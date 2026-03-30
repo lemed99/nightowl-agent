@@ -1,0 +1,48 @@
+{
+    "name": "nightowl/agent",
+    "description": "NightOwl monitoring agent — collects telemetry from laravel/nightwatch and writes to PostgreSQL",
+    "keywords": ["laravel", "monitoring", "nightwatch", "telemetry", "agent"],
+    "license": "MIT",
+    "type": "library",
+    "require": {
+        "php": "^8.2",
+        "ext-pdo_pgsql": "*",
+        "ext-pdo_sqlite": "*",
+        "laravel/framework": "^11.0|^12.0",
+        "react/datagram": "^1.10",
+        "react/event-loop": "^1.5",
+        "react/http": "^1.9",
+        "react/socket": "^1.15"
+    },
+    "suggest": {
+        "ext-zlib": "Required for gzip decompression of compressed payloads",
+        "laravel/nightwatch": "Required to collect telemetry from your Laravel app"
+    },
+    "autoload": {
+        "psr-4": {
+            "NightOwl\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "NightOwl\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "NightOwl\\NightOwlAgentServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "require-dev": {
+        "laravel/boost": "^2.3",
+        "mockery/mockery": "^1.6",
+        "phpunit/phpunit": "^11.5"
+    }
+}

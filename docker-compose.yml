@@ -1,0 +1,64 @@
+# NightOwl Agent — PostgreSQL + PgBouncer
+#
+# The agent connects to PgBouncer (port 6432) which pools connections to PostgreSQL.
+# This reduces connection overhead when running multiple drain workers.
+#
+# Usage:
+#   docker compose up -d
+#
+# .env config:
+#   NIGHTOWL_DB_HOST=127.0.0.1
+#   NIGHTOWL_DB_PORT=6432            # PgBouncer (pooled) — use for agent
+#   NIGHTOWL_DB_DATABASE=nightowl
+#   NIGHTOWL_DB_USERNAME=nightowl
+#   NIGHTOWL_DB_PASSWORD=nightowl
+#   NIGHTOWL_DRAIN_WORKERS=4         # Parallel drain workers
+#
+# Direct PostgreSQL (bypass PgBouncer):
+#   psql -h 127.0.0.1 -p 5432 -U nightowl -d nightowl
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: nightowl
+      POSTGRES_USER: nightowl
+      POSTGRES_PASSWORD: nightowl
+    ports:
+      - "${NIGHTOWL_DB_PORT:-5432}:5432"
+    volumes:
+      - nightowl_data:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c synchronous_commit=off
+      -c max_wal_size=2GB
+      -c wal_buffers=64MB
+      -c shared_buffers=256MB
+      -c work_mem=64MB
+      -c checkpoint_completion_target=0.9
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nightowl"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DATABASE_URL: postgres://nightowl:nightowl@postgres:5432/nightowl
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 20
+      MIN_POOL_SIZE: 5
+      RESERVE_POOL_SIZE: 5
+      RESERVE_POOL_TIMEOUT: 3
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits
+      AUTH_TYPE: plain
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  nightowl_data:
