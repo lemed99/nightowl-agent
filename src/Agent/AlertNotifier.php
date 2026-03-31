@@ -19,7 +19,6 @@ final class AlertNotifier
     private array $channelCache = [];
     private float $channelCacheExpiry = 0;
     private int $cacheTtl;
-    private string $encryptionKey;
 
     /** Maximum total time for notification dispatch per flush (seconds) */
     private const MAX_NOTIFICATION_SECONDS = 5.0;
@@ -27,24 +26,15 @@ final class AlertNotifier
     /** @var list<array{appName: string, issueGroups: array, issueType: string, newHashes: string[]}> */
     private array $pendingNotifications = [];
 
-    public function __construct(int $cacheTtl = 86400, string $encryptionKey = '')
+    public function __construct(int $cacheTtl = 86400)
     {
         $this->cacheTtl = $cacheTtl;
-        $this->encryptionKey = $encryptionKey;
     }
 
     public static function fromConfig(): self
     {
-        $appKey = config('app.key', '');
-
-        // Strip the base64: prefix that Laravel uses
-        if (str_starts_with($appKey, 'base64:')) {
-            $appKey = base64_decode(substr($appKey, 7));
-        }
-
         return new self(
             (int) config('nightowl.threshold_cache_ttl', 86400),
-            $appKey,
         );
     }
 
@@ -72,7 +62,7 @@ final class AlertNotifier
             $placeholders = implode(',', array_fill(0, count($groupHashes), '?'));
             $stmt = $pdo->prepare("
                 SELECT group_hash FROM nightowl_issues
-                WHERE group_hash IN ({$placeholders}) AND type = ?
+                WHERE group_hash IN ({$placeholders}) AND type = ? AND status != 'resolved'
             ");
             $stmt->execute([...array_values($groupHashes), $issueType]);
 
@@ -184,11 +174,6 @@ final class AlertNotifier
 
             foreach ($rows as $row) {
                 $config = json_decode($row['config'], true) ?? [];
-
-                // Decrypt email password if present
-                if ($row['type'] === 'email' && ! empty($config['password']) && $this->encryptionKey !== '') {
-                    $config['password'] = $this->decryptValue($config['password']);
-                }
 
                 $this->channelCache[] = [
                     'type' => $row['type'],
@@ -475,34 +460,4 @@ final class AlertNotifier
         return $response;
     }
 
-    // ─── Encryption ──────────────────────────────────────────────────
-
-    /**
-     * Decrypt a value encrypted by Laravel's Crypt::encryptString().
-     * Uses AES-256-CBC with the app key, matching Laravel's Encrypter.
-     */
-    private function decryptValue(string $encrypted): string
-    {
-        try {
-            $payload = json_decode(base64_decode($encrypted), true);
-            if (! $payload || ! isset($payload['iv'], $payload['value'], $payload['mac'])) {
-                return $encrypted; // Not encrypted, return as-is
-            }
-
-            $iv = base64_decode($payload['iv']);
-            $value = base64_decode($payload['value']);
-
-            // Verify MAC (computed on base64 values, matching Laravel)
-            $mac = hash_hmac('sha256', $payload['iv'] . $payload['value'], $this->encryptionKey);
-            if (! hash_equals($mac, $payload['mac'])) {
-                return $encrypted; // MAC mismatch
-            }
-
-            $decrypted = openssl_decrypt($value, 'aes-256-cbc', $this->encryptionKey, OPENSSL_RAW_DATA, $iv);
-
-            return $decrypted !== false ? $decrypted : $encrypted;
-        } catch (\Throwable) {
-            return $encrypted;
-        }
-    }
 }
