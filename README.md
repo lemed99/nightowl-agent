@@ -212,11 +212,15 @@ Already using Nightwatch and not ready to fully switch? You can run both agents 
 
 ### 1. Set NightOwl to a different port
 
-In your `.env`:
+In your `.env`, set the NightOwl agent to a different port and provide both tokens:
 
 ```env
 NIGHTOWL_AGENT_PORT=2410
+NIGHTOWL_TOKEN=your-nightowl-token-from-dashboard
+NIGHTWATCH_TOKEN=your-nightwatch-token
 ```
+
+> `NIGHTWATCH_TOKEN` is used by the Nightwatch package to send telemetry. `NIGHTOWL_TOKEN` is the token from the NightOwl dashboard — the NightOwl agent uses it for payload authentication and health reporting.
 
 ### 2. Create a MultiIngest wrapper
 
@@ -298,8 +302,8 @@ public function register(): void
 
         $core = $this->app->make(\Laravel\Nightwatch\Core::class);
         $nightowlPort = config('nightowl.agent.port', 2410);
-        $token = config('nightwatch.token', '');
-        $tokenHash = substr(hash('xxh128', $token), 0, 7);
+        $nightowlToken = config('nightowl.agent.token', config('nightwatch.token', ''));
+        $tokenHash = substr(hash('xxh128', $nightowlToken), 0, 7);
 
         $nightowlIngest = new \Laravel\Nightwatch\Ingest(
             transmitTo: "127.0.0.1:{$nightowlPort}",
