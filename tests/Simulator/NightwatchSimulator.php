@@ -653,7 +653,7 @@ final class NightwatchSimulator
     public function makeCacheEvent(array $overrides = []): array
     {
         $keys = ['users:1', 'products:list', 'config:cache', 'route:cache', 'session:abc123'];
-        $types = ['hit', 'hit', 'hit', 'miss', 'set', 'delete'];
+        $types = ['hit', 'hit', 'hit', 'miss', 'write', 'delete'];
 
         return array_merge([
             't' => 'cache-event',
