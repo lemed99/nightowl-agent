@@ -90,7 +90,7 @@ class SimulatorPayloadTest extends TestCase
 
         $result = $this->parser->parse($wire);
 
-        $this->assertSame('queued_job', $result['records'][0]['t']);
+        $this->assertSame('queued-job', $result['records'][0]['t']);
         $this->assertArrayHasKey('name', $result['records'][0]);
         $this->assertArrayHasKey('queue', $result['records'][0]);
         $this->assertArrayHasKey('status', $result['records'][0]);
@@ -115,9 +115,9 @@ class SimulatorPayloadTest extends TestCase
 
         $result = $this->parser->parse($wire);
 
-        $this->assertSame('scheduled_task', $result['records'][0]['t']);
-        $this->assertArrayHasKey('command', $result['records'][0]);
-        $this->assertArrayHasKey('expression', $result['records'][0]);
+        $this->assertSame('scheduled-task', $result['records'][0]['t']);
+        $this->assertArrayHasKey('name', $result['records'][0]);
+        $this->assertArrayHasKey('cron', $result['records'][0]);
     }
 
     public function testCacheEventRecordParsesCorrectly(): void
@@ -127,7 +127,7 @@ class SimulatorPayloadTest extends TestCase
 
         $result = $this->parser->parse($wire);
 
-        $this->assertSame('cache_event', $result['records'][0]['t']);
+        $this->assertSame('cache-event', $result['records'][0]['t']);
         $this->assertArrayHasKey('type', $result['records'][0]);
         $this->assertArrayHasKey('key', $result['records'][0]);
     }
@@ -140,7 +140,7 @@ class SimulatorPayloadTest extends TestCase
         $result = $this->parser->parse($wire);
 
         $this->assertSame('mail', $result['records'][0]['t']);
-        $this->assertArrayHasKey('mailable', $result['records'][0]);
+        $this->assertArrayHasKey('class', $result['records'][0]);
         $this->assertArrayHasKey('subject', $result['records'][0]);
     }
 
@@ -152,7 +152,7 @@ class SimulatorPayloadTest extends TestCase
         $result = $this->parser->parse($wire);
 
         $this->assertSame('notification', $result['records'][0]['t']);
-        $this->assertArrayHasKey('notification', $result['records'][0]);
+        $this->assertArrayHasKey('class', $result['records'][0]);
         $this->assertArrayHasKey('channel', $result['records'][0]);
     }
 
@@ -163,7 +163,7 @@ class SimulatorPayloadTest extends TestCase
 
         $result = $this->parser->parse($wire);
 
-        $this->assertSame('outgoing_request', $result['records'][0]['t']);
+        $this->assertSame('outgoing-request', $result['records'][0]['t']);
         $this->assertArrayHasKey('method', $result['records'][0]);
         $this->assertArrayHasKey('url', $result['records'][0]);
         $this->assertArrayHasKey('status_code', $result['records'][0]);
@@ -221,13 +221,13 @@ class SimulatorPayloadTest extends TestCase
         $this->assertContains('request', $types);
         $this->assertContains('query', $types);
         $this->assertContains('exception', $types);
-        $this->assertContains('queued_job', $types);
+        $this->assertContains('queued-job', $types);
         $this->assertContains('command', $types);
-        $this->assertContains('scheduled_task', $types);
-        $this->assertContains('cache_event', $types);
+        $this->assertContains('scheduled-task', $types);
+        $this->assertContains('cache-event', $types);
         $this->assertContains('mail', $types);
         $this->assertContains('notification', $types);
-        $this->assertContains('outgoing_request', $types);
+        $this->assertContains('outgoing-request', $types);
         $this->assertContains('log', $types);
         $this->assertContains('user', $types);
     }

@@ -77,7 +77,7 @@ final class Sampler
                 return $this->commandRate;
             }
 
-            if ($type === 'scheduled_task' && $this->scheduledRate !== null) {
+            if ($type === 'scheduled-task' && $this->scheduledRate !== null) {
                 return $this->scheduledRate;
             }
         }

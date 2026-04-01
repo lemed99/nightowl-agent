@@ -548,7 +548,7 @@ final class NightwatchSimulator
         ];
 
         return array_merge([
-            't' => 'queued_job',
+            't' => 'queued-job',
             'trace_id' => $this->uuid(),
             'timestamp' => microtime(true),
             'deploy' => 'production',
@@ -622,15 +622,15 @@ final class NightwatchSimulator
         $task = $tasks[array_rand($tasks)];
 
         return array_merge([
-            't' => 'scheduled_task',
+            't' => 'scheduled-task',
             'trace_id' => $this->uuid(),
             'timestamp' => microtime(true),
             'deploy' => 'production',
             'server' => 'web-01',
             '_group' => md5($task[0]),
             'user' => null,
-            'command' => $task[0],
-            'expression' => $task[1],
+            'name' => $task[0],
+            'cron' => $task[1],
             'status' => 'processed',
             'duration' => mt_rand(100_000, 30_000_000),
             'exit_code' => 0,
@@ -656,7 +656,7 @@ final class NightwatchSimulator
         $types = ['hit', 'hit', 'hit', 'miss', 'set', 'delete'];
 
         return array_merge([
-            't' => 'cache_event',
+            't' => 'cache-event',
             'trace_id' => $this->uuid(),
             'timestamp' => microtime(true),
             'deploy' => 'production',
@@ -695,7 +695,7 @@ final class NightwatchSimulator
             'mailer' => 'smtp',
             'to' => json_encode(['user@example.com']),
             'subject' => 'Welcome to our platform!',
-            'mailable' => $mailables[array_rand($mailables)],
+            'class' => $mailables[array_rand($mailables)],
             'duration' => mt_rand(50_000, 500_000),
             'queued' => true,
         ], $overrides);
@@ -719,7 +719,7 @@ final class NightwatchSimulator
             'execution_id' => null,
             'execution_stage' => null,
             'user' => null,
-            'notification' => $notifications[array_rand($notifications)],
+            'class' => $notifications[array_rand($notifications)],
             'channel' => ['mail', 'database', 'slack'][array_rand(['mail', 'database', 'slack'])],
             'notifiable_type' => 'App\\Models\\User',
             'notifiable_id' => (string) mt_rand(1, 100),
@@ -741,7 +741,7 @@ final class NightwatchSimulator
         $api = $apis[array_rand($apis)];
 
         return array_merge([
-            't' => 'outgoing_request',
+            't' => 'outgoing-request',
             'trace_id' => $this->uuid(),
             'timestamp' => microtime(true),
             'deploy' => 'production',

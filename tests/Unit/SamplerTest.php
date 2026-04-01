@@ -192,7 +192,7 @@ class SamplerTest extends TestCase
 
         $rejected = 0;
         for ($i = 0; $i < 100; $i++) {
-            if (! $sampler->shouldKeep([['t' => 'scheduled_task', 'command' => 'cleanup']])) {
+            if (! $sampler->shouldKeep([['t' => 'scheduled-task', 'command' => 'cleanup']])) {
                 $rejected++;
             }
         }

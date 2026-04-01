@@ -12,6 +12,7 @@ return new class extends Migration
     {
         Schema::connection($this->connection)->create('nightowl_commands', function (Blueprint $table) {
             $table->id();
+            $table->smallInteger('v')->nullable();
             $table->string('trace_id');
             $table->string('timestamp')->nullable();
             $table->string('deploy')->nullable();
@@ -19,9 +20,14 @@ return new class extends Migration
             $table->string('group_hash')->nullable();
             $table->string('user_id')->nullable();
 
+            $table->string('class')->nullable();
+            $table->string('name')->nullable();
             $table->string('command');
             $table->integer('exit_code')->nullable();
             $table->integer('duration')->nullable();
+            $table->integer('bootstrap')->nullable();
+            $table->integer('action')->nullable();
+            $table->integer('terminating')->nullable();
 
             // Child event counts
             $table->integer('exceptions')->default(0);
@@ -38,6 +44,7 @@ return new class extends Migration
             $table->integer('hydrated_models')->default(0);
             $table->integer('peak_memory_usage')->nullable();
             $table->text('exception_preview')->nullable();
+            $table->text('context')->nullable();
 
             $table->timestamp('created_at')->useCurrent();
 

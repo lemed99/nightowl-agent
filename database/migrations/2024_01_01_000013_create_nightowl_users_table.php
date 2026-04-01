@@ -12,8 +12,10 @@ return new class extends Migration
     {
         Schema::connection('nightowl')->create('nightowl_users', function (Blueprint $table) {
             $table->string('user_id')->primary();
+            $table->smallInteger('v')->nullable();
             $table->string('name')->nullable();
             $table->string('email')->nullable();
+            $table->string('timestamp')->nullable();
             $table->timestamp('created_at')->useCurrent();
             $table->timestamp('updated_at')->useCurrent();
         });

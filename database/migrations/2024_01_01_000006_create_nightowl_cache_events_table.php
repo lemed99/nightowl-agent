@@ -12,13 +12,16 @@ return new class extends Migration
     {
         Schema::connection($this->connection)->create('nightowl_cache_events', function (Blueprint $table) {
             $table->id();
+            $table->smallInteger('v')->nullable();
             $table->string('trace_id');
             $table->string('timestamp')->nullable();
             $table->string('deploy')->nullable();
             $table->string('server')->nullable();
+            $table->string('group_hash')->nullable();
             $table->string('execution_source')->nullable();
             $table->string('execution_id')->nullable();
             $table->string('execution_stage')->nullable();
+            $table->string('execution_preview')->nullable();
             $table->string('user_id')->nullable();
 
             $table->string('event_type');

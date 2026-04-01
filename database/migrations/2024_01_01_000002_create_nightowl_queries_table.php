@@ -12,6 +12,7 @@ return new class extends Migration
     {
         Schema::connection($this->connection)->create('nightowl_queries', function (Blueprint $table) {
             $table->id();
+            $table->smallInteger('v')->nullable();
             $table->string('trace_id');
             $table->string('timestamp')->nullable();
             $table->string('deploy')->nullable();
@@ -22,6 +23,7 @@ return new class extends Migration
             $table->string('execution_source')->nullable();
             $table->string('execution_id')->nullable();
             $table->string('execution_stage')->nullable();
+            $table->string('execution_preview')->nullable();
             $table->string('user_id')->nullable();
 
             // Query data

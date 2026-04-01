@@ -110,12 +110,13 @@ final class RecordWriter
                     'query' => $this->writeQueries($typeRecords),
                     'exception' => $this->writeExceptions($typeRecords),
                     'command' => $this->writeCommands($typeRecords),
-                    'queued_job' => $this->writeJobs($typeRecords),
-                    'cache_event' => $this->writeCacheEvents($typeRecords),
+                    'queued-job' => $this->writeJobs($typeRecords),
+                    'cache-event' => $this->writeCacheEvents($typeRecords),
                     'mail' => $this->writeMail($typeRecords),
                     'notification' => $this->writeNotifications($typeRecords),
-                    'outgoing_request' => $this->writeOutgoingRequests($typeRecords),
-                    'scheduled_task' => $this->writeScheduledTasks($typeRecords),
+                    'outgoing-request' => $this->writeOutgoingRequests($typeRecords),
+                    'scheduled-task' => $this->writeScheduledTasks($typeRecords),
+                    'job-attempt' => $this->writeJobs($typeRecords),
                     'log' => $this->writeLogs($typeRecords),
                     'user' => $this->writeUsers($typeRecords),
                     default => null,
@@ -191,7 +192,7 @@ final class RecordWriter
     private function writeRequests(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
             'user_id', 'method', 'url', 'route_name', 'route_methods',
             'route_domain', 'route_path', 'route_action', 'ip',
             'duration', 'status_code', 'request_size', 'response_size',
@@ -207,6 +208,7 @@ final class RecordWriter
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
+                $r['v'] ?? null,
                 $r['trace_id'] ?? null,
                 $r['timestamp'] ?? null,
                 $r['deploy'] ?? null,
@@ -260,14 +262,15 @@ final class RecordWriter
     private function writeQueries(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
-            'execution_source', 'execution_id', 'execution_stage', 'user_id',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'sql_query', 'file', 'line', 'duration', 'connection', 'connection_type',
         ];
 
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
+                $r['v'] ?? null,
                 $r['trace_id'] ?? null,
                 $r['timestamp'] ?? null,
                 $r['deploy'] ?? null,
@@ -276,6 +279,7 @@ final class RecordWriter
                 $r['execution_source'] ?? null,
                 $r['execution_id'] ?? null,
                 $r['execution_stage'] ?? null,
+                $r['execution_preview'] ?? null,
                 $r['user'] ?? null,
                 $r['sql'] ?? '',
                 $r['file'] ?? null,
@@ -292,13 +296,13 @@ final class RecordWriter
     private function writeExceptions(array $records): void
     {
         $stmt = $this->pdo()->prepare('INSERT INTO nightowl_exceptions (
-            trace_id, timestamp, deploy, server,
-            execution_source, execution_id, execution_stage, user_id,
+            v, trace_id, timestamp, deploy, server, group_hash,
+            execution_source, execution_id, execution_stage, execution_preview, user_id,
             class, message, code, file, line, trace,
             php_version, laravel_version, handled, fingerprint
         ) VALUES (
-            :trace_id, :timestamp, :deploy, :server,
-            :execution_source, :execution_id, :execution_stage, :user_id,
+            :v, :trace_id, :timestamp, :deploy, :server, :group_hash,
+            :execution_source, :execution_id, :execution_stage, :execution_preview, :user_id,
             :class, :message, :code, :file, :line, :trace,
             :php_version, :laravel_version, :handled, :fingerprint
         )');
@@ -309,13 +313,16 @@ final class RecordWriter
             $fingerprint = md5(($r['class'] ?? '') . ($r['file'] ?? '') . ($r['line'] ?? ''));
 
             $stmt->execute([
+                'v' => $r['v'] ?? null,
                 'trace_id' => $r['trace_id'] ?? null,
                 'timestamp' => $r['timestamp'] ?? null,
                 'deploy' => $r['deploy'] ?? null,
                 'server' => $r['server'] ?? null,
+                'group_hash' => $r['_group'] ?? null,
                 'execution_source' => $r['execution_source'] ?? null,
                 'execution_id' => $r['execution_id'] ?? null,
                 'execution_stage' => $r['execution_stage'] ?? null,
+                'execution_preview' => $r['execution_preview'] ?? null,
                 'user_id' => $r['user'] ?? null,
                 'class' => $r['class'] ?? 'Unknown',
                 'message' => $r['message'] ?? null,
@@ -406,24 +413,28 @@ final class RecordWriter
     private function writeCommands(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
-            'user_id', 'command', 'exit_code', 'duration',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'user_id', 'class', 'name', 'command', 'exit_code', 'duration',
+            'bootstrap', 'action', 'terminating',
             'exceptions', 'logs', 'queries', 'lazy_loads',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
             'files_read', 'files_written', 'cache_events',
-            'hydrated_models', 'peak_memory_usage', 'exception_preview',
+            'hydrated_models', 'peak_memory_usage', 'exception_preview', 'context',
         ];
 
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
+                $r['v'] ?? null,
                 $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null,
                 $r['server'] ?? null, $r['_group'] ?? null, $r['user'] ?? null,
-                $r['command'] ?? 'unknown', $r['exit_code'] ?? null, $r['duration'] ?? null,
+                $r['class'] ?? null, $r['name'] ?? null, $r['command'] ?? 'unknown', $r['exit_code'] ?? null, $r['duration'] ?? null,
+                $r['bootstrap'] ?? null, $r['action'] ?? null, $r['terminating'] ?? null,
                 $r['exceptions'] ?? 0, $r['logs'] ?? 0, $r['queries'] ?? 0, $r['lazy_loads'] ?? 0,
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
                 $r['files_read'] ?? 0, $r['files_written'] ?? 0, $r['cache_events'] ?? 0,
                 $r['hydrated_models'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
+                is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
             ];
         }
 
@@ -435,27 +446,31 @@ final class RecordWriter
     private function writeJobs(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
-            'execution_source', 'execution_id', 'user_id',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
+            'job_id', 'attempt_id', 'attempt',
             'job_class', 'queue', 'connection', 'status', 'duration', 'attempts',
             'exceptions', 'logs', 'queries', 'lazy_loads',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
             'files_read', 'files_written', 'cache_events',
-            'hydrated_models', 'peak_memory_usage', 'exception_preview',
+            'hydrated_models', 'peak_memory_usage', 'exception_preview', 'context',
         ];
 
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
+                $r['v'] ?? null,
                 $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null,
                 $r['server'] ?? null, $r['_group'] ?? null, $r['execution_source'] ?? null,
-                $r['execution_id'] ?? null, $r['user'] ?? null,
+                $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
+                $r['job_id'] ?? null, $r['attempt_id'] ?? null, $r['attempt'] ?? null,
                 $r['name'] ?? $r['job_class'] ?? 'Unknown', $r['queue'] ?? null,
                 $r['connection'] ?? null, $r['status'] ?? null, $r['duration'] ?? null, $r['attempts'] ?? 1,
                 $r['exceptions'] ?? 0, $r['logs'] ?? 0, $r['queries'] ?? 0, $r['lazy_loads'] ?? 0,
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
                 $r['files_read'] ?? 0, $r['files_written'] ?? 0, $r['cache_events'] ?? 0,
                 $r['hydrated_models'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
+                is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
             ];
         }
 
@@ -467,16 +482,17 @@ final class RecordWriter
     private function writeCacheEvents(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server',
-            'execution_source', 'execution_id', 'execution_stage', 'user_id',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'event_type', 'key', 'store', 'ttl', 'duration',
         ];
 
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null,
-                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['user'] ?? null,
+                $r['v'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null, $r['_group'] ?? null,
+                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['type'] ?? 'unknown', $r['key'] ?? '', $r['store'] ?? null, $r['ttl'] ?? null, $r['duration'] ?? null,
             ];
         }
@@ -487,19 +503,21 @@ final class RecordWriter
     private function writeMail(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server',
-            'execution_source', 'execution_id', 'execution_stage', 'user_id',
-            'mailer', 'recipients', 'subject', 'mailable', 'duration', 'queued',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
+            'mailer', 'recipients', 'cc', 'bcc', 'attachments', 'subject', 'mailable', 'duration', 'failed', 'queued',
         ];
 
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null,
-                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['user'] ?? null,
+                $r['v'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null, $r['_group'] ?? null,
+                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['mailer'] ?? null, is_array($r['to'] ?? null) ? json_encode($r['to']) : ($r['to'] ?? null),
-                $r['subject'] ?? null, $r['mailable'] ?? null, $r['duration'] ?? null,
-                ($r['queued'] ?? false) ? 't' : 'f',
+                $r['cc'] ?? 0, $r['bcc'] ?? 0, $r['attachments'] ?? 0,
+                $r['subject'] ?? null, $r['class'] ?? $r['mailable'] ?? null, $r['duration'] ?? null,
+                ($r['failed'] ?? false) ? 't' : 'f', ($r['queued'] ?? false) ? 't' : 'f',
             ];
         }
 
@@ -509,18 +527,19 @@ final class RecordWriter
     private function writeNotifications(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server',
-            'execution_source', 'execution_id', 'execution_stage', 'user_id',
-            'notification', 'channel', 'notifiable_type', 'notifiable_id', 'duration', 'queued',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
+            'notification', 'channel', 'notifiable_type', 'notifiable_id', 'duration', 'failed', 'queued',
         ];
 
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null,
-                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['user'] ?? null,
-                $r['notification'] ?? null, $r['channel'] ?? null, $r['notifiable_type'] ?? null, $r['notifiable_id'] ?? null,
-                $r['duration'] ?? null, ($r['queued'] ?? false) ? 't' : 'f',
+                $r['v'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null, $r['_group'] ?? null,
+                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
+                $r['class'] ?? $r['notification'] ?? null, $r['channel'] ?? null, $r['notifiable_type'] ?? null, $r['notifiable_id'] ?? null,
+                $r['duration'] ?? null, ($r['failed'] ?? false) ? 't' : 'f', ($r['queued'] ?? false) ? 't' : 'f',
             ];
         }
 
@@ -530,18 +549,19 @@ final class RecordWriter
     private function writeOutgoingRequests(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server',
-            'execution_source', 'execution_id', 'execution_stage', 'user_id',
-            'method', 'url', 'status_code', 'duration',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
+            'host', 'method', 'url', 'status_code', 'duration',
             'request_size', 'response_size', 'request_headers',
         ];
 
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null,
-                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['user'] ?? null,
-                $r['method'] ?? 'GET', $r['url'] ?? '', $r['status_code'] ?? null, $r['duration'] ?? null,
+                $r['v'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null, $r['_group'] ?? null,
+                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
+                $r['host'] ?? null, $r['method'] ?? 'GET', $r['url'] ?? '', $r['status_code'] ?? null, $r['duration'] ?? null,
                 $r['request_size'] ?? null, $r['response_size'] ?? null, $r['request_headers'] ?? null,
             ];
         }
@@ -552,18 +572,20 @@ final class RecordWriter
     private function writeLogs(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server',
-            'execution_source', 'execution_id', 'execution_stage', 'user_id',
-            'level', 'message', 'context', 'channel', 'created_at',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server',
+            'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
+            'level', 'message', 'context', 'extra', 'channel', 'created_at',
         ];
 
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
+                $r['v'] ?? null,
                 $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null,
-                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['user'] ?? null,
+                $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['level'] ?? 'info', $r['message'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
+                is_string($r['extra'] ?? null) ? $r['extra'] : json_encode($r['extra'] ?? null),
                 $r['channel'] ?? null,
                 isset($r['timestamp']) ? date('Y-m-d H:i:s', (int) $r['timestamp']) : date('Y-m-d H:i:s'),
             ];
@@ -575,11 +597,13 @@ final class RecordWriter
     private function writeUsers(array $records): void
     {
         $stmt = $this->pdo()->prepare('
-            INSERT INTO nightowl_users (user_id, name, email, updated_at)
-            VALUES (:user_id, :name, :email, :updated_at)
+            INSERT INTO nightowl_users (v, user_id, name, email, timestamp, updated_at)
+            VALUES (:v, :user_id, :name, :email, :timestamp, :updated_at)
             ON CONFLICT (user_id) DO UPDATE SET
+                v = EXCLUDED.v,
                 name = EXCLUDED.name,
                 email = EXCLUDED.email,
+                timestamp = EXCLUDED.timestamp,
                 updated_at = EXCLUDED.updated_at
         ');
 
@@ -590,9 +614,11 @@ final class RecordWriter
             }
 
             $stmt->execute([
+                'v' => $r['v'] ?? null,
                 'user_id' => (string) $userId,
                 'name' => $r['name'] ?? null,
                 'email' => $r['username'] ?? null,
+                'timestamp' => $r['timestamp'] ?? null,
                 'updated_at' => date('Y-m-d H:i:s'),
             ]);
         }
@@ -601,31 +627,38 @@ final class RecordWriter
     private function writeScheduledTasks(array $records): void
     {
         $columns = [
-            'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
-            'user_id', 'command', 'expression', 'status', 'duration', 'exit_code',
+            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'user_id', 'command', 'expression',
+            'timezone', 'repeat_seconds', 'without_overlapping', 'on_one_server', 'run_in_background', 'even_in_maintenance_mode',
+            'status', 'duration', 'exit_code',
             'exceptions', 'logs', 'queries', 'lazy_loads',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
             'files_read', 'files_written', 'cache_events',
-            'hydrated_models', 'peak_memory_usage', 'exception_preview',
+            'hydrated_models', 'peak_memory_usage', 'exception_preview', 'context',
         ];
 
         $rows = [];
         foreach ($records as $r) {
             $rows[] = [
+                $r['v'] ?? null,
                 $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null,
                 $r['server'] ?? null, $r['_group'] ?? null, $r['user'] ?? null,
-                $r['command'] ?? 'unknown', $r['expression'] ?? null, $r['status'] ?? null,
-                $r['duration'] ?? null, $r['exit_code'] ?? null,
+                $r['name'] ?? $r['command'] ?? 'unknown', $r['cron'] ?? $r['expression'] ?? null,
+                $r['timezone'] ?? null, $r['repeat_seconds'] ?? 0,
+                ($r['without_overlapping'] ?? false) ? 't' : 'f', ($r['on_one_server'] ?? false) ? 't' : 'f',
+                ($r['run_in_background'] ?? false) ? 't' : 'f', ($r['even_in_maintenance_mode'] ?? false) ? 't' : 'f',
+                $r['status'] ?? null, $r['duration'] ?? null, $r['exit_code'] ?? null,
                 $r['exceptions'] ?? 0, $r['logs'] ?? 0, $r['queries'] ?? 0, $r['lazy_loads'] ?? 0,
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
                 $r['files_read'] ?? 0, $r['files_written'] ?? 0, $r['cache_events'] ?? 0,
                 $r['hydrated_models'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
+                is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
             ];
         }
 
         $this->copyBatch('nightowl_scheduled_tasks', $columns, $rows);
 
-        $this->checkThresholds('scheduled_task', $records, 'command');
+        $this->checkThresholds('scheduled-task', $records, ['name', 'command']);
     }
 
     // ─── Performance Threshold Checking ──────────────────────────────
@@ -730,7 +763,7 @@ final class RecordWriter
     /**
      * Check records against thresholds and upsert performance issues.
      *
-     * @param string          $type     Threshold type: 'route', 'job', 'command', 'scheduled_task'
+     * @param string          $type     Threshold type: 'route', 'job', 'command', 'scheduled-task'
      * @param array           $records  Raw records from the batch
      * @param string|string[] $nameKeys Record field(s) containing the name, tried in order
      * @param string          $groupKey Record field containing the group hash

@@ -12,6 +12,7 @@ return new class extends Migration
     {
         Schema::connection($this->connection)->create('nightowl_jobs', function (Blueprint $table) {
             $table->id();
+            $table->smallInteger('v')->nullable();
             $table->string('trace_id');
             $table->string('timestamp')->nullable();
             $table->string('deploy')->nullable();
@@ -21,9 +22,14 @@ return new class extends Migration
             // Execution context
             $table->string('execution_source')->nullable();
             $table->string('execution_id')->nullable();
+            $table->string('execution_stage')->nullable();
+            $table->string('execution_preview')->nullable();
             $table->string('user_id')->nullable();
 
             // Job data
+            $table->string('job_id')->nullable();
+            $table->string('attempt_id')->nullable();
+            $table->integer('attempt')->nullable();
             $table->string('job_class');
             $table->string('queue')->nullable();
             $table->string('connection')->nullable();
@@ -46,6 +52,7 @@ return new class extends Migration
             $table->integer('hydrated_models')->default(0);
             $table->integer('peak_memory_usage')->nullable();
             $table->text('exception_preview')->nullable();
+            $table->text('context')->nullable();
 
             $table->timestamp('created_at')->useCurrent();
 

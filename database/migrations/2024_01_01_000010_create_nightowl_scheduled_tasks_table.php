@@ -12,6 +12,7 @@ return new class extends Migration
     {
         Schema::connection($this->connection)->create('nightowl_scheduled_tasks', function (Blueprint $table) {
             $table->id();
+            $table->smallInteger('v')->nullable();
             $table->string('trace_id');
             $table->string('timestamp')->nullable();
             $table->string('deploy')->nullable();
@@ -21,6 +22,12 @@ return new class extends Migration
 
             $table->string('command');
             $table->string('expression')->nullable();
+            $table->string('timezone')->nullable();
+            $table->integer('repeat_seconds')->default(0);
+            $table->boolean('without_overlapping')->default(false);
+            $table->boolean('on_one_server')->default(false);
+            $table->boolean('run_in_background')->default(false);
+            $table->boolean('even_in_maintenance_mode')->default(false);
             $table->string('status')->nullable();
             $table->integer('duration')->nullable();
             $table->integer('exit_code')->nullable();
@@ -40,6 +47,7 @@ return new class extends Migration
             $table->integer('hydrated_models')->default(0);
             $table->integer('peak_memory_usage')->nullable();
             $table->text('exception_preview')->nullable();
+            $table->text('context')->nullable();
 
             $table->timestamp('created_at')->useCurrent();
 
