@@ -667,6 +667,27 @@ final class MetricsCollector
     }
 
     /**
+     * Get diagnoses that just crossed the debounce threshold on this tick.
+     * Returns an empty array on most ticks — only non-empty when a new issue appears.
+     *
+     * @return array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}>
+     */
+    public function getNewlyActiveDiagnoses(): array
+    {
+        $newly = [];
+        foreach ($this->diagnoses as $d) {
+            $code = $d['code'];
+            if (isset($this->diagnosisLifecycle[$code])
+                && $this->diagnosisLifecycle[$code]['consecutive_ticks'] === self::DEBOUNCE_TICKS
+            ) {
+                $newly[] = $d;
+            }
+        }
+
+        return $newly;
+    }
+
+    /**
      * Get current status string (used by HealthReporter for adaptive intervals).
      */
     public function getStatus(): string

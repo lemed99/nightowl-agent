@@ -37,6 +37,7 @@ final class AsyncServer
     // Telemetry
     private float $startTime = 0;
     private MetricsCollector $metrics;
+    private ?HealthAlertNotifier $healthAlertNotifier = null;
 
     /** @var array<int, TimerInterface> */
     private array $connectionTimers = [];
@@ -187,12 +188,28 @@ final class AsyncServer
             $this->metrics->readDrainMetrics($this->sqlitePath, $this->drainWorkerCount);
         });
 
+        // Health alert notifier — dispatches to Slack/Discord/Webhook/Email
+        // when a new diagnosis crosses the debounce threshold.
+        $instanceId = gethostname() . ':' . getmypid();
+        $this->healthAlertNotifier = HealthAlertNotifier::fromConfig($instanceId);
+
         // 10-second diagnosis — run health checks and update score
         $this->loop->addPeriodicTimer(10.0, function () {
             $pending = $this->buffer?->pendingCount() ?? 0;
             $walSize = $this->buffer?->walSize() ?? 0;
             $rss = memory_get_usage(true);
             $this->metrics->runDiagnosis($this->backPressure, $pending, $walSize, $rss);
+
+            // Dispatch alerts for newly active diagnoses (rare — only fires
+            // when a diagnosis first crosses the debounce threshold)
+            $newDiagnoses = $this->metrics->getNewlyActiveDiagnoses();
+            if (! empty($newDiagnoses) && $this->healthAlertNotifier !== null) {
+                try {
+                    $this->healthAlertNotifier->dispatch($newDiagnoses);
+                } catch (\Throwable $e) {
+                    error_log("[NightOwl Agent] Health alert dispatch failed: {$e->getMessage()}");
+                }
+            }
         });
 
         // Restart drain workers if they die unexpectedly
