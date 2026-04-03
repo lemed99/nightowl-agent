@@ -80,12 +80,33 @@ final class RecordWriter
         } catch (\Throwable $e) {
             // Check if this looks like a connection error — reconnect and retry once
             if ($this->isConnectionError($e)) {
-                $this->pdo = null;
+                $this->reconnect();
                 $this->doWrite($records);
             } else {
                 throw $e;
             }
         }
+    }
+
+    /**
+     * Drop the current connection and force a fresh one on next use.
+     * Ensures any stale transaction state is cleaned up before the
+     * socket is discarded — critical for PgBouncer/Supavisor which
+     * recycle server connections and may inherit dirty transaction state.
+     */
+    private function reconnect(): void
+    {
+        if ($this->pdo !== null) {
+            try {
+                if ($this->pdo->inTransaction()) {
+                    $this->pdo->rollBack();
+                }
+            } catch (\Throwable) {
+                // Connection is likely already dead — ignore
+            }
+        }
+
+        $this->pdo = null;
     }
 
     private function doWrite(array $records): void
@@ -142,7 +163,7 @@ final class RecordWriter
         $prev = $e->getPrevious();
         $prevMessage = $prev ? strtolower($prev->getMessage()) : '';
 
-        $patterns = ['server closed', 'connection reset', 'broken pipe', 'gone away', 'no connection', 'connection refused', 'connection timed out'];
+        $patterns = ['server closed', 'connection reset', 'broken pipe', 'gone away', 'no connection', 'connection refused', 'connection timed out', 'eof detected', 'ssl syscall', 'already an active transaction', 'ssl error'];
         foreach ($patterns as $pattern) {
             if (str_contains($message, $pattern) || str_contains($prevMessage, $pattern)) {
                 return true;
