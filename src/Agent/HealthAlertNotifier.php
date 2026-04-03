@@ -49,11 +49,25 @@ final class HealthAlertNotifier
 
     /**
      * Dispatch alerts for newly active diagnoses.
-     * No-ops if the list is empty or no channels are configured.
      *
      * @param array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}> $diagnoses
      */
     public function dispatch(array $diagnoses): void
+    {
+        $this->sendAll($diagnoses, 'health.degraded', 'degraded');
+    }
+
+    /**
+     * Dispatch recovery notifications for resolved diagnoses.
+     *
+     * @param array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}> $diagnoses
+     */
+    public function dispatchRecovered(array $diagnoses): void
+    {
+        $this->sendAll($diagnoses, 'health.recovered', 'recovered');
+    }
+
+    private function sendAll(array $diagnoses, string $event, string $variant): void
     {
         if (empty($diagnoses)) {
             return;
@@ -80,16 +94,16 @@ final class HealthAlertNotifier
                 }
 
                 $notifyEvents = $channel['config']['notify_events'] ?? null;
-                if ($notifyEvents !== null && ! in_array('health.degraded', $notifyEvents)) {
+                if ($notifyEvents !== null && ! in_array($event, $notifyEvents)) {
                     continue;
                 }
 
                 try {
                     match ($channel['type']) {
-                        'slack' => $this->sendSlack($channel['config'], $diagnosis),
-                        'discord' => $this->sendDiscord($channel['config'], $diagnosis),
-                        'webhook' => $this->sendWebhook($channel['config'], $diagnosis),
-                        'email' => $this->sendEmail($channel['config'], $diagnosis),
+                        'slack' => $this->sendSlack($channel['config'], $diagnosis, $variant),
+                        'discord' => $this->sendDiscord($channel['config'], $diagnosis, $variant),
+                        'webhook' => $this->sendWebhook($channel['config'], $diagnosis, $event, $variant),
+                        'email' => $this->sendEmail($channel['config'], $diagnosis, $variant),
                         default => null,
                     };
                 } catch (\Throwable $e) {
@@ -154,41 +168,51 @@ final class HealthAlertNotifier
 
     // ─── Dispatch ────────────────────────────────────────────────────
 
-    private function sendSlack(array $config, array $d): void
+    private function sendSlack(array $config, array $d, string $variant): void
     {
         $url = $config['webhook_url'] ?? '';
         if ($url === '') {
             return;
         }
 
-        $emoji = $this->severityEmoji($d['level']);
-        $text = "{$emoji} *[{$this->appName}] Agent Health Alert*{$this->instanceLabel()}\n";
-        $text .= "*{$d['code']}* — {$d['message']}\n";
-        if (! empty($d['recommendation'])) {
-            $text .= "_{$d['recommendation']}_";
+        if ($variant === 'recovered') {
+            $text = "✅ *[{$this->appName}] Recovered*{$this->instanceLabel()}\n";
+            $text .= "*{$d['code']}* — {$d['message']} (resolved)";
+        } else {
+            $emoji = $this->severityEmoji($d['level']);
+            $text = "{$emoji} *[{$this->appName}] Agent Health Alert*{$this->instanceLabel()}\n";
+            $text .= "*{$d['code']}* — {$d['message']}\n";
+            if (! empty($d['recommendation'])) {
+                $text .= "_{$d['recommendation']}_";
+            }
         }
 
         $this->httpPost($url, json_encode(['text' => $text], JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
-    private function sendDiscord(array $config, array $d): void
+    private function sendDiscord(array $config, array $d, string $variant): void
     {
         $url = $config['webhook_url'] ?? '';
         if ($url === '') {
             return;
         }
 
-        $emoji = $this->severityEmoji($d['level']);
-        $text = "{$emoji} **[{$this->appName}] Agent Health Alert**{$this->instanceLabel()}\n";
-        $text .= "**{$d['code']}** — {$d['message']}\n";
-        if (! empty($d['recommendation'])) {
-            $text .= "_{$d['recommendation']}_";
+        if ($variant === 'recovered') {
+            $text = "✅ **[{$this->appName}] Recovered**{$this->instanceLabel()}\n";
+            $text .= "**{$d['code']}** — {$d['message']} (resolved)";
+        } else {
+            $emoji = $this->severityEmoji($d['level']);
+            $text = "{$emoji} **[{$this->appName}] Agent Health Alert**{$this->instanceLabel()}\n";
+            $text .= "**{$d['code']}** — {$d['message']}\n";
+            if (! empty($d['recommendation'])) {
+                $text .= "_{$d['recommendation']}_";
+            }
         }
 
         $this->httpPost($url, json_encode(['content' => $text], JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
-    private function sendWebhook(array $config, array $d): void
+    private function sendWebhook(array $config, array $d, string $event, string $variant): void
     {
         $url = $config['url'] ?? '';
         if ($url === '') {
@@ -196,7 +220,7 @@ final class HealthAlertNotifier
         }
 
         $payload = json_encode([
-            'event' => 'health.degraded',
+            'event' => $event,
             'app' => $this->appName,
             'instance' => $this->instanceId,
             'diagnosis' => [
@@ -204,6 +228,7 @@ final class HealthAlertNotifier
                 'level' => $d['level'],
                 'message' => $d['message'],
                 'recommendation' => $d['recommendation'],
+                'status' => $variant === 'recovered' ? 'resolved' : 'active',
             ],
             'timestamp' => date('c'),
         ], JSON_INVALID_UTF8_SUBSTITUTE);
@@ -216,7 +241,7 @@ final class HealthAlertNotifier
         $this->httpPost($url, $payload, $headers);
     }
 
-    private function sendEmail(array $config, array $d): void
+    private function sendEmail(array $config, array $d, string $variant): void
     {
         $host = $config['host'] ?? '';
         $port = (int) ($config['port'] ?? 587);
@@ -231,12 +256,18 @@ final class HealthAlertNotifier
             return;
         }
 
-        $subject = str_replace(["\r", "\n"], '', "[{$this->appName}] Agent Health: {$d['code']}");
-        $body = "Agent Health Alert — {$this->appName}{$this->instanceLabel()}\n\n";
-        $body .= strtoupper($d['level']) . ": {$d['code']}\n";
-        $body .= "{$d['message']}\n";
-        if (! empty($d['recommendation'])) {
-            $body .= "\nRecommendation: {$d['recommendation']}\n";
+        if ($variant === 'recovered') {
+            $subject = str_replace(["\r", "\n"], '', "[{$this->appName}] Recovered: {$d['code']}");
+            $body = "Agent Health Recovered — {$this->appName}{$this->instanceLabel()}\n\n";
+            $body .= "{$d['code']} — {$d['message']} (resolved)\n";
+        } else {
+            $subject = str_replace(["\r", "\n"], '', "[{$this->appName}] Agent Health: {$d['code']}");
+            $body = "Agent Health Alert — {$this->appName}{$this->instanceLabel()}\n\n";
+            $body .= strtoupper($d['level']) . ": {$d['code']}\n";
+            $body .= "{$d['message']}\n";
+            if (! empty($d['recommendation'])) {
+                $body .= "\nRecommendation: {$d['recommendation']}\n";
+            }
         }
 
         $transport = $encryption === 'ssl' ? "ssl://{$host}" : $host;

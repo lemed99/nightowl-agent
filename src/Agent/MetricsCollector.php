@@ -91,6 +91,8 @@ final class MetricsCollector
     // Diagnosis lifecycle tracking
     /** @var array<string, array{first_seen_at: string, last_seen_at: string, status: string, consecutive_ticks: int, level: string, message: string, recommendation: string, value: float|int}> */
     private array $diagnosisLifecycle = [];
+    /** @var array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}> Diagnoses that resolved on the current tick */
+    private array $newlyResolved = [];
 
     // Anti-flapping: minimum consecutive ticks before a diagnosis is reported
     private const DEBOUNCE_TICKS = 2;
@@ -491,6 +493,7 @@ final class MetricsCollector
         // Handle disappearing diagnoses — collect removals separately to avoid
         // modifying array during iteration (PHP foreach with references)
         $toRemove = [];
+        $this->newlyResolved = [];
         foreach ($this->diagnosisLifecycle as $code => &$entry) {
             if (isset($activeCodes[$code]) || $entry['status'] !== 'active') {
                 continue;
@@ -503,6 +506,13 @@ final class MetricsCollector
                 // Genuine resolution
                 $entry['status'] = 'resolved';
                 $entry['resolved_at'] = $now;
+                $this->newlyResolved[] = [
+                    'code' => $code,
+                    'level' => $entry['level'],
+                    'message' => $entry['message'],
+                    'recommendation' => $entry['recommendation'],
+                    'value' => $entry['value'],
+                ];
             }
         }
         unset($entry);
@@ -685,6 +695,16 @@ final class MetricsCollector
         }
 
         return $newly;
+    }
+
+    /**
+     * Get diagnoses that resolved on this tick (genuine resolutions only, not transient).
+     *
+     * @return array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}>
+     */
+    public function getNewlyResolvedDiagnoses(): array
+    {
+        return $this->newlyResolved;
     }
 
     /**

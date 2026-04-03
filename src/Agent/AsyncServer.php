@@ -200,12 +200,12 @@ final class AsyncServer
             $rss = memory_get_usage(true);
             $this->metrics->runDiagnosis($this->backPressure, $pending, $walSize, $rss);
 
-            // Dispatch alerts for newly active diagnoses (rare — only fires
-            // when a diagnosis first crosses the debounce threshold)
-            $newDiagnoses = $this->metrics->getNewlyActiveDiagnoses();
-            if (! empty($newDiagnoses) && $this->healthAlertNotifier !== null) {
+            // Dispatch alerts for newly active or resolved diagnoses (rare —
+            // only fires on genuine state transitions, not every tick)
+            if ($this->healthAlertNotifier !== null) {
                 try {
-                    $this->healthAlertNotifier->dispatch($newDiagnoses);
+                    $this->healthAlertNotifier->dispatch($this->metrics->getNewlyActiveDiagnoses());
+                    $this->healthAlertNotifier->dispatchRecovered($this->metrics->getNewlyResolvedDiagnoses());
                 } catch (\Throwable $e) {
                     error_log("[NightOwl Agent] Health alert dispatch failed: {$e->getMessage()}");
                 }
