@@ -268,14 +268,52 @@ final class AlertNotifier
 
         $name = $this->issueName($group);
         $message = $this->issueMessage($group);
+        $occurrences = $group['count'];
+        $users = count($group['users']);
 
-        $text = "*[{$appName}] {$prefix}*\n*{$name}*\n";
+        $detail = "*{$name}*";
         if ($message !== '') {
-            $text .= "{$message}\n";
+            $detail .= "\n{$message}";
         }
-        $text .= "Occurrences: {$group['count']} | Users: " . count($group['users']);
 
-        $this->httpPost($url, json_encode(['text' => $text], JSON_INVALID_UTF8_SUBSTITUTE));
+        $payload = [
+            'attachments' => [
+                [
+                    'color' => '#DC2626',
+                    'blocks' => [
+                        [
+                            'type' => 'section',
+                            'text' => [
+                                'type' => 'mrkdwn',
+                                'text' => "\xF0\x9F\x9A\xA8  *New Issue*  \xC2\xB7  {$appName}",
+                            ],
+                        ],
+                        [
+                            'type' => 'section',
+                            'text' => [
+                                'type' => 'mrkdwn',
+                                'text' => $detail,
+                            ],
+                        ],
+                        [
+                            'type' => 'section',
+                            'fields' => [
+                                ['type' => 'mrkdwn', 'text' => "*Occurrences*\n{$occurrences}"],
+                                ['type' => 'mrkdwn', 'text' => "*Users Affected*\n{$users}"],
+                            ],
+                        ],
+                        [
+                            'type' => 'context',
+                            'elements' => [
+                                ['type' => 'mrkdwn', 'text' => "\xF0\x9F\xA6\x89 NightOwl"],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ];
+
+        $this->httpPost($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
     private function sendDiscord(array $config, string $appName, string $prefix, array $group): void
@@ -287,14 +325,32 @@ final class AlertNotifier
 
         $name = $this->issueName($group);
         $message = $this->issueMessage($group);
+        $occurrences = $group['count'];
+        $users = count($group['users']);
 
-        $text = "**[{$appName}] {$prefix}**\n**{$name}**\n";
+        $description = "**{$name}**";
         if ($message !== '') {
-            $text .= "{$message}\n";
+            $description .= "\n{$message}";
         }
-        $text .= "Occurrences: {$group['count']} | Users: " . count($group['users']);
 
-        $this->httpPost($url, json_encode(['content' => $text], JSON_INVALID_UTF8_SUBSTITUTE));
+        $payload = [
+            'embeds' => [
+                [
+                    'title' => "\xF0\x9F\x9A\xA8  New Issue",
+                    'description' => $description,
+                    'color' => 0xDC2626,
+                    'fields' => [
+                        ['name' => 'Occurrences', 'value' => (string) $occurrences, 'inline' => true],
+                        ['name' => 'Users Affected', 'value' => (string) $users, 'inline' => true],
+                        ['name' => 'App', 'value' => $appName, 'inline' => true],
+                    ],
+                    'footer' => ['text' => "\xF0\x9F\xA6\x89 NightOwl"],
+                    'timestamp' => date('c'),
+                ],
+            ],
+        ];
+
+        $this->httpPost($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
     private function sendWebhook(array $config, string $appName, string $prefix, array $group): void
@@ -340,19 +396,52 @@ final class AlertNotifier
         }
 
         $name = $this->issueName($group);
-        $subject = $this->sanitizeHeader("[{$appName}] {$prefix}: {$name}");
+        $message = $this->issueMessage($group);
+        $occurrences = $group['count'];
+        $users = count($group['users']);
+
+        $subject = $this->sanitizeHeader("[{$appName}] New Issue: {$name}");
         $fromName = $this->sanitizeHeader($fromName);
 
-        $body = "{$prefix} in {$appName}\n\n";
-        $body .= "{$name}\n";
-        $message = $this->issueMessage($group);
-        if ($message !== '') {
-            $body .= "Message: {$message}\n";
-        }
-        $body .= "\nOccurrences: {$group['count']}\n";
-        $body .= "Users affected: " . count($group['users']) . "\n";
+        $body = $this->buildEmailHtml($appName, $name, $message, $occurrences, $users);
 
-        $this->smtpSend($host, $port, $username, $password, $encryption, $fromAddress, $fromName, $toAddresses, $subject, $body);
+        $this->smtpSend($host, $port, $username, $password, $encryption, $fromAddress, $fromName, $toAddresses, $subject, $body, true);
+    }
+
+    private function buildEmailHtml(string $appName, string $class, string $message, int $occurrences, int $users): string
+    {
+        $escapedClass = htmlspecialchars($class, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $escapedMessage = htmlspecialchars($message, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $escapedApp = htmlspecialchars($appName, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+        $messageRow = '';
+        if ($message !== '') {
+            $messageRow = '<tr><td style="padding:6px 28px 0;"><div style="font-size:13px;color:#52525b;line-height:1.5;word-break:break-word;">' . $escapedMessage . '</div></td></tr>';
+        }
+
+        return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>'
+            . '<body style="margin:0;padding:0;background-color:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;">'
+            . '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f5;padding:32px 16px;"><tr><td align="center">'
+            . '<table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;background-color:#ffffff;border-radius:8px;overflow:hidden;">'
+            // Color bar
+            . '<tr><td style="height:4px;background-color:#DC2626;"></td></tr>'
+            // Header
+            . '<tr><td style="padding:24px 28px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>'
+            . '<td><span style="display:inline-block;padding:3px 10px;background-color:#FEE2E2;color:#DC2626;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">New Issue</span></td>'
+            . '<td align="right" style="color:#a1a1aa;font-size:12px;">' . $escapedApp . '</td>'
+            . '</tr></table></td></tr>'
+            // Exception class
+            . '<tr><td style="padding:16px 28px 0;"><div style="font-size:16px;font-weight:600;color:#18181b;word-break:break-all;">' . $escapedClass . '</div></td></tr>'
+            // Message
+            . $messageRow
+            // Stats
+            . '<tr><td style="padding:20px 28px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#fafafa;border-radius:6px;"><tr>'
+            . '<td style="padding:14px 18px;width:50%;border-right:1px solid #e4e4e7;"><div style="font-size:11px;color:#a1a1aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">Occurrences</div><div style="font-size:22px;font-weight:700;color:#18181b;">' . $occurrences . '</div></td>'
+            . '<td style="padding:14px 18px;width:50%;"><div style="font-size:11px;color:#a1a1aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">Users Affected</div><div style="font-size:22px;font-weight:700;color:#18181b;">' . $users . '</div></td>'
+            . '</tr></table></td></tr>'
+            // Footer
+            . '<tr><td style="padding:14px 28px;border-top:1px solid #f4f4f5;"><span style="color:#a1a1aa;font-size:11px;">&#x1F989; NightOwl</span></td></tr>'
+            . '</table></td></tr></table></body></html>';
     }
 
     // ─── Raw HTTP ────────────────────────────────────────────────────
@@ -390,6 +479,7 @@ final class AlertNotifier
         array $toAddresses,
         string $subject,
         string $body,
+        bool $isHtml = false,
     ): void {
         $transport = $encryption === 'ssl' ? "ssl://{$host}" : $host;
 
@@ -439,7 +529,8 @@ final class AlertNotifier
             $msg .= "To: {$toHeader}\r\n";
             $msg .= "Subject: {$subject}\r\n";
             $msg .= "MIME-Version: 1.0\r\n";
-            $msg .= "Content-Type: text/plain; charset=UTF-8\r\n";
+            $contentType = $isHtml ? 'text/html' : 'text/plain';
+            $msg .= "Content-Type: {$contentType}; charset=UTF-8\r\n";
             $msg .= "\r\n";
             $msg .= $smtpBody;
             $msg .= "\r\n.\r\n";
