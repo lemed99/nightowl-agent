@@ -20,6 +20,10 @@ final class AlertNotifier
     private float $channelCacheExpiry = 0;
     private int $cacheTtl;
 
+    /** Lightweight polling: detect channel changes without full reload */
+    private float $channelVersionCheckAt = 0;
+    private ?string $channelFingerprint = null;
+
     /** Maximum total time for notification dispatch per flush (seconds) */
     private const MAX_NOTIFICATION_SECONDS = 5.0;
 
@@ -160,27 +164,50 @@ final class AlertNotifier
     private function loadChannels(PDO $pdo): array
     {
         $now = microtime(true);
+
         if ($now < $this->channelCacheExpiry) {
-            return $this->channelCache;
+            // Periodically poll for dashboard-side channel changes
+            if ($now < $this->channelVersionCheckAt) {
+                return $this->channelCache;
+            }
+
+            $this->channelVersionCheckAt = $now + 30;
+
+            try {
+                $fingerprint = $pdo->query(
+                    "SELECT COUNT(*)::text || ':' || COALESCE(MAX(updated_at)::text, '') FROM nightowl_alert_channels WHERE enabled = true"
+                )->fetchColumn();
+
+                if ($fingerprint === $this->channelFingerprint) {
+                    return $this->channelCache;
+                }
+                // Fingerprint changed — fall through to full reload
+            } catch (\Throwable) {
+                return $this->channelCache;
+            }
         }
 
         $this->channelCache = [];
         $this->channelCacheExpiry = $now + $this->cacheTtl;
+        $this->channelVersionCheckAt = $now + 30;
 
         try {
             $rows = $pdo->query(
-                "SELECT type, name, config FROM nightowl_alert_channels WHERE enabled = true"
+                "SELECT type, name, config, updated_at FROM nightowl_alert_channels WHERE enabled = true"
             )->fetchAll(PDO::FETCH_ASSOC);
 
+            $maxUpdatedAt = '';
             foreach ($rows as $row) {
-                $config = json_decode($row['config'], true) ?? [];
-
+                if (($row['updated_at'] ?? '') > $maxUpdatedAt) {
+                    $maxUpdatedAt = $row['updated_at'];
+                }
                 $this->channelCache[] = [
                     'type' => $row['type'],
                     'name' => $row['name'],
-                    'config' => $config,
+                    'config' => json_decode($row['config'], true) ?? [],
                 ];
             }
+            $this->channelFingerprint = count($rows) . ':' . $maxUpdatedAt;
         } catch (\Throwable) {
             // Table may not exist yet
         }

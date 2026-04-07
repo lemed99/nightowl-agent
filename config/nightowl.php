@@ -121,9 +121,10 @@ return [
     | and caches them locally. When a record's duration exceeds a matching
     | threshold, a performance issue is created in nightowl_issues.
     |
-    | The cache TTL controls how often the agent re-reads thresholds from
-    | the database. Thresholds rarely change, so 24 hours is a safe default.
-    | Restart the agent to pick up changes immediately.
+    | The cache TTL controls the maximum lifetime of the threshold cache.
+    | In addition, the agent polls the updated_at column every 30 seconds
+    | to detect dashboard-side changes, so new thresholds take effect
+    | within ~30s without restarting the agent.
     |
     */
     'threshold_cache_ttl' => env('NIGHTOWL_THRESHOLD_CACHE_TTL', 86400),

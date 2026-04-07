@@ -21,6 +21,10 @@ final class HealthAlertNotifier
     private array $channelCache = [];
     private float $channelCacheExpiry = 0;
 
+    /** Lightweight polling: detect channel changes without full reload */
+    private float $channelVersionCheckAt = 0;
+    private ?string $channelFingerprint = null;
+
     private const CHANNEL_CACHE_TTL = 3600;
     private const MAX_DISPATCH_SECONDS = 5.0;
 
@@ -128,24 +132,49 @@ final class HealthAlertNotifier
     private function loadChannels(): array
     {
         $now = microtime(true);
+
         if ($now < $this->channelCacheExpiry) {
-            return $this->channelCache;
+            // Periodically poll for dashboard-side channel changes
+            if ($now < $this->channelVersionCheckAt) {
+                return $this->channelCache;
+            }
+
+            $this->channelVersionCheckAt = $now + 30;
+
+            try {
+                $fingerprint = $this->pdo()->query(
+                    "SELECT COUNT(*)::text || ':' || COALESCE(MAX(updated_at)::text, '') FROM nightowl_alert_channels WHERE enabled = true"
+                )->fetchColumn();
+
+                if ($fingerprint === $this->channelFingerprint) {
+                    return $this->channelCache;
+                }
+                // Fingerprint changed — fall through to full reload
+            } catch (\Throwable) {
+                return $this->channelCache;
+            }
         }
 
         $this->channelCache = [];
         $this->channelCacheExpiry = $now + self::CHANNEL_CACHE_TTL;
+        $this->channelVersionCheckAt = $now + 30;
 
         $rows = $this->pdo()->query(
-            "SELECT type, name, config FROM nightowl_alert_channels WHERE enabled = true"
+            "SELECT type, name, config, updated_at FROM nightowl_alert_channels WHERE enabled = true"
         )->fetchAll(PDO::FETCH_ASSOC);
 
+        $maxUpdatedAt = '';
         foreach ($rows as $row) {
+            if (($row['updated_at'] ?? '') > $maxUpdatedAt) {
+                $maxUpdatedAt = $row['updated_at'];
+            }
             $this->channelCache[] = [
                 'type' => $row['type'],
                 'name' => $row['name'],
                 'config' => json_decode($row['config'], true) ?? [],
             ];
         }
+        $this->channelFingerprint = count($rows) . ':' . $maxUpdatedAt;
 
         return $this->channelCache;
     }

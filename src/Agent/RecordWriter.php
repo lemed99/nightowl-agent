@@ -16,6 +16,10 @@ final class RecordWriter
     private float $thresholdCacheExpiry = 0;
     private int $thresholdCacheTtl;
 
+    /** Lightweight polling: detect settings changes without full reload */
+    private float $thresholdVersionCheckAt = 0;
+    private ?string $thresholdUpdatedAt = null;
+
     private AlertNotifier $notifier;
     private string $appName;
 
@@ -312,6 +316,8 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_queries', $columns, $rows);
+
+        $this->checkThresholds('query', $records, 'connection');
     }
 
     private function writeExceptions(array $records): void
@@ -519,6 +525,8 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_cache_events', $columns, $rows);
+
+        $this->checkThresholds('cache', $records, 'store');
     }
 
     private function writeMail(array $records): void
@@ -543,6 +551,8 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_mail', $columns, $rows);
+
+        $this->checkThresholds('mail', $records, ['class', 'mailable']);
     }
 
     private function writeNotifications(array $records): void
@@ -565,6 +575,8 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_notifications', $columns, $rows);
+
+        $this->checkThresholds('notification', $records, ['class', 'notification']);
     }
 
     private function writeOutgoingRequests(array $records): void
@@ -588,6 +600,8 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_outgoing_requests', $columns, $rows);
+
+        $this->checkThresholds('outgoing_request', $records, 'host');
     }
 
     private function writeLogs(array $records): void
@@ -711,6 +725,10 @@ final class RecordWriter
     /**
      * Load thresholds from nightowl_settings, cached for threshold_cache_ttl seconds.
      *
+     * Every 30s a lightweight poll checks whether updated_at changed in the DB.
+     * If it did, the cache is invalidated and thresholds are reloaded immediately.
+     * This lets users update thresholds from the dashboard without restarting the agent.
+     *
      * @return array<string, list<array{target?: string, duration_ms: int}>>
      */
     private function getThresholds(): array
@@ -718,22 +736,43 @@ final class RecordWriter
         $now = microtime(true);
 
         if ($now < $this->thresholdCacheExpiry) {
-            return $this->thresholdCache;
+            // Periodically poll updated_at to detect dashboard-side changes
+            if ($now < $this->thresholdVersionCheckAt) {
+                return $this->thresholdCache;
+            }
+
+            $this->thresholdVersionCheckAt = $now + 30;
+
+            try {
+                $updatedAt = $this->pdo()->query(
+                    "SELECT updated_at FROM nightowl_settings WHERE key = 'thresholds'"
+                )->fetchColumn() ?: null;
+
+                if ($updatedAt === $this->thresholdUpdatedAt) {
+                    return $this->thresholdCache;
+                }
+                // updated_at changed — fall through to full reload
+            } catch (\Throwable) {
+                return $this->thresholdCache;
+            }
         }
 
         $this->thresholdCache = [];
         $this->thresholdCacheExpiry = $now + $this->thresholdCacheTtl;
+        $this->thresholdVersionCheckAt = $now + 30;
 
         try {
-            $raw = $this->pdo()->query(
-                "SELECT value FROM nightowl_settings WHERE key = 'thresholds'"
-            )->fetchColumn();
+            $row = $this->pdo()->query(
+                "SELECT value, updated_at FROM nightowl_settings WHERE key = 'thresholds'"
+            )->fetch(PDO::FETCH_ASSOC);
 
-            if (! $raw) {
+            $this->thresholdUpdatedAt = is_array($row) ? ($row['updated_at'] ?? null) : null;
+
+            if (! is_array($row) || empty($row['value'])) {
                 return $this->thresholdCache;
             }
 
-            $items = json_decode($raw, true);
+            $items = json_decode($row['value'], true);
             if (! is_array($items)) {
                 return $this->thresholdCache;
             }
