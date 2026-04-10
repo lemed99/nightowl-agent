@@ -30,15 +30,19 @@ final class AlertNotifier
     /** @var list<array{appName: string, issueGroups: array, issueType: string, newHashes: string[]}> */
     private array $pendingNotifications = [];
 
-    public function __construct(int $cacheTtl = 86400)
+    private string $frontendUrl;
+
+    public function __construct(int $cacheTtl = 86400, string $frontendUrl = '')
     {
         $this->cacheTtl = $cacheTtl;
+        $this->frontendUrl = $frontendUrl;
     }
 
     public static function fromConfig(): self
     {
         return new self(
             (int) config('nightowl.threshold_cache_ttl', 86400),
+            (string) config('app.frontend_url', ''),
         );
     }
 
@@ -112,6 +116,9 @@ final class AlertNotifier
     /**
      * Stage 3: Call AFTER the transaction commits. Dispatches all queued notifications.
      * This is the only method that does I/O (HTTP/SMTP).
+     *
+     * Enriches each new issue from the DB (now committed) before dispatching,
+     * so notifications carry the full context: issue ID, timestamps, environment, etc.
      */
     public function flushNotifications(PDO $pdo): void
     {
@@ -130,6 +137,16 @@ final class AlertNotifier
         $deadline = microtime(true) + self::MAX_NOTIFICATION_SECONDS;
 
         foreach ($pending as $batch) {
+            // Enrich groups from DB once per batch (not per channel)
+            $enrichedGroups = [];
+            foreach ($batch['newHashes'] as $hash) {
+                $group = $batch['issueGroups'][$hash] ?? null;
+                if ($group === null) {
+                    continue;
+                }
+                $enrichedGroups[$hash] = $this->enrichFromDb($pdo, $group, $hash, $batch['issueType']);
+            }
+
             foreach ($channels as $channel) {
                 if (microtime(true) > $deadline) {
                     error_log('[NightOwl Agent] Notification dispatch budget exceeded (' . self::MAX_NOTIFICATION_SECONDS . 's), skipping remaining');
@@ -143,20 +160,75 @@ final class AlertNotifier
                     continue;
                 }
 
-                foreach ($batch['newHashes'] as $hash) {
+                foreach ($enrichedGroups as $group) {
                     if (microtime(true) > $deadline) {
                         error_log('[NightOwl Agent] Notification dispatch budget exceeded (' . self::MAX_NOTIFICATION_SECONDS . 's), skipping remaining');
                         return;
                     }
 
-                    $group = $batch['issueGroups'][$hash] ?? null;
-                    if ($group === null) {
-                        continue;
-                    }
-                    $this->dispatchToChannel($channel, $batch['appName'], 'New Issue', $group);
+                    $this->dispatchToChannel($channel, $batch['appName'], 'New Issue', $group, $batch['issueType']);
                 }
             }
         }
+    }
+
+    /**
+     * Enrich a notification group with data from the now-committed DB rows.
+     *
+     * Queries nightowl_issues for: id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype.
+     * For exceptions, also queries nightowl_exceptions for: file, line, server, php_version, laravel_version, handled.
+     */
+    private function enrichFromDb(PDO $pdo, array $group, string $groupHash, string $issueType): array
+    {
+        try {
+            $stmt = $pdo->prepare('
+                SELECT id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype
+                FROM nightowl_issues
+                WHERE group_hash = ? AND type = ?
+                LIMIT 1
+            ');
+            $stmt->execute([$groupHash, $issueType]);
+            $issue = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if ($issue) {
+                $group['issue_id'] = (int) $issue['id'];
+                $group['first_seen_at'] = $issue['first_seen_at'];
+                $group['last_seen_at'] = $issue['last_seen_at'];
+                $group['count'] = (int) ($issue['occurrences_count'] ?? $group['count']);
+                $group['users_count'] = (int) ($issue['users_count'] ?? count($group['users']));
+                $group['subtype'] = $issue['subtype'] ?? ($group['subtype'] ?? null);
+            }
+        } catch (\Throwable) {
+            // Best-effort — dispatch with whatever we have
+        }
+
+        if ($issueType === 'exception') {
+            try {
+                $stmt = $pdo->prepare('
+                    SELECT file, line, server, php_version, laravel_version, handled
+                    FROM nightowl_exceptions
+                    WHERE fingerprint = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                ');
+                $stmt->execute([$groupHash]);
+                $exc = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                if ($exc) {
+                    $group['environment'] = ! empty($exc['server']) ? $exc['server'] : null;
+                    $group['handled'] = isset($exc['handled']) ? (bool) $exc['handled'] : null;
+                    $group['php_version'] = ! empty($exc['php_version']) ? $exc['php_version'] : null;
+                    $group['laravel_version'] = ! empty($exc['laravel_version']) ? $exc['laravel_version'] : null;
+                    if (! empty($exc['file'])) {
+                        $group['location'] = $exc['file'] . (! empty($exc['line']) ? ':' . $exc['line'] : '');
+                    }
+                }
+            } catch (\Throwable) {
+                // Best-effort
+            }
+        }
+
+        return $group;
     }
 
     // ─── Channel Loading ─────────────────────────────────────────────
@@ -217,14 +289,14 @@ final class AlertNotifier
 
     // ─── Dispatch ────────────────────────────────────────────────────
 
-    private function dispatchToChannel(array $channel, string $appName, string $prefix, array $group): void
+    private function dispatchToChannel(array $channel, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
     {
         try {
             match ($channel['type']) {
-                'slack' => $this->sendSlack($channel['config'], $appName, $prefix, $group),
-                'discord' => $this->sendDiscord($channel['config'], $appName, $prefix, $group),
-                'webhook' => $this->sendWebhook($channel['config'], $appName, $prefix, $group),
-                'email' => $this->sendEmail($channel['config'], $appName, $prefix, $group),
+                'slack' => $this->sendSlack($channel['config'], $appName, $prefix, $group, $issueType),
+                'discord' => $this->sendDiscord($channel['config'], $appName, $prefix, $group, $issueType),
+                'webhook' => $this->sendWebhook($channel['config'], $appName, $prefix, $group, $issueType),
+                'email' => $this->sendEmail($channel['config'], $appName, $prefix, $group, $issueType),
                 default => null,
             };
         } catch (\Throwable $e) {
@@ -251,6 +323,21 @@ final class AlertNotifier
         return $message;
     }
 
+    private function logoUrl(): string
+    {
+        return rtrim($this->frontendUrl, '/') . '/logo.png';
+    }
+
+    private function buildViewUrl(?int $issueId): ?string
+    {
+        if ($issueId === null || $this->frontendUrl === '') {
+            return null;
+        }
+
+        // Agent doesn't know the app ID in the dashboard, so link to the issues list
+        return rtrim($this->frontendUrl, '/') . '/dashboard';
+    }
+
     /**
      * Strip CR/LF from a string to prevent email header injection.
      */
@@ -259,7 +346,7 @@ final class AlertNotifier
         return str_replace(["\r", "\n"], '', $value);
     }
 
-    private function sendSlack(array $config, string $appName, string $prefix, array $group): void
+    private function sendSlack(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
     {
         $url = $config['webhook_url'] ?? '';
         if ($url === '') {
@@ -268,47 +355,87 @@ final class AlertNotifier
 
         $name = $this->issueName($group);
         $message = $this->issueMessage($group);
-        $occurrences = $group['count'];
-        $users = count($group['users']);
+        $occurrences = (int) ($group['count'] ?? 0);
+        $users = (int) ($group['users_count'] ?? count($group['users'] ?? []));
+        $subtype = $group['subtype'] ?? null;
+        $issueId = $group['issue_id'] ?? null;
+        $handled = $group['handled'] ?? null;
+        $isException = $issueType === 'exception';
+
+        $blocks = [];
+
+        $blocks[] = [
+            'type' => 'section',
+            'text' => [
+                'type' => 'mrkdwn',
+                'text' => "\xF0\x9F\x9A\xA8  *New Issue*  \xC2\xB7  {$appName}",
+            ],
+        ];
 
         $detail = "*{$name}*";
         if ($message !== '') {
             $detail .= "\n{$message}";
         }
+        $blocks[] = [
+            'type' => 'section',
+            'text' => ['type' => 'mrkdwn', 'text' => $detail],
+        ];
+
+        $fields = [];
+        if ($issueId !== null) {
+            $fields[] = ['type' => 'mrkdwn', 'text' => "*Issue*\n#{$issueId}"];
+        }
+        if ($isException) {
+            $statusText = ($handled === true) ? 'Handled' : 'Unhandled';
+            $fields[] = ['type' => 'mrkdwn', 'text' => "*Status*\n{$statusText}"];
+            if (! empty($group['environment'])) {
+                $fields[] = ['type' => 'mrkdwn', 'text' => "*Environment*\n{$group['environment']}"];
+            }
+            if (! empty($group['location'])) {
+                $fields[] = ['type' => 'mrkdwn', 'text' => "*Location*\n`{$group['location']}`"];
+            }
+            if (! empty($group['laravel_version'])) {
+                $fields[] = ['type' => 'mrkdwn', 'text' => "*Laravel*\n{$group['laravel_version']}"];
+            }
+            if (! empty($group['php_version'])) {
+                $fields[] = ['type' => 'mrkdwn', 'text' => "*PHP*\n{$group['php_version']}"];
+            }
+        } else {
+            $subtypeLabel = EmailTemplate::subtypeLabel($subtype);
+            $fields[] = ['type' => 'mrkdwn', 'text' => "*{$subtypeLabel}*\n`{$name}`"];
+        }
+        $fields[] = ['type' => 'mrkdwn', 'text' => "*Occurrences*\n{$occurrences}"];
+        $fields[] = ['type' => 'mrkdwn', 'text' => "*Users Affected*\n{$users}"];
+
+        $blocks[] = [
+            'type' => 'section',
+            'fields' => array_slice($fields, 0, 10),
+        ];
+
+        // First/Last seen
+        $contextElements = [];
+        if (! empty($group['first_seen_at'])) {
+            $contextElements[] = ['type' => 'mrkdwn', 'text' => "First seen: {$group['first_seen_at']}"];
+        }
+        if (! empty($group['last_seen_at'])) {
+            $contextElements[] = ['type' => 'mrkdwn', 'text' => "Last seen: {$group['last_seen_at']}"];
+        }
+        if (! empty($contextElements)) {
+            $blocks[] = ['type' => 'context', 'elements' => $contextElements];
+        }
+
+        $blocks[] = [
+            'type' => 'context',
+            'elements' => [['type' => 'mrkdwn', 'text' => 'NightOwl']],
+        ];
 
         $payload = [
+            'username' => 'NightOwl',
+            'icon_url' => $this->logoUrl(),
             'attachments' => [
                 [
                     'color' => '#DC2626',
-                    'blocks' => [
-                        [
-                            'type' => 'section',
-                            'text' => [
-                                'type' => 'mrkdwn',
-                                'text' => "\xF0\x9F\x9A\xA8  *New Issue*  \xC2\xB7  {$appName}",
-                            ],
-                        ],
-                        [
-                            'type' => 'section',
-                            'text' => [
-                                'type' => 'mrkdwn',
-                                'text' => $detail,
-                            ],
-                        ],
-                        [
-                            'type' => 'section',
-                            'fields' => [
-                                ['type' => 'mrkdwn', 'text' => "*Occurrences*\n{$occurrences}"],
-                                ['type' => 'mrkdwn', 'text' => "*Users Affected*\n{$users}"],
-                            ],
-                        ],
-                        [
-                            'type' => 'context',
-                            'elements' => [
-                                ['type' => 'mrkdwn', 'text' => "\xF0\x9F\xA6\x89 NightOwl"],
-                            ],
-                        ],
-                    ],
+                    'blocks' => $blocks,
                 ],
             ],
         ];
@@ -316,7 +443,7 @@ final class AlertNotifier
         $this->httpPost($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
-    private function sendDiscord(array $config, string $appName, string $prefix, array $group): void
+    private function sendDiscord(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
     {
         $url = $config['webhook_url'] ?? '';
         if ($url === '') {
@@ -325,26 +452,70 @@ final class AlertNotifier
 
         $name = $this->issueName($group);
         $message = $this->issueMessage($group);
-        $occurrences = $group['count'];
-        $users = count($group['users']);
+        $occurrences = (int) ($group['count'] ?? 0);
+        $users = (int) ($group['users_count'] ?? count($group['users'] ?? []));
+        $subtype = $group['subtype'] ?? null;
+        $issueId = $group['issue_id'] ?? null;
+        $handled = $group['handled'] ?? null;
+        $isException = $issueType === 'exception';
 
         $description = "**{$name}**";
         if ($message !== '') {
             $description .= "\n{$message}";
         }
 
+        $fields = [
+            ['name' => 'App', 'value' => $appName, 'inline' => true],
+        ];
+
+        if ($issueId !== null) {
+            $fields[] = ['name' => 'Issue', 'value' => '#' . $issueId, 'inline' => true];
+        }
+
+        if (! empty($group['environment'])) {
+            $fields[] = ['name' => 'Environment', 'value' => (string) $group['environment'], 'inline' => true];
+        }
+
+        if ($isException) {
+            $statusText = ($handled === true) ? 'Handled' : 'Unhandled';
+            $fields[] = ['name' => 'Status', 'value' => $statusText, 'inline' => true];
+            if (! empty($group['location'])) {
+                $fields[] = ['name' => 'Location', 'value' => '`' . $group['location'] . '`', 'inline' => false];
+            }
+            if (! empty($group['laravel_version'])) {
+                $fields[] = ['name' => 'Laravel', 'value' => (string) $group['laravel_version'], 'inline' => true];
+            }
+            if (! empty($group['php_version'])) {
+                $fields[] = ['name' => 'PHP', 'value' => (string) $group['php_version'], 'inline' => true];
+            }
+        } else {
+            $subtypeLabel = EmailTemplate::subtypeLabel($subtype);
+            $fields[] = ['name' => $subtypeLabel, 'value' => '`' . $name . '`', 'inline' => false];
+        }
+
+        $fields[] = ['name' => 'Occurrences', 'value' => (string) $occurrences, 'inline' => true];
+        $fields[] = ['name' => 'Users Affected', 'value' => (string) $users, 'inline' => true];
+
+        if (! empty($group['first_seen_at'])) {
+            $fields[] = ['name' => 'First Seen', 'value' => (string) $group['first_seen_at'], 'inline' => true];
+        }
+        if (! empty($group['last_seen_at'])) {
+            $fields[] = ['name' => 'Last Seen', 'value' => (string) $group['last_seen_at'], 'inline' => true];
+        }
+
+        $logoUrl = $this->logoUrl();
+
         $payload = [
+            'username' => 'NightOwl',
+            'avatar_url' => $logoUrl,
             'embeds' => [
                 [
+                    'author' => ['name' => 'NightOwl', 'icon_url' => $logoUrl],
                     'title' => "\xF0\x9F\x9A\xA8  New Issue",
                     'description' => $description,
                     'color' => 0xDC2626,
-                    'fields' => [
-                        ['name' => 'Occurrences', 'value' => (string) $occurrences, 'inline' => true],
-                        ['name' => 'Users Affected', 'value' => (string) $users, 'inline' => true],
-                        ['name' => 'App', 'value' => $appName, 'inline' => true],
-                    ],
-                    'footer' => ['text' => "\xF0\x9F\xA6\x89 NightOwl"],
+                    'fields' => array_slice($fields, 0, 25),
+                    'footer' => ['text' => 'NightOwl', 'icon_url' => $logoUrl],
                     'timestamp' => date('c'),
                 ],
             ],
@@ -353,22 +524,37 @@ final class AlertNotifier
         $this->httpPost($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
-    private function sendWebhook(array $config, string $appName, string $prefix, array $group): void
+    private function sendWebhook(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
     {
         $url = $config['url'] ?? '';
         if ($url === '') {
             return;
         }
 
+        $issue = [
+            'id' => $group['issue_id'] ?? null,
+            'type' => $issueType,
+            'subtype' => $group['subtype'] ?? null,
+            'class' => $this->issueName($group),
+            'message' => $group['message'] ?? '',
+            'occurrences' => (int) ($group['count'] ?? 0),
+            'users' => (int) ($group['users_count'] ?? count($group['users'] ?? [])),
+            'first_seen_at' => $group['first_seen_at'] ?? null,
+            'last_seen_at' => $group['last_seen_at'] ?? null,
+        ];
+
+        if ($issueType === 'exception') {
+            $issue['handled'] = $group['handled'] ?? null;
+            $issue['environment'] = $group['environment'] ?? null;
+            $issue['location'] = $group['location'] ?? null;
+            $issue['php_version'] = $group['php_version'] ?? null;
+            $issue['laravel_version'] = $group['laravel_version'] ?? null;
+        }
+
         $payload = json_encode([
             'event' => 'issue.new',
             'app' => $appName,
-            'issue' => [
-                'class' => $this->issueName($group),
-                'message' => $group['message'] ?? '',
-                'occurrences' => $group['count'],
-                'users' => count($group['users']),
-            ],
+            'issue' => $issue,
             'timestamp' => date('c'),
         ], JSON_INVALID_UTF8_SUBSTITUTE);
 
@@ -380,7 +566,7 @@ final class AlertNotifier
         $this->httpPost($url, $payload, $headers);
     }
 
-    private function sendEmail(array $config, string $appName, string $prefix, array $group): void
+    private function sendEmail(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
     {
         $host = $config['host'] ?? '';
         $port = (int) ($config['port'] ?? 587);
@@ -396,52 +582,14 @@ final class AlertNotifier
         }
 
         $name = $this->issueName($group);
-        $message = $this->issueMessage($group);
-        $occurrences = $group['count'];
-        $users = count($group['users']);
+        $group['view_url'] = $this->buildViewUrl($group['issue_id'] ?? null);
 
         $subject = $this->sanitizeHeader("[{$appName}] New Issue: {$name}");
         $fromName = $this->sanitizeHeader($fromName);
 
-        $body = $this->buildEmailHtml($appName, $name, $message, $occurrences, $users);
+        $body = EmailTemplate::renderIssue($appName, $group, $issueType);
 
         $this->smtpSend($host, $port, $username, $password, $encryption, $fromAddress, $fromName, $toAddresses, $subject, $body, true);
-    }
-
-    private function buildEmailHtml(string $appName, string $class, string $message, int $occurrences, int $users): string
-    {
-        $escapedClass = htmlspecialchars($class, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-        $escapedMessage = htmlspecialchars($message, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-        $escapedApp = htmlspecialchars($appName, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-
-        $messageRow = '';
-        if ($message !== '') {
-            $messageRow = '<tr><td style="padding:6px 28px 0;"><div style="font-size:13px;color:#52525b;line-height:1.5;word-break:break-word;">' . $escapedMessage . '</div></td></tr>';
-        }
-
-        return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>'
-            . '<body style="margin:0;padding:0;background-color:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;">'
-            . '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f5;padding:32px 16px;"><tr><td align="center">'
-            . '<table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;background-color:#ffffff;border-radius:8px;overflow:hidden;">'
-            // Color bar
-            . '<tr><td style="height:4px;background-color:#DC2626;"></td></tr>'
-            // Header
-            . '<tr><td style="padding:24px 28px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>'
-            . '<td><span style="display:inline-block;padding:3px 10px;background-color:#FEE2E2;color:#DC2626;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">New Issue</span></td>'
-            . '<td align="right" style="color:#a1a1aa;font-size:12px;">' . $escapedApp . '</td>'
-            . '</tr></table></td></tr>'
-            // Exception class
-            . '<tr><td style="padding:16px 28px 0;"><div style="font-size:16px;font-weight:600;color:#18181b;word-break:break-all;">' . $escapedClass . '</div></td></tr>'
-            // Message
-            . $messageRow
-            // Stats
-            . '<tr><td style="padding:20px 28px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#fafafa;border-radius:6px;"><tr>'
-            . '<td style="padding:14px 18px;width:50%;border-right:1px solid #e4e4e7;"><div style="font-size:11px;color:#a1a1aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">Occurrences</div><div style="font-size:22px;font-weight:700;color:#18181b;">' . $occurrences . '</div></td>'
-            . '<td style="padding:14px 18px;width:50%;"><div style="font-size:11px;color:#a1a1aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">Users Affected</div><div style="font-size:22px;font-weight:700;color:#18181b;">' . $users . '</div></td>'
-            . '</tr></table></td></tr>'
-            // Footer
-            . '<tr><td style="padding:14px 28px;border-top:1px solid #f4f4f5;"><span style="color:#a1a1aa;font-size:11px;">&#x1F989; NightOwl</span></td></tr>'
-            . '</table></td></tr></table></body></html>';
     }
 
     // ─── Raw HTTP ────────────────────────────────────────────────────

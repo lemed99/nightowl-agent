@@ -3,9 +3,10 @@
 namespace NightOwl\Notifications;
 
 use Illuminate\Bus\Queueable;
-use Illuminate\Notifications\Messages\MailMessage;
+use Illuminate\Contracts\Mail\Mailable;
 use Illuminate\Notifications\Messages\SlackMessage;
 use Illuminate\Notifications\Notification;
+use NightOwl\Agent\EmailTemplate;
 
 class ThresholdExceeded extends Notification
 {
@@ -32,16 +33,13 @@ class ThresholdExceeded extends Notification
         return $channels;
     }
 
-    public function toMail(object $notifiable): MailMessage
+    public function toMail(object $notifiable): Mailable
     {
         $appName = config('app.name', 'Laravel');
 
-        return (new MailMessage)
-            ->subject("[NightOwl] Alert: {$this->title}")
-            ->greeting("Performance alert for {$appName}")
-            ->line("**{$this->title}**")
-            ->line($this->message)
-            ->action('View Dashboard', 'https://api.usenightowl.com');
+        $html = EmailTemplate::renderThreshold($appName, $this->type, $this->title, $this->message);
+
+        return new BrandedMail($html, "[NightOwl] Alert: {$this->title}");
     }
 
     public function toSlack(object $notifiable): SlackMessage

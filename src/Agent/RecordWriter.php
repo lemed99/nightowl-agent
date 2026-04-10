@@ -693,7 +693,7 @@ final class RecordWriter
 
         $this->copyBatch('nightowl_scheduled_tasks', $columns, $rows);
 
-        $this->checkThresholds('scheduled-task', $records, ['name', 'command']);
+        $this->checkThresholds('scheduled_task', $records, ['name', 'command']);
     }
 
     // ─── Performance Threshold Checking ──────────────────────────────
@@ -823,7 +823,7 @@ final class RecordWriter
     /**
      * Check records against thresholds and upsert performance issues.
      *
-     * @param string          $type     Threshold type: 'route', 'job', 'command', 'scheduled-task'
+     * @param string          $type     Threshold type: 'route', 'job', 'command', 'scheduled_task', etc.
      * @param array           $records  Raw records from the batch
      * @param string|string[] $nameKeys Record field(s) containing the name, tried in order
      * @param string          $groupKey Record field containing the group hash
@@ -865,6 +865,7 @@ final class RecordWriter
             if (! isset($issueGroups[$groupHash])) {
                 $issueGroups[$groupHash] = [
                     'name' => $name ?? 'Unknown',
+                    'subtype' => $type,
                     'count' => 0,
                     'users' => [],
                     'timestamps' => [],
@@ -899,15 +900,16 @@ final class RecordWriter
         // GREATEST to prevent unbounded inflation while keeping the high-water mark.
         $upsertStmt = $this->pdo()->prepare('
             INSERT INTO nightowl_issues (
-                type, status, exception_class, exception_message, group_hash,
+                type, subtype, status, exception_class, exception_message, group_hash,
                 first_seen_at, last_seen_at, occurrences_count, users_count,
                 created_at, updated_at
             ) VALUES (
-                :type, :status, :exception_class, :exception_message, :group_hash,
+                :type, :subtype, :status, :exception_class, :exception_message, :group_hash,
                 :first_seen_at, :last_seen_at, :occurrences_count, :users_count,
                 :created_at, :updated_at
             )
             ON CONFLICT (group_hash, type) DO UPDATE SET
+                subtype = COALESCE(EXCLUDED.subtype, nightowl_issues.subtype),
                 last_seen_at = GREATEST(nightowl_issues.last_seen_at, EXCLUDED.last_seen_at),
                 occurrences_count = nightowl_issues.occurrences_count + EXCLUDED.occurrences_count,
                 users_count = GREATEST(nightowl_issues.users_count, EXCLUDED.users_count),
@@ -925,6 +927,7 @@ final class RecordWriter
 
             $upsertStmt->execute([
                 'type' => 'performance',
+                'subtype' => $group['subtype'] ?? null,
                 'status' => 'open',
                 'exception_class' => $group['name'],
                 'exception_message' => 'Duration exceeded threshold',
