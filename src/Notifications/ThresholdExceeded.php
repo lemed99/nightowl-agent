@@ -37,7 +37,8 @@ class ThresholdExceeded extends Notification
     {
         $appName = config('app.name', 'Laravel');
 
-        $html = EmailTemplate::renderThreshold($appName, $this->type, $this->title, $this->message);
+        $frontendUrl = (string) config('app.frontend_url', '');
+        $html = EmailTemplate::renderThreshold($appName, $this->type, $this->title, $this->message, $frontendUrl);
 
         return new BrandedMail($html, "[NightOwl] Alert: {$this->title}");
     }

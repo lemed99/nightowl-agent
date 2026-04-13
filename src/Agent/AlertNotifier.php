@@ -47,17 +47,17 @@ final class AlertNotifier
     }
 
     /**
-     * Stage 1: Call BEFORE the issue upsert to snapshot existing hashes.
-     * Returns the set of group_hashes that already exist, for diffing after upsert.
+     * Stage 1: Call BEFORE the issue upsert to snapshot existing composite keys.
+     * Returns the set of (group_hash|deploy) keys that already exist, for diffing after upsert.
      *
-     * @param  PDO      $pdo
-     * @param  string[] $groupHashes  All group_hashes about to be upserted
-     * @param  string   $issueType    'exception' or 'performance'
-     * @return string[] Group hashes that already exist
+     * @param  PDO    $pdo
+     * @param  array  $issueGroups  Groups keyed by "fingerprint|deploy", each carrying 'fingerprint' and 'deploy'
+     * @param  string $issueType    'exception' or 'performance'
+     * @return string[] Composite keys that already exist
      */
-    public function snapshotExistingIssues(PDO $pdo, array $groupHashes, string $issueType): array
+    public function snapshotExistingIssues(PDO $pdo, array $issueGroups, string $issueType): array
     {
-        if (empty($groupHashes)) {
+        if (empty($issueGroups)) {
             return [];
         }
 
@@ -67,14 +67,21 @@ final class AlertNotifier
         }
 
         try {
-            $placeholders = implode(',', array_fill(0, count($groupHashes), '?'));
+            $existing = [];
             $stmt = $pdo->prepare("
-                SELECT group_hash FROM nightowl_issues
-                WHERE group_hash IN ({$placeholders}) AND type = ? AND status != 'resolved'
+                SELECT 1 FROM nightowl_issues
+                WHERE group_hash = ? AND type = ? AND deploy IS NOT DISTINCT FROM ? AND status != 'resolved'
+                LIMIT 1
             ");
-            $stmt->execute([...array_values($groupHashes), $issueType]);
 
-            return $stmt->fetchAll(PDO::FETCH_COLUMN) ?: [];
+            foreach ($issueGroups as $key => $group) {
+                $stmt->execute([$group['fingerprint'], $issueType, $group['deploy'] ?? null]);
+                if ($stmt->fetchColumn() !== false) {
+                    $existing[] = $key;
+                }
+            }
+
+            return $existing;
         } catch (\Throwable) {
             return [];
         }
@@ -178,28 +185,49 @@ final class AlertNotifier
      * Queries nightowl_issues for: id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype.
      * For exceptions, also queries nightowl_exceptions for: file, line, server, php_version, laravel_version, handled.
      */
-    private function enrichFromDb(PDO $pdo, array $group, string $groupHash, string $issueType): array
+    private function enrichFromDb(PDO $pdo, array $group, string $compositeKey, string $issueType): array
     {
+        $fingerprint = $group['fingerprint'] ?? $compositeKey;
+        $deploy = $group['deploy'] ?? null;
+        $group['environment'] = $deploy;
+
+        $issue = null;
         try {
             $stmt = $pdo->prepare('
-                SELECT id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype
+                SELECT id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype,
+                       threshold_ms, triggered_duration_ms
                 FROM nightowl_issues
-                WHERE group_hash = ? AND type = ?
+                WHERE group_hash = ? AND type = ? AND deploy IS NOT DISTINCT FROM ?
                 LIMIT 1
             ');
-            $stmt->execute([$groupHash, $issueType]);
+            $stmt->execute([$fingerprint, $issueType, $deploy]);
             $issue = $stmt->fetch(PDO::FETCH_ASSOC);
-
-            if ($issue) {
-                $group['issue_id'] = (int) $issue['id'];
-                $group['first_seen_at'] = $issue['first_seen_at'];
-                $group['last_seen_at'] = $issue['last_seen_at'];
-                $group['count'] = (int) ($issue['occurrences_count'] ?? $group['count']);
-                $group['users_count'] = (int) ($issue['users_count'] ?? count($group['users']));
-                $group['subtype'] = $issue['subtype'] ?? ($group['subtype'] ?? null);
-            }
         } catch (\Throwable) {
-            // Best-effort — dispatch with whatever we have
+            // Threshold columns may not exist yet on customer DBs pending migration —
+            // fall back to the legacy column set so enrichment still succeeds.
+            try {
+                $stmt = $pdo->prepare('
+                    SELECT id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype
+                    FROM nightowl_issues
+                    WHERE group_hash = ? AND type = ? AND deploy IS NOT DISTINCT FROM ?
+                    LIMIT 1
+                ');
+                $stmt->execute([$fingerprint, $issueType, $deploy]);
+                $issue = $stmt->fetch(PDO::FETCH_ASSOC);
+            } catch (\Throwable) {
+                // Best-effort — dispatch with whatever we have
+            }
+        }
+
+        if ($issue) {
+            $group['issue_id'] = (int) $issue['id'];
+            $group['first_seen_at'] = $issue['first_seen_at'];
+            $group['last_seen_at'] = $issue['last_seen_at'];
+            $group['count'] = (int) ($issue['occurrences_count'] ?? $group['count']);
+            $group['users_count'] = (int) ($issue['users_count'] ?? count($group['users']));
+            $group['subtype'] = $issue['subtype'] ?? ($group['subtype'] ?? null);
+            $group['threshold_ms'] = isset($issue['threshold_ms']) && $issue['threshold_ms'] !== null ? (int) $issue['threshold_ms'] : ($group['threshold_ms'] ?? null);
+            $group['duration_ms'] = isset($issue['triggered_duration_ms']) && $issue['triggered_duration_ms'] !== null ? (int) $issue['triggered_duration_ms'] : ($group['duration_ms'] ?? null);
         }
 
         if ($issueType === 'exception') {
@@ -207,15 +235,15 @@ final class AlertNotifier
                 $stmt = $pdo->prepare('
                     SELECT file, line, server, php_version, laravel_version, handled
                     FROM nightowl_exceptions
-                    WHERE fingerprint = ?
+                    WHERE fingerprint = ? AND deploy IS NOT DISTINCT FROM ?
                     ORDER BY created_at DESC
                     LIMIT 1
                 ');
-                $stmt->execute([$groupHash]);
+                $stmt->execute([$fingerprint, $deploy]);
                 $exc = $stmt->fetch(PDO::FETCH_ASSOC);
 
                 if ($exc) {
-                    $group['environment'] = ! empty($exc['server']) ? $exc['server'] : null;
+                    $group['server'] = ! empty($exc['server']) ? $exc['server'] : null;
                     $group['handled'] = isset($exc['handled']) ? (bool) $exc['handled'] : null;
                     $group['php_version'] = ! empty($exc['php_version']) ? $exc['php_version'] : null;
                     $group['laravel_version'] = ! empty($exc['laravel_version']) ? $exc['laravel_version'] : null;
@@ -362,13 +390,16 @@ final class AlertNotifier
         $handled = $group['handled'] ?? null;
         $isException = $issueType === 'exception';
 
+        $headerEmoji = $isException ? "\xF0\x9F\x9A\xA8" : "\xE2\x9A\xA1"; // siren vs high-voltage bolt
+        $headerLabel = $isException ? 'New Issue' : 'Performance Alert';
+
         $blocks = [];
 
         $blocks[] = [
             'type' => 'section',
             'text' => [
                 'type' => 'mrkdwn',
-                'text' => "\xF0\x9F\x9A\xA8  *New Issue*  \xC2\xB7  {$appName}",
+                'text' => "{$headerEmoji}  *{$headerLabel}*  \xC2\xB7  {$appName}",
             ],
         ];
 
@@ -403,6 +434,18 @@ final class AlertNotifier
         } else {
             $subtypeLabel = EmailTemplate::subtypeLabel($subtype);
             $fields[] = ['type' => 'mrkdwn', 'text' => "*{$subtypeLabel}*\n`{$name}`"];
+            $duration = $group['duration_ms'] ?? null;
+            $threshold = $group['threshold_ms'] ?? null;
+            if ($duration !== null) {
+                $fields[] = ['type' => 'mrkdwn', 'text' => "*Duration*\n{$duration}ms"];
+            }
+            if ($threshold !== null) {
+                $fields[] = ['type' => 'mrkdwn', 'text' => "*Threshold*\n{$threshold}ms"];
+            }
+            if ($duration !== null && $threshold !== null && $duration > $threshold) {
+                $over = $duration - $threshold;
+                $fields[] = ['type' => 'mrkdwn', 'text' => "*Over by*\n{$over}ms"];
+            }
         }
         $fields[] = ['type' => 'mrkdwn', 'text' => "*Occurrences*\n{$occurrences}"];
         $fields[] = ['type' => 'mrkdwn', 'text' => "*Users Affected*\n{$users}"];
@@ -429,12 +472,14 @@ final class AlertNotifier
             'elements' => [['type' => 'mrkdwn', 'text' => 'NightOwl']],
         ];
 
+        $attachmentColor = $isException ? '#DC2626' : '#F59E0B';
+
         $payload = [
             'username' => 'NightOwl',
             'icon_url' => $this->logoUrl(),
             'attachments' => [
                 [
-                    'color' => '#DC2626',
+                    'color' => $attachmentColor,
                     'blocks' => $blocks,
                 ],
             ],
@@ -491,6 +536,18 @@ final class AlertNotifier
         } else {
             $subtypeLabel = EmailTemplate::subtypeLabel($subtype);
             $fields[] = ['name' => $subtypeLabel, 'value' => '`' . $name . '`', 'inline' => false];
+            $duration = $group['duration_ms'] ?? null;
+            $threshold = $group['threshold_ms'] ?? null;
+            if ($duration !== null) {
+                $fields[] = ['name' => 'Duration', 'value' => $duration . 'ms', 'inline' => true];
+            }
+            if ($threshold !== null) {
+                $fields[] = ['name' => 'Threshold', 'value' => $threshold . 'ms', 'inline' => true];
+            }
+            if ($duration !== null && $threshold !== null && $duration > $threshold) {
+                $over = $duration - $threshold;
+                $fields[] = ['name' => 'Over by', 'value' => $over . 'ms', 'inline' => true];
+            }
         }
 
         $fields[] = ['name' => 'Occurrences', 'value' => (string) $occurrences, 'inline' => true];
@@ -505,15 +562,18 @@ final class AlertNotifier
 
         $logoUrl = $this->logoUrl();
 
+        $discordTitle = $isException ? "\xF0\x9F\x9A\xA8  New Issue" : "\xE2\x9A\xA1  Performance Alert";
+        $discordColor = $isException ? 0xDC2626 : 0xF59E0B;
+
         $payload = [
             'username' => 'NightOwl',
             'avatar_url' => $logoUrl,
             'embeds' => [
                 [
                     'author' => ['name' => 'NightOwl', 'icon_url' => $logoUrl],
-                    'title' => "\xF0\x9F\x9A\xA8  New Issue",
+                    'title' => $discordTitle,
                     'description' => $description,
-                    'color' => 0xDC2626,
+                    'color' => $discordColor,
                     'fields' => array_slice($fields, 0, 25),
                     'footer' => ['text' => 'NightOwl', 'icon_url' => $logoUrl],
                     'timestamp' => date('c'),
@@ -549,6 +609,9 @@ final class AlertNotifier
             $issue['location'] = $group['location'] ?? null;
             $issue['php_version'] = $group['php_version'] ?? null;
             $issue['laravel_version'] = $group['laravel_version'] ?? null;
+        } else {
+            $issue['threshold_ms'] = $group['threshold_ms'] ?? null;
+            $issue['duration_ms'] = $group['duration_ms'] ?? null;
         }
 
         $payload = json_encode([
@@ -584,10 +647,11 @@ final class AlertNotifier
         $name = $this->issueName($group);
         $group['view_url'] = $this->buildViewUrl($group['issue_id'] ?? null);
 
-        $subject = $this->sanitizeHeader("[{$appName}] New Issue: {$name}");
+        $subjectPrefix = $issueType === 'performance' ? 'Performance Alert' : 'New Issue';
+        $subject = $this->sanitizeHeader("[{$appName}] {$subjectPrefix}: {$name}");
         $fromName = $this->sanitizeHeader($fromName);
 
-        $body = EmailTemplate::renderIssue($appName, $group, $issueType);
+        $body = EmailTemplate::renderIssue($appName, $group, $issueType, $this->frontendUrl);
 
         $this->smtpSend($host, $port, $username, $password, $encryption, $fromAddress, $fromName, $toAddresses, $subject, $body, true);
     }

@@ -211,7 +211,11 @@ final class RecordWriter
             $tsvRows[] = implode("\t", $escaped);
         }
 
-        $this->pdo()->pgsqlCopyFromArray($table . ' (' . $colList . ')', $tsvRows, "\t", '\\N');
+        // Note: do NOT pass the 4th NULL-marker arg. libpq mis-parses the
+        // escaped string there, so any `\N` in the TSV is treated as the
+        // literal string "N" for non-text columns. The text COPY default
+        // null marker is already `\N`.
+        $this->pdo()->pgsqlCopyFromArray($table . ' (' . $colList . ')', $tsvRows);
     }
 
     private function writeRequests(array $records): void
@@ -338,12 +342,14 @@ final class RecordWriter
 
         foreach ($records as $r) {
             $fingerprint = md5(($r['class'] ?? '') . ($r['file'] ?? '') . ($r['line'] ?? ''));
+            $deploy = $r['deploy'] ?? null;
+            $groupKey = $fingerprint.'|'.($deploy ?? '');
 
             $stmt->execute([
                 'v' => $r['v'] ?? null,
                 'trace_id' => $r['trace_id'] ?? null,
                 'timestamp' => $r['timestamp'] ?? null,
-                'deploy' => $r['deploy'] ?? null,
+                'deploy' => $deploy,
                 'server' => $r['server'] ?? null,
                 'group_hash' => $r['_group'] ?? null,
                 'execution_source' => $r['execution_source'] ?? null,
@@ -363,8 +369,10 @@ final class RecordWriter
                 'fingerprint' => $fingerprint,
             ]);
 
-            if (! isset($issueGroups[$fingerprint])) {
-                $issueGroups[$fingerprint] = [
+            if (! isset($issueGroups[$groupKey])) {
+                $issueGroups[$groupKey] = [
+                    'fingerprint' => $fingerprint,
+                    'deploy' => $deploy,
                     'class' => $r['class'] ?? 'Unknown',
                     'message' => $r['message'] ?? null,
                     'count' => 0,
@@ -372,16 +380,16 @@ final class RecordWriter
                     'timestamps' => [],
                 ];
             }
-            $issueGroups[$fingerprint]['count']++;
+            $issueGroups[$groupKey]['count']++;
             if (! empty($r['user'])) {
-                $issueGroups[$fingerprint]['users'][$r['user']] = true;
+                $issueGroups[$groupKey]['users'][$r['user']] = true;
             }
             if (! empty($r['timestamp'])) {
-                $issueGroups[$fingerprint]['timestamps'][] = $r['timestamp'];
+                $issueGroups[$groupKey]['timestamps'][] = $r['timestamp'];
             }
         }
 
-        $existingBefore = $this->notifier->snapshotExistingIssues($this->pdo(), array_keys($issueGroups), 'exception');
+        $existingBefore = $this->notifier->snapshotExistingIssues($this->pdo(), $issueGroups, 'exception');
         $this->syncIssuesToExceptions($issueGroups);
         $this->notifier->queueNewIssueNotifications($this->appName, $issueGroups, 'exception', $existingBefore);
     }
@@ -393,28 +401,30 @@ final class RecordWriter
         // (which inflates the count when the same user appears across batches).
         $upsertStmt = $this->pdo()->prepare('
             INSERT INTO nightowl_issues (
-                type, status, exception_class, exception_message, group_hash,
+                type, deploy, status, exception_class, exception_message, group_hash,
                 first_seen_at, last_seen_at, occurrences_count, users_count,
                 created_at, updated_at
             ) VALUES (
-                :type, :status, :exception_class, :exception_message, :group_hash,
+                :type, :deploy, :status, :exception_class, :exception_message, :group_hash,
                 :first_seen_at, :last_seen_at, :occurrences_count, :users_count,
                 :created_at, :updated_at
             )
-            ON CONFLICT (group_hash, type) DO UPDATE SET
+            ON CONFLICT (group_hash, type, deploy) DO UPDATE SET
                 exception_message = EXCLUDED.exception_message,
                 last_seen_at = GREATEST(nightowl_issues.last_seen_at, EXCLUDED.last_seen_at),
                 occurrences_count = nightowl_issues.occurrences_count + EXCLUDED.occurrences_count,
                 users_count = (
                     SELECT COUNT(DISTINCT user_id) FROM nightowl_exceptions
-                    WHERE fingerprint = EXCLUDED.group_hash AND user_id IS NOT NULL
+                    WHERE fingerprint = EXCLUDED.group_hash
+                      AND deploy IS NOT DISTINCT FROM EXCLUDED.deploy
+                      AND user_id IS NOT NULL
                 ),
                 updated_at = EXCLUDED.updated_at
         ');
 
         $now = date('Y-m-d H:i:s');
 
-        foreach ($issueGroups as $fingerprint => $group) {
+        foreach ($issueGroups as $group) {
             $timestamps = $group['timestamps'];
             sort($timestamps);
             $firstSeen = ! empty($timestamps) ? date('Y-m-d H:i:s', (int) $timestamps[0]) : $now;
@@ -423,10 +433,11 @@ final class RecordWriter
 
             $upsertStmt->execute([
                 'type' => 'exception',
+                'deploy' => $group['deploy'] ?? null,
                 'status' => 'open',
                 'exception_class' => $group['class'],
                 'exception_message' => $group['message'],
-                'group_hash' => $fingerprint,
+                'group_hash' => $group['fingerprint'],
                 'first_seen_at' => $firstSeen,
                 'last_seen_at' => $lastSeen,
                 'occurrences_count' => $group['count'],
@@ -861,22 +872,32 @@ final class RecordWriter
             if ($groupHash === null) {
                 continue;
             }
+            $deploy = $r['deploy'] ?? null;
+            $compositeKey = $groupHash.'|'.($deploy ?? '');
 
-            if (! isset($issueGroups[$groupHash])) {
-                $issueGroups[$groupHash] = [
+            if (! isset($issueGroups[$compositeKey])) {
+                $issueGroups[$compositeKey] = [
+                    'fingerprint' => $groupHash,
+                    'deploy' => $deploy,
                     'name' => $name ?? 'Unknown',
                     'subtype' => $type,
                     'count' => 0,
                     'users' => [],
                     'timestamps' => [],
+                    'threshold_us' => $threshold,
+                    'max_duration_us' => $duration,
                 ];
             }
-            $issueGroups[$groupHash]['count']++;
+            $issueGroups[$compositeKey]['count']++;
+            $issueGroups[$compositeKey]['threshold_us'] = $threshold;
+            if ($duration > $issueGroups[$compositeKey]['max_duration_us']) {
+                $issueGroups[$compositeKey]['max_duration_us'] = $duration;
+            }
             if (! empty($r['user'])) {
-                $issueGroups[$groupHash]['users'][$r['user']] = true;
+                $issueGroups[$compositeKey]['users'][$r['user']] = true;
             }
             if (! empty($r['timestamp'])) {
-                $issueGroups[$groupHash]['timestamps'][] = $r['timestamp'];
+                $issueGroups[$compositeKey]['timestamps'][] = $r['timestamp'];
             }
         }
 
@@ -884,7 +905,7 @@ final class RecordWriter
             return;
         }
 
-        $existingBefore = $this->notifier->snapshotExistingIssues($this->pdo(), array_keys($issueGroups), 'performance');
+        $existingBefore = $this->notifier->snapshotExistingIssues($this->pdo(), $issueGroups, 'performance');
         $this->upsertPerformanceIssues($issueGroups);
         $this->notifier->queueNewIssueNotifications($this->appName, $issueGroups, 'performance', $existingBefore);
     }
@@ -900,42 +921,57 @@ final class RecordWriter
         // GREATEST to prevent unbounded inflation while keeping the high-water mark.
         $upsertStmt = $this->pdo()->prepare('
             INSERT INTO nightowl_issues (
-                type, subtype, status, exception_class, exception_message, group_hash,
+                type, deploy, subtype, status, exception_class, exception_message, group_hash,
                 first_seen_at, last_seen_at, occurrences_count, users_count,
+                threshold_ms, triggered_duration_ms,
                 created_at, updated_at
             ) VALUES (
-                :type, :subtype, :status, :exception_class, :exception_message, :group_hash,
+                :type, :deploy, :subtype, :status, :exception_class, :exception_message, :group_hash,
                 :first_seen_at, :last_seen_at, :occurrences_count, :users_count,
+                :threshold_ms, :triggered_duration_ms,
                 :created_at, :updated_at
             )
-            ON CONFLICT (group_hash, type) DO UPDATE SET
+            ON CONFLICT (group_hash, type, deploy) DO UPDATE SET
                 subtype = COALESCE(EXCLUDED.subtype, nightowl_issues.subtype),
                 last_seen_at = GREATEST(nightowl_issues.last_seen_at, EXCLUDED.last_seen_at),
                 occurrences_count = nightowl_issues.occurrences_count + EXCLUDED.occurrences_count,
                 users_count = GREATEST(nightowl_issues.users_count, EXCLUDED.users_count),
+                threshold_ms = COALESCE(EXCLUDED.threshold_ms, nightowl_issues.threshold_ms),
+                triggered_duration_ms = GREATEST(
+                    COALESCE(nightowl_issues.triggered_duration_ms, 0),
+                    COALESCE(EXCLUDED.triggered_duration_ms, 0)
+                ),
                 updated_at = EXCLUDED.updated_at
         ');
 
         $now = date('Y-m-d H:i:s');
 
-        foreach ($issueGroups as $groupHash => $group) {
+        foreach ($issueGroups as $group) {
             $timestamps = $group['timestamps'];
             sort($timestamps);
             $firstSeen = ! empty($timestamps) ? date('Y-m-d H:i:s', (int) $timestamps[0]) : $now;
             $lastSeen = ! empty($timestamps) ? date('Y-m-d H:i:s', (int) end($timestamps)) : $now;
             $userCount = count($group['users']);
 
+            $thresholdUs = $group['threshold_us'] ?? null;
+            $maxDurationUs = $group['max_duration_us'] ?? null;
+            $thresholdMs = $thresholdUs !== null ? (int) round($thresholdUs / 1000) : null;
+            $triggeredMs = $maxDurationUs !== null ? (int) round($maxDurationUs / 1000) : null;
+
             $upsertStmt->execute([
                 'type' => 'performance',
+                'deploy' => $group['deploy'] ?? null,
                 'subtype' => $group['subtype'] ?? null,
                 'status' => 'open',
                 'exception_class' => $group['name'],
                 'exception_message' => 'Duration exceeded threshold',
-                'group_hash' => $groupHash,
+                'group_hash' => $group['fingerprint'],
                 'first_seen_at' => $firstSeen,
                 'last_seen_at' => $lastSeen,
                 'occurrences_count' => $group['count'],
                 'users_count' => $userCount,
+                'threshold_ms' => $thresholdMs,
+                'triggered_duration_ms' => $triggeredMs,
                 'created_at' => $now,
                 'updated_at' => $now,
             ]);
