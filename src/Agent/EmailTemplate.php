@@ -313,6 +313,9 @@ final class EmailTemplate
     private static function logo(string $frontendUrl): string
     {
         $base = rtrim($frontendUrl, '/');
+        if ($base === '') {
+            $base = 'https://usenightowl.com';
+        }
         $src = htmlspecialchars($base . '/full-logo.png', ENT_QUOTES | ENT_HTML5, 'UTF-8');
 
         return '<img src="' . $src . '" alt="NightOwl" height="32" style="display:block;border:0;outline:none;text-decoration:none;height:32px;width:auto;color:#fafafa;font-size:18px;font-weight:700;letter-spacing:0.3px;">';
