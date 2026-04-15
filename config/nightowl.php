@@ -85,6 +85,21 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Nightwatch Coexistence
+    |--------------------------------------------------------------------------
+    |
+    | When `parallel_with_nightwatch` is true, the service provider keeps
+    | Nightwatch's hosted-agent ingest AND fans out every record to the
+    | NightOwl agent. Use this during migration to compare dashboards.
+    | When false (default), the Nightwatch collector is redirected entirely
+    | at the NightOwl agent — Laravel Cloud receives nothing.
+    |
+    */
+    'parallel_with_nightwatch' => (bool) env('NIGHTOWL_PARALLEL_WITH_NIGHTWATCH', false),
+    'nightwatch_agent_port' => (int) env('NIGHTWATCH_AGENT_PORT', 2407),
+
+    /*
+    |--------------------------------------------------------------------------
     | Dashboard
     |--------------------------------------------------------------------------
     |

@@ -83,6 +83,33 @@ class NightOwlAgentServiceProvider extends ServiceProvider
             );
         });
 
+        $this->app->booted(function () {
+            if (! $this->app->bound(\Laravel\Nightwatch\Core::class)) {
+                return;
+            }
+
+            $core = $this->app->make(\Laravel\Nightwatch\Core::class);
+
+            $nightowlPort = (int) config('nightowl.agent.port', 2407);
+            $nightowlToken = (string) config('nightowl.agent.token', config('nightwatch.token', ''));
+            $tokenHash = substr(hash('xxh128', $nightowlToken), 0, 7);
+
+            $nightowlIngest = new \Laravel\Nightwatch\Ingest(
+                transmitTo: "127.0.0.1:{$nightowlPort}",
+                connectionTimeout: 0.5,
+                timeout: 0.5,
+                streamFactory: new \Laravel\Nightwatch\SocketStreamFactory,
+                buffer: new \Laravel\Nightwatch\RecordsBuffer(length: 500),
+                tokenHash: $tokenHash,
+            );
+
+            if (config('nightowl.parallel_with_nightwatch', false)) {
+                $core->ingest = new \NightOwl\Support\MultiIngest($core->ingest, $nightowlIngest);
+            } else {
+                $core->ingest = $nightowlIngest;
+            }
+        });
+
         $this->app->singleton(AsyncServer::class, function ($app) {
             return new AsyncServer(
                 $app->make(PayloadParser::class),

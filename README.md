@@ -23,7 +23,7 @@ Sign up at your NightOwl dashboard, create a new app, and provide your PostgreSQ
 NightOwl receives telemetry from Laravel's Nightwatch package, so install both:
 
 ```bash
-composer require laravel/nightwatch nightowl/agent
+composer require nightowl/agent
 ```
 
 ### 3. Configure environment
@@ -108,40 +108,40 @@ WantedBy=multi-user.target
 
 All configuration is in `config/nightowl.php` after running the installer. Key environment variables:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NIGHTWATCH_TOKEN` | — | Token from the dashboard (used by both Nightwatch and the agent) |
-| `NIGHTOWL_DB_HOST` | `127.0.0.1` | PostgreSQL host |
-| `NIGHTOWL_DB_PORT` | `5432` | PostgreSQL port |
-| `NIGHTOWL_DB_DATABASE` | `nightowl` | PostgreSQL database name |
-| `NIGHTOWL_DB_USERNAME` | `nightowl` | PostgreSQL username |
-| `NIGHTOWL_DB_PASSWORD` | `nightowl` | PostgreSQL password |
-| `NIGHTOWL_AGENT_HOST` | `127.0.0.1` | TCP host the agent binds to (set to `0.0.0.0` or an LB VIP for multi-host) |
-| `NIGHTOWL_AGENT_PORT` | `2407` | TCP port the agent listens on |
-| `NIGHTOWL_AGENT_DRIVER` | `async` | Server driver (`async` or `sync`) |
-| `NIGHTOWL_SO_REUSEPORT` | `false` | Allow multiple agents to bind the same port (Linux only, see *Running Multiple Instances*) |
-| `NIGHTOWL_DRAIN_WORKERS` | `1` | Number of parallel drain worker processes |
-| `NIGHTOWL_DRAIN_BATCH_SIZE` | `5000` | Rows per PostgreSQL `COPY` batch |
-| `NIGHTOWL_DRAIN_INTERVAL_MS` | `100` | Drain loop sleep interval when the buffer is idle |
-| `NIGHTOWL_MAX_PENDING_ROWS` | `100000` | Reject new payloads once buffer hits this depth |
-| `NIGHTOWL_MAX_BUFFER_MEMORY` | `268435456` | RSS ceiling (bytes) before back-pressure kicks in |
-| `NIGHTOWL_SAMPLE_RATE` | `1.0` | Global sampling rate (1.0 = keep all, exceptions always kept) |
-| `NIGHTOWL_REQUEST_SAMPLE_RATE` | — | Override sample rate for HTTP requests |
-| `NIGHTOWL_COMMAND_SAMPLE_RATE` | — | Override sample rate for artisan commands |
-| `NIGHTOWL_SCHEDULED_TASK_SAMPLE_RATE` | — | Override sample rate for scheduled tasks |
-| `NIGHTOWL_REDACT_ENABLED` | `false` | Redact sensitive keys from payloads before writing |
-| `NIGHTOWL_REDACT_KEYS` | — | Comma-separated key names to redact (e.g. `password,token,authorization`) |
-| `NIGHTOWL_THRESHOLD_CACHE_TTL` | `86400` | Seconds to cache performance thresholds (restart agent to pick up changes immediately) |
-| `NIGHTOWL_RETENTION_DAYS` | `14` | Days to keep monitoring data |
+| Variable                              | Default     | Description                                                                                |
+| ------------------------------------- | ----------- | ------------------------------------------------------------------------------------------ |
+| `NIGHTWATCH_TOKEN`                    | —           | Token from the dashboard (used by both Nightwatch and the agent)                           |
+| `NIGHTOWL_DB_HOST`                    | `127.0.0.1` | PostgreSQL host                                                                            |
+| `NIGHTOWL_DB_PORT`                    | `5432`      | PostgreSQL port                                                                            |
+| `NIGHTOWL_DB_DATABASE`                | `nightowl`  | PostgreSQL database name                                                                   |
+| `NIGHTOWL_DB_USERNAME`                | `nightowl`  | PostgreSQL username                                                                        |
+| `NIGHTOWL_DB_PASSWORD`                | `nightowl`  | PostgreSQL password                                                                        |
+| `NIGHTOWL_AGENT_HOST`                 | `127.0.0.1` | TCP host the agent binds to (set to `0.0.0.0` or an LB VIP for multi-host)                 |
+| `NIGHTOWL_AGENT_PORT`                 | `2407`      | TCP port the agent listens on                                                              |
+| `NIGHTOWL_AGENT_DRIVER`               | `async`     | Server driver (`async` or `sync`)                                                          |
+| `NIGHTOWL_SO_REUSEPORT`               | `false`     | Allow multiple agents to bind the same port (Linux only, see _Running Multiple Instances_) |
+| `NIGHTOWL_DRAIN_WORKERS`              | `1`         | Number of parallel drain worker processes                                                  |
+| `NIGHTOWL_DRAIN_BATCH_SIZE`           | `5000`      | Rows per PostgreSQL `COPY` batch                                                           |
+| `NIGHTOWL_DRAIN_INTERVAL_MS`          | `100`       | Drain loop sleep interval when the buffer is idle                                          |
+| `NIGHTOWL_MAX_PENDING_ROWS`           | `100000`    | Reject new payloads once buffer hits this depth                                            |
+| `NIGHTOWL_MAX_BUFFER_MEMORY`          | `268435456` | RSS ceiling (bytes) before back-pressure kicks in                                          |
+| `NIGHTOWL_SAMPLE_RATE`                | `1.0`       | Global sampling rate (1.0 = keep all, exceptions always kept)                              |
+| `NIGHTOWL_REQUEST_SAMPLE_RATE`        | —           | Override sample rate for HTTP requests                                                     |
+| `NIGHTOWL_COMMAND_SAMPLE_RATE`        | —           | Override sample rate for artisan commands                                                  |
+| `NIGHTOWL_SCHEDULED_TASK_SAMPLE_RATE` | —           | Override sample rate for scheduled tasks                                                   |
+| `NIGHTOWL_REDACT_ENABLED`             | `false`     | Redact sensitive keys from payloads before writing                                         |
+| `NIGHTOWL_REDACT_KEYS`                | —           | Comma-separated key names to redact (e.g. `password,token,authorization`)                  |
+| `NIGHTOWL_THRESHOLD_CACHE_TTL`        | `86400`     | Seconds to cache performance thresholds (restart agent to pick up changes immediately)     |
+| `NIGHTOWL_RETENTION_DAYS`             | `14`        | Days to keep monitoring data                                                               |
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `nightowl:agent` | Start the monitoring agent |
-| `nightowl:install` | Publish config and run migrations |
-| `nightowl:prune` | Delete monitoring data older than retention period |
-| `nightowl:clear` | Truncate all monitoring tables |
+| Command            | Description                                        |
+| ------------------ | -------------------------------------------------- |
+| `nightowl:agent`   | Start the monitoring agent                         |
+| `nightowl:install` | Publish config and run migrations                  |
+| `nightowl:prune`   | Delete monitoring data older than retention period |
+| `nightowl:clear`   | Truncate all monitoring tables                     |
 
 ## Data Retention
 

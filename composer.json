@@ -9,14 +9,14 @@
         "ext-pdo_pgsql": "*",
         "ext-pdo_sqlite": "*",
         "laravel/framework": "^11.0|^12.0",
+        "laravel/nightwatch": "^1.26",
         "react/datagram": "^1.10",
         "react/event-loop": "^1.5",
         "react/http": "^1.9",
         "react/socket": "^1.15"
     },
     "suggest": {
-        "ext-zlib": "Required for gzip decompression of compressed payloads",
-        "laravel/nightwatch": "Required to collect telemetry from your Laravel app"
+        "ext-zlib": "Required for gzip decompression of compressed payloads"
     },
     "autoload": {
         "psr-4": {
