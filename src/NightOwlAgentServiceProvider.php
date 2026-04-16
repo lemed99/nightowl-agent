@@ -3,6 +3,10 @@
 namespace NightOwl;
 
 use Illuminate\Support\ServiceProvider;
+use Laravel\Nightwatch\Core;
+use Laravel\Nightwatch\Ingest;
+use Laravel\Nightwatch\RecordsBuffer;
+use Laravel\Nightwatch\SocketStreamFactory;
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\ConnectionHandler;
 use NightOwl\Agent\DrainWorker;
@@ -16,16 +20,27 @@ use NightOwl\Commands\CheckThresholdsCommand;
 use NightOwl\Commands\ClearCommand;
 use NightOwl\Commands\InstallCommand;
 use NightOwl\Commands\PruneCommand;
+use NightOwl\Support\MultiIngest;
 
 class NightOwlAgentServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        $this->mergeConfigFrom(__DIR__ . '/../config/nightowl.php', 'nightowl');
+        $this->mergeConfigFrom(__DIR__.'/../config/nightowl.php', 'nightowl');
 
         $this->app->singleton(PayloadParser::class, function ($app) {
+            $debugDumpPath = null;
+            if ((bool) config('nightowl.agent.debug_raw_payloads', false)) {
+                $debugDumpPath = (string) config(
+                    'nightowl.agent.debug_raw_payloads_path',
+                    storage_path('nightowl/raw-payloads.jsonl'),
+                );
+                error_log('[NightOwl Agent] RAW PAYLOAD DEBUG ENABLED — dumping to '.$debugDumpPath.' (DO NOT leave on in prod)');
+            }
+
             return new PayloadParser(
                 (bool) config('nightowl.agent.gzip_enabled', true),
+                $debugDumpPath,
             );
         });
 
@@ -84,27 +99,27 @@ class NightOwlAgentServiceProvider extends ServiceProvider
         });
 
         $this->app->booted(function () {
-            if (! $this->app->bound(\Laravel\Nightwatch\Core::class)) {
+            if (! $this->app->bound(Core::class)) {
                 return;
             }
 
-            $core = $this->app->make(\Laravel\Nightwatch\Core::class);
+            $core = $this->app->make(Core::class);
 
             $nightowlPort = (int) config('nightowl.agent.port', 2407);
             $nightowlToken = (string) config('nightowl.agent.token', config('nightwatch.token', ''));
             $tokenHash = substr(hash('xxh128', $nightowlToken), 0, 7);
 
-            $nightowlIngest = new \Laravel\Nightwatch\Ingest(
+            $nightowlIngest = new Ingest(
                 transmitTo: "127.0.0.1:{$nightowlPort}",
                 connectionTimeout: 0.5,
                 timeout: 0.5,
-                streamFactory: new \Laravel\Nightwatch\SocketStreamFactory,
-                buffer: new \Laravel\Nightwatch\RecordsBuffer(length: 500),
+                streamFactory: new SocketStreamFactory,
+                buffer: new RecordsBuffer(length: 500),
                 tokenHash: $tokenHash,
             );
 
             if (config('nightowl.parallel_with_nightwatch', false)) {
-                $core->ingest = new \NightOwl\Support\MultiIngest($core->ingest, $nightowlIngest);
+                $core->ingest = new MultiIngest($core->ingest, $nightowlIngest);
             } else {
                 $core->ingest = $nightowlIngest;
             }
@@ -145,7 +160,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
     protected function registerConfig(): void
     {
         $this->publishes([
-            __DIR__ . '/../config/nightowl.php' => config_path('nightowl.php'),
+            __DIR__.'/../config/nightowl.php' => config_path('nightowl.php'),
         ], 'nightowl-config');
     }
 
@@ -179,6 +194,6 @@ class NightOwlAgentServiceProvider extends ServiceProvider
 
     protected function registerMigrations(): void
     {
-        $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
+        $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
     }
 }

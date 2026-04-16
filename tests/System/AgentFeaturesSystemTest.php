@@ -2,6 +2,7 @@
 
 namespace NightOwl\Tests\System;
 
+use NightOwl\Tests\Integration\MigrationRunner;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
@@ -22,23 +23,33 @@ use PHPUnit\Framework\TestCase;
 class AgentFeaturesSystemTest extends TestCase
 {
     private const TOKEN = 'features-test-token-2025';
+
     private const AGENT_HOST = '127.0.0.1';
+
     private const AGENT_PORT = 2413;
 
     private const DRAIN_TIMEOUT = 15;
+
     private const STARTUP_TIMEOUT = 5;
 
     private static ?PDO $pdo = null;
+
     private static string $dbHost;
+
     private static int $dbPort;
+
     private static string $dbDatabase;
+
     private static string $dbUsername;
+
     private static string $dbPassword;
 
     /** @var resource|null */
     private static $agentProcess = null;
+
     /** @var resource[] */
     private static array $agentPipes = [];
+
     private static string $sqlitePath = '';
 
     private NightwatchSimulator $sim;
@@ -62,14 +73,16 @@ class AgentFeaturesSystemTest extends TestCase
             self::$pdo = new PDO($dsn, self::$dbUsername, self::$dbPassword);
             self::$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         } catch (\Exception $e) {
-            static::markTestSkipped('PostgreSQL not available: ' . $e->getMessage());
+            static::markTestSkipped('PostgreSQL not available: '.$e->getMessage());
         }
 
-        $schemaPath = __DIR__ . '/../Simulator/schema.sql';
-        $sql = file_get_contents($schemaPath);
-        if ($sql) {
-            self::$pdo->exec($sql);
-        }
+        MigrationRunner::migrate(
+            self::$dbHost,
+            (int) self::$dbPort,
+            self::$dbDatabase,
+            self::$dbUsername,
+            self::$dbPassword,
+        );
 
         self::startAgent();
     }
@@ -100,9 +113,9 @@ class AgentFeaturesSystemTest extends TestCase
 
     private static function startAgent(): void
     {
-        self::$sqlitePath = sys_get_temp_dir() . '/nightowl-features-test-' . getmypid() . '.sqlite';
+        self::$sqlitePath = sys_get_temp_dir().'/nightowl-features-test-'.getmypid().'.sqlite';
 
-        $harness = realpath(__DIR__ . '/../Simulator/agent-harness-async.php');
+        $harness = realpath(__DIR__.'/../Simulator/agent-harness-async.php');
         if (! $harness) {
             static::markTestSkipped('agent-harness-async.php not found.');
         }
@@ -142,7 +155,7 @@ class AgentFeaturesSystemTest extends TestCase
         $ready = false;
         while (microtime(true) < $deadline) {
             $sock = @stream_socket_client(
-                'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+                'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
                 $errno, $errstr, 0.5,
             );
             if ($sock) {
@@ -156,7 +169,7 @@ class AgentFeaturesSystemTest extends TestCase
         if (! $ready) {
             $output = stream_get_contents(self::$agentPipes[1]);
             self::stopAgent();
-            static::markTestSkipped("Agent did not start within " . self::STARTUP_TIMEOUT . "s. Output: {$output}");
+            static::markTestSkipped('Agent did not start within '.self::STARTUP_TIMEOUT."s. Output: {$output}");
         }
     }
 
@@ -195,10 +208,10 @@ class AgentFeaturesSystemTest extends TestCase
 
         foreach ([
             self::$sqlitePath,
-            self::$sqlitePath . '-wal',
-            self::$sqlitePath . '-shm',
-            self::$sqlitePath . '.drain-metrics.json',
-            self::$sqlitePath . '.drain-metrics.json.tmp',
+            self::$sqlitePath.'-wal',
+            self::$sqlitePath.'-shm',
+            self::$sqlitePath.'.drain-metrics.json',
+            self::$sqlitePath.'.drain-metrics.json.tmp',
         ] as $f) {
             if (file_exists($f)) {
                 @unlink($f);
@@ -231,6 +244,7 @@ class AgentFeaturesSystemTest extends TestCase
     private static function fetch(string $table, string $where): ?array
     {
         $row = self::$pdo->query("SELECT * FROM {$table} WHERE {$where}")->fetch(PDO::FETCH_ASSOC);
+
         return $row ?: null;
     }
 
@@ -251,7 +265,7 @@ class AgentFeaturesSystemTest extends TestCase
     private function sendTcp(string $wire): string|false
     {
         $sock = @stream_socket_client(
-            'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+            'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
             $errno, $errstr, 3.0,
         );
         if (! $sock) {
@@ -261,6 +275,7 @@ class AgentFeaturesSystemTest extends TestCase
         fwrite($sock, $wire);
         $response = fread($sock, 128);
         fclose($sock);
+
         return $response ?: false;
     }
 
@@ -269,16 +284,17 @@ class AgentFeaturesSystemTest extends TestCase
         $json = json_encode($records, JSON_THROW_ON_ERROR);
         $tokenHash = substr(hash('xxh128', self::TOKEN), 0, 7);
         $body = "v1:{$tokenHash}:{$json}";
-        return strlen($body) . ':' . $body;
+
+        return strlen($body).':'.$body;
     }
 
     // ═══════════════════════════════════════════════════════════
     //  SAMPLING TESTS (sample_rate = 0.0)
     // ═══════════════════════════════════════════════════════════
 
-    public function testSamplingDropsNormalRequests(): void
+    public function test_sampling_drops_normal_requests(): void
     {
-        $traceId = 'feat-sample-drop-' . uniqid();
+        $traceId = 'feat-sample-drop-'.uniqid();
 
         // Normal 200 request — should be dropped (sample_rate=0.0)
         $response = $this->sim->send([
@@ -293,9 +309,9 @@ class AgentFeaturesSystemTest extends TestCase
         $this->assertSame(0, self::rowCount('nightowl_requests', "trace_id = '{$traceId}'"));
     }
 
-    public function testSamplingKeepsExceptionPayloads(): void
+    public function test_sampling_keeps_exception_payloads(): void
     {
-        $traceId = 'feat-sample-exc-' . uniqid();
+        $traceId = 'feat-sample-exc-'.uniqid();
         $excClass = 'App\\Exceptions\\SamplingTestException';
         $file = 'app/Sampling.php';
         $line = 99;
@@ -308,7 +324,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'exceptions' => 1,
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-exc-detail-' . uniqid(),
+                'trace_id' => 'feat-exc-detail-'.uniqid(),
                 'execution_id' => $traceId,
                 'class' => $excClass,
                 'message' => 'Sampling bypass test',
@@ -328,14 +344,14 @@ class AgentFeaturesSystemTest extends TestCase
 
         // Exception record and issue also stored
         $this->assertGreaterThanOrEqual(1, self::rowCount('nightowl_exceptions', "execution_id = '{$traceId}'"));
-        $fp = md5($excClass . $file . $line);
+        $fp = md5($excClass.$file.$line);
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fp}'");
         $this->assertNotNull($issue);
     }
 
-    public function testSamplingKeeps5xxRequests(): void
+    public function test_sampling_keeps5xx_requests(): void
     {
-        $traceId = 'feat-sample-5xx-' . uniqid();
+        $traceId = 'feat-sample-5xx-'.uniqid();
 
         // 502 request without explicit exception record — still kept (5xx bypass)
         $response = $this->sim->send([
@@ -354,10 +370,10 @@ class AgentFeaturesSystemTest extends TestCase
         $this->assertSame(502, (int) $request['status_code']);
     }
 
-    public function testSamplingDropsNormalJobsAndCommands(): void
+    public function test_sampling_drops_normal_jobs_and_commands(): void
     {
-        $jobTrace = 'feat-sample-job-' . uniqid();
-        $cmdTrace = 'feat-sample-cmd-' . uniqid();
+        $jobTrace = 'feat-sample-job-'.uniqid();
+        $cmdTrace = 'feat-sample-cmd-'.uniqid();
 
         // Normal job and command — both should be dropped
         $this->sim->send([
@@ -384,9 +400,9 @@ class AgentFeaturesSystemTest extends TestCase
     //  arrays for storage.
     // ═══════════════════════════════════════════════════════════
 
-    public function testRedactionStripsPasswordFromContext(): void
+    public function test_redaction_strips_password_from_context(): void
     {
-        $traceId = 'feat-redact-ctx-' . uniqid();
+        $traceId = 'feat-redact-ctx-'.uniqid();
 
         // Send context as a nested array (not pre-encoded JSON string)
         // so the redactor can walk into it and find the 'password' key.
@@ -403,7 +419,7 @@ class AgentFeaturesSystemTest extends TestCase
                 ],
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-redact-exc-' . uniqid(),
+                'trace_id' => 'feat-redact-exc-'.uniqid(),
                 'execution_id' => $traceId,
                 'class' => 'RuntimeException',
                 'file' => 'app/Redact.php',
@@ -424,9 +440,9 @@ class AgentFeaturesSystemTest extends TestCase
         $this->assertStringContainsString('admin', $context, 'Non-sensitive fields should be preserved');
     }
 
-    public function testRedactionStripsHeadersPassedAsArray(): void
+    public function test_redaction_strips_headers_passed_as_array(): void
     {
-        $traceId = 'feat-redact-hdr-' . uniqid();
+        $traceId = 'feat-redact-hdr-'.uniqid();
 
         // Pass headers as a nested array so the redactor can walk it.
         // In production, Nightwatch may pre-encode headers as a JSON string,
@@ -445,7 +461,7 @@ class AgentFeaturesSystemTest extends TestCase
                 ],
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-redact-exc2-' . uniqid(),
+                'trace_id' => 'feat-redact-exc2-'.uniqid(),
                 'execution_id' => $traceId,
                 'class' => 'RuntimeException',
                 'file' => 'app/Redact.php',
@@ -468,9 +484,9 @@ class AgentFeaturesSystemTest extends TestCase
         $this->assertSame('application/json', $decoded['accept'], 'Accept header should be preserved');
     }
 
-    public function testRedactionHandlesNestedSensitiveKeys(): void
+    public function test_redaction_handles_nested_sensitive_keys(): void
     {
-        $traceId = 'feat-redact-nest-' . uniqid();
+        $traceId = 'feat-redact-nest-'.uniqid();
 
         // Nested array context with deep sensitive keys
         $response = $this->sim->send([
@@ -481,7 +497,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'line' => 3,
             ]),
             $this->sim->makeLog([
-                'trace_id' => 'feat-redact-log-' . uniqid(),
+                'trace_id' => 'feat-redact-log-'.uniqid(),
                 'execution_id' => $traceId,
                 'level' => 'error',
                 'message' => 'Auth failed',
@@ -510,9 +526,9 @@ class AgentFeaturesSystemTest extends TestCase
         }
     }
 
-    public function testRedactionStripsRecordLevelSensitiveKeys(): void
+    public function test_redaction_strips_record_level_sensitive_keys(): void
     {
-        $traceId = 'feat-redact-toplvl-' . uniqid();
+        $traceId = 'feat-redact-toplvl-'.uniqid();
 
         // Test that top-level record keys matching redact list are stripped.
         // 'password' and 'secret' at record level → [REDACTED]
@@ -526,7 +542,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'secret' => 'top-level-api-key',
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-redact-exc3-' . uniqid(),
+                'trace_id' => 'feat-redact-exc3-'.uniqid(),
                 'execution_id' => $traceId,
                 'class' => 'RuntimeException',
                 'file' => 'app/Redact.php',
@@ -549,16 +565,16 @@ class AgentFeaturesSystemTest extends TestCase
     //  THRESHOLD TESTS (cache_ttl = 0, always re-reads)
     // ═══════════════════════════════════════════════════════════
 
-    public function testRouteThresholdCreatesPerformanceIssue(): void
+    public function test_route_threshold_creates_performance_issue(): void
     {
         // Insert a threshold: any route over 100ms (100,000 us) triggers a performance issue
         self::$pdo->exec("
-            INSERT INTO nightowl_settings (key, value) VALUES ('thresholds', '" .
-            json_encode([['type' => 'route', 'duration_ms' => 100]]) . "')
+            INSERT INTO nightowl_settings (key, value) VALUES ('thresholds', '".
+            json_encode([['type' => 'route', 'duration_ms' => 100]])."')
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         ");
 
-        $traceId = 'feat-thresh-route-' . uniqid();
+        $traceId = 'feat-thresh-route-'.uniqid();
 
         // Send a slow request (500ms = 500,000 us) with exception to bypass sampling
         $response = $this->sim->send([
@@ -572,7 +588,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'route_methods' => json_encode(['GET']),
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-thresh-exc-' . uniqid(),
+                'trace_id' => 'feat-thresh-exc-'.uniqid(),
                 'execution_id' => $traceId,
                 'class' => 'RuntimeException',
                 'file' => 'app/Threshold.php',
@@ -596,16 +612,16 @@ class AgentFeaturesSystemTest extends TestCase
         $this->assertSame('open', $perfIssues[0]['status']);
     }
 
-    public function testRequestBelowThresholdDoesNotCreateIssue(): void
+    public function test_request_below_threshold_does_not_create_issue(): void
     {
         // Insert a threshold: 1000ms (1,000,000 us)
         self::$pdo->exec("
-            INSERT INTO nightowl_settings (key, value) VALUES ('thresholds', '" .
-            json_encode([['type' => 'route', 'duration_ms' => 1000]]) . "')
+            INSERT INTO nightowl_settings (key, value) VALUES ('thresholds', '".
+            json_encode([['type' => 'route', 'duration_ms' => 1000]])."')
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         ");
 
-        $traceId = 'feat-thresh-fast-' . uniqid();
+        $traceId = 'feat-thresh-fast-'.uniqid();
 
         // Send a fast request (50ms = 50,000 us) — below threshold, with exception to bypass sampling
         $response = $this->sim->send([
@@ -616,7 +632,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'duration' => 50_000, // 50ms — below 1000ms threshold
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-thresh-fast-exc-' . uniqid(),
+                'trace_id' => 'feat-thresh-fast-exc-'.uniqid(),
                 'execution_id' => $traceId,
                 'class' => 'RuntimeException',
                 'file' => 'app/Threshold.php',
@@ -634,16 +650,16 @@ class AgentFeaturesSystemTest extends TestCase
         $this->assertSame(0, $perfCount, 'Fast request should not create performance issue');
     }
 
-    public function testJobThresholdCreatesPerformanceIssue(): void
+    public function test_job_threshold_creates_performance_issue(): void
     {
         // Insert a job threshold: any job over 200ms triggers performance issue
         self::$pdo->exec("
-            INSERT INTO nightowl_settings (key, value) VALUES ('thresholds', '" .
-            json_encode([['type' => 'job', 'duration_ms' => 200]]) . "')
+            INSERT INTO nightowl_settings (key, value) VALUES ('thresholds', '".
+            json_encode([['type' => 'job', 'duration_ms' => 200]])."')
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         ");
 
-        $traceId = 'feat-thresh-job-' . uniqid();
+        $traceId = 'feat-thresh-job-'.uniqid();
 
         // Send a slow failed job (5s = 5,000,000 us) with exception to bypass sampling
         $response = $this->sim->send([
@@ -655,7 +671,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'exceptions' => 1,
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-thresh-job-exc-' . uniqid(),
+                'trace_id' => 'feat-thresh-job-exc-'.uniqid(),
                 'execution_id' => $traceId,
                 'execution_source' => 'job',
                 'class' => 'App\\Exceptions\\JobTimeout',
@@ -680,16 +696,16 @@ class AgentFeaturesSystemTest extends TestCase
     //  COMBINED: SAMPLING + REDACTION + THRESHOLDS TOGETHER
     // ═══════════════════════════════════════════════════════════
 
-    public function testAllFeaturesWorkTogetherInSinglePayload(): void
+    public function test_all_features_work_together_in_single_payload(): void
     {
         // Set threshold
         self::$pdo->exec("
-            INSERT INTO nightowl_settings (key, value) VALUES ('thresholds', '" .
-            json_encode([['type' => 'route', 'duration_ms' => 100]]) . "')
+            INSERT INTO nightowl_settings (key, value) VALUES ('thresholds', '".
+            json_encode([['type' => 'route', 'duration_ms' => 100]])."')
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         ");
 
-        $traceId = 'feat-combined-' . uniqid();
+        $traceId = 'feat-combined-'.uniqid();
         $excClass = 'App\\Exceptions\\CombinedTest';
         $file = 'app/Combined.php';
         $line = 42;
@@ -719,7 +735,7 @@ class AgentFeaturesSystemTest extends TestCase
                 ],
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-combined-exc-' . uniqid(),
+                'trace_id' => 'feat-combined-exc-'.uniqid(),
                 'execution_id' => $traceId,
                 'class' => $excClass,
                 'message' => 'Combined test error',
@@ -749,7 +765,7 @@ class AgentFeaturesSystemTest extends TestCase
         $this->assertNotEmpty($perfIssues, 'Slow request should create performance issue');
 
         // 4. EXCEPTION: issue also created
-        $fp = md5($excClass . $file . $line);
+        $fp = md5($excClass.$file.$line);
         $excIssue = self::fetch('nightowl_issues', "group_hash = '{$fp}' AND type = 'exception'");
         $this->assertNotNull($excIssue, 'Exception issue should exist alongside performance issue');
     }

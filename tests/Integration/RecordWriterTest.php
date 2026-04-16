@@ -27,13 +27,19 @@ use PHPUnit\Framework\TestCase;
 class RecordWriterTest extends TestCase
 {
     private static ?PDO $pdo = null;
+
     private static string $host;
+
     private static int $port;
+
     private static string $database;
+
     private static string $username;
+
     private static string $password;
 
     private RecordWriter $writer;
+
     private NightwatchSimulator $sim;
 
     public static function setUpBeforeClass(): void
@@ -53,7 +59,7 @@ class RecordWriterTest extends TestCase
         }
 
         if (self::$pdo) {
-            self::createTables();
+            MigrationRunner::migrate(self::$host, self::$port, self::$database, self::$username, self::$password);
         }
     }
 
@@ -76,7 +82,7 @@ class RecordWriterTest extends TestCase
 
     // ─── Individual record type tests ──────────────────────
 
-    public function testWriteRequest(): void
+    public function test_write_request(): void
     {
         $record = $this->sim->makeRequest(['trace_id' => 'req-001', 'status_code' => 200]);
 
@@ -88,7 +94,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('req-001', $row['trace_id']);
     }
 
-    public function testWriteQuery(): void
+    public function test_write_query(): void
     {
         $record = $this->sim->makeQuery(['trace_id' => 'qry-001', 'sql' => 'SELECT * FROM users']);
 
@@ -99,7 +105,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('SELECT * FROM users', $row['sql_query']);
     }
 
-    public function testWriteException(): void
+    public function test_write_exception(): void
     {
         $record = $this->sim->makeException([
             'trace_id' => 'exc-001',
@@ -115,7 +121,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('Test error', $row['message']);
     }
 
-    public function testWriteExceptionCreatesIssue(): void
+    public function test_write_exception_creates_issue(): void
     {
         $record = $this->sim->makeException([
             'trace_id' => 'exc-issue-001',
@@ -127,7 +133,7 @@ class RecordWriterTest extends TestCase
 
         $this->writer->write([$record]);
 
-        $fingerprint = md5('App\\Exceptions\\TestException' . 'app/Test.php' . '42');
+        $fingerprint = md5('App\\Exceptions\\TestException'.'app/Test.php'.'42');
         $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetch(PDO::FETCH_ASSOC);
         $this->assertNotFalse($issue);
         $this->assertSame('exception', $issue['type']);
@@ -136,7 +142,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame(1, (int) $issue['occurrences_count']);
     }
 
-    public function testWriteExceptionUpsertsIssueCount(): void
+    public function test_write_exception_upserts_issue_count(): void
     {
         $baseRecord = [
             'class' => 'App\\Exceptions\\DuplicateTest',
@@ -148,12 +154,12 @@ class RecordWriterTest extends TestCase
         $this->writer->write([$this->sim->makeException(array_merge($baseRecord, ['trace_id' => 'dup-2']))]);
         $this->writer->write([$this->sim->makeException(array_merge($baseRecord, ['trace_id' => 'dup-3']))]);
 
-        $fingerprint = md5('App\\Exceptions\\DuplicateTest' . 'app/Dup.php' . '10');
+        $fingerprint = md5('App\\Exceptions\\DuplicateTest'.'app/Dup.php'.'10');
         $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetch(PDO::FETCH_ASSOC);
         $this->assertSame(3, (int) $issue['occurrences_count']);
     }
 
-    public function testWriteCommand(): void
+    public function test_write_command(): void
     {
         $record = $this->sim->makeCommand(['trace_id' => 'cmd-001', 'command' => 'migrate']);
 
@@ -164,7 +170,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('migrate', $row['command']);
     }
 
-    public function testWriteJob(): void
+    public function test_write_job(): void
     {
         $record = $this->sim->makeJob(['trace_id' => 'job-001', 'name' => 'App\\Jobs\\TestJob', 'status' => 'processed']);
 
@@ -176,7 +182,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('processed', $row['status']);
     }
 
-    public function testWriteCacheEvent(): void
+    public function test_write_cache_event(): void
     {
         $record = $this->sim->makeCacheEvent(['trace_id' => 'cache-001', 'type' => 'hit', 'key' => 'users:1']);
 
@@ -188,7 +194,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('users:1', $row['key']);
     }
 
-    public function testWriteMail(): void
+    public function test_write_mail(): void
     {
         $record = $this->sim->makeMail(['trace_id' => 'mail-001', 'subject' => 'Welcome!']);
 
@@ -199,7 +205,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('Welcome!', $row['subject']);
     }
 
-    public function testWriteNotification(): void
+    public function test_write_notification(): void
     {
         $record = $this->sim->makeNotification(['trace_id' => 'notif-001', 'channel' => 'mail']);
 
@@ -210,7 +216,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('mail', $row['channel']);
     }
 
-    public function testWriteOutgoingRequest(): void
+    public function test_write_outgoing_request(): void
     {
         $record = $this->sim->makeOutgoingRequest(['trace_id' => 'out-001', 'url' => 'https://api.stripe.com/v1/charges']);
 
@@ -221,9 +227,9 @@ class RecordWriterTest extends TestCase
         $this->assertStringContainsString('stripe', $row['url']);
     }
 
-    public function testWriteScheduledTask(): void
+    public function test_write_scheduled_task(): void
     {
-        $record = $this->sim->makeScheduledTask(['trace_id' => 'task-001', 'command' => 'schedule:run']);
+        $record = $this->sim->makeScheduledTask(['trace_id' => 'task-001', 'name' => 'schedule:run']);
 
         $this->writer->write([$record]);
 
@@ -232,7 +238,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('schedule:run', $row['command']);
     }
 
-    public function testWriteLog(): void
+    public function test_write_log(): void
     {
         $record = $this->sim->makeLog(['trace_id' => 'log-001', 'level' => 'error', 'message' => 'Something broke']);
 
@@ -244,7 +250,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame('Something broke', $row['message']);
     }
 
-    public function testWriteUser(): void
+    public function test_write_user(): void
     {
         $record = $this->sim->makeUser('user_42');
 
@@ -255,7 +261,7 @@ class RecordWriterTest extends TestCase
         $this->assertNotNull($row['name']);
     }
 
-    public function testWriteUserUpsertUpdatesExisting(): void
+    public function test_write_user_upsert_updates_existing(): void
     {
         $this->writer->write([$this->sim->makeUser('user_upsert')]);
         $this->writer->write([['t' => 'user', 'id' => 'user_upsert', 'name' => 'Updated Name', 'username' => 'updated@test.com']]);
@@ -267,7 +273,7 @@ class RecordWriterTest extends TestCase
 
     // ─── Mixed payload tests ───────────────────────────────
 
-    public function testWriteMixedPayload(): void
+    public function test_write_mixed_payload(): void
     {
         $traceId = 'mixed-001';
         $records = [
@@ -288,7 +294,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame(1, (int) self::$pdo->query("SELECT COUNT(*) FROM nightowl_users WHERE user_id = 'user_mixed'")->fetchColumn());
     }
 
-    public function testWriteAllTwelveTypes(): void
+    public function test_write_all_twelve_types(): void
     {
         $records = [
             $this->sim->makeRequest(['trace_id' => 'all-req']),
@@ -332,7 +338,7 @@ class RecordWriterTest extends TestCase
 
     // ─── Transaction behavior ──────────────────────────────
 
-    public function testWriteIsAtomic(): void
+    public function test_write_is_atomic(): void
     {
         // Write valid records
         $this->writer->write([
@@ -344,7 +350,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame(1, (int) self::$pdo->query("SELECT COUNT(*) FROM nightowl_queries WHERE trace_id = 'atomic-2'")->fetchColumn());
     }
 
-    public function testSkipsRecordsWithoutType(): void
+    public function test_skips_records_without_type(): void
     {
         // Records without 't' key should be silently skipped
         $this->writer->write([
@@ -355,7 +361,7 @@ class RecordWriterTest extends TestCase
         $this->assertSame(1, (int) self::$pdo->query("SELECT COUNT(*) FROM nightowl_requests WHERE trace_id = 'has-type'")->fetchColumn());
     }
 
-    public function testSkipsUnknownType(): void
+    public function test_skips_unknown_type(): void
     {
         $this->writer->write([
             ['t' => 'unknown_type', 'data' => 'ignored'],
@@ -367,14 +373,14 @@ class RecordWriterTest extends TestCase
 
     // ─── users_count accuracy ────────────────────────────────
 
-    public function testExceptionIssueUsersCountDoesNotInflate(): void
+    public function test_exception_issue_users_count_does_not_inflate(): void
     {
         $baseRecord = [
             'class' => 'App\\Exceptions\\UserCountTest',
             'file' => 'app/UserCount.php',
             'line' => 99,
         ];
-        $fingerprint = md5('App\\Exceptions\\UserCountTest' . 'app/UserCount.php' . '99');
+        $fingerprint = md5('App\\Exceptions\\UserCountTest'.'app/UserCount.php'.'99');
 
         // Batch 1: user_A and user_B
         $this->writer->write([
@@ -406,14 +412,14 @@ class RecordWriterTest extends TestCase
         $this->assertSame(4, (int) $issue['occurrences_count']);
     }
 
-    public function testExceptionIssueUsersCountHandlesNullUsers(): void
+    public function test_exception_issue_users_count_handles_null_users(): void
     {
         $baseRecord = [
             'class' => 'App\\Exceptions\\NullUserTest',
             'file' => 'app/NullUser.php',
             'line' => 50,
         ];
-        $fingerprint = md5('App\\Exceptions\\NullUserTest' . 'app/NullUser.php' . '50');
+        $fingerprint = md5('App\\Exceptions\\NullUserTest'.'app/NullUser.php'.'50');
 
         // Exceptions with null user_id
         $this->writer->write([
@@ -427,7 +433,7 @@ class RecordWriterTest extends TestCase
 
     // ─── Batch stress ──────────────────────────────────────
 
-    public function testLargeBatchWrite(): void
+    public function test_large_batch_write(): void
     {
         $records = [];
         for ($i = 0; $i < 100; $i++) {
@@ -456,64 +462,5 @@ class RecordWriterTest extends TestCase
         foreach ($tables as $table) {
             self::$pdo->exec("TRUNCATE TABLE {$table} CASCADE");
         }
-    }
-
-    private static function createTables(): void
-    {
-        $sql = <<<'SQL'
-        CREATE TABLE IF NOT EXISTS nightowl_requests (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), user_id VARCHAR(255), method VARCHAR(255) NOT NULL DEFAULT 'GET', url TEXT NOT NULL DEFAULT '/', route_name VARCHAR(255), route_methods TEXT, route_domain VARCHAR(255), route_path VARCHAR(255), route_action VARCHAR(255), ip VARCHAR(255), duration INTEGER, status_code INTEGER NOT NULL DEFAULT 200, request_size INTEGER, response_size INTEGER, bootstrap INTEGER, before_middleware INTEGER, action INTEGER, render INTEGER, after_middleware INTEGER, sending INTEGER, terminating INTEGER, exceptions INTEGER DEFAULT 0, logs INTEGER DEFAULT 0, queries INTEGER DEFAULT 0, lazy_loads INTEGER DEFAULT 0, jobs_queued INTEGER DEFAULT 0, mail INTEGER DEFAULT 0, notifications INTEGER DEFAULT 0, outgoing_requests INTEGER DEFAULT 0, files_read INTEGER DEFAULT 0, files_written INTEGER DEFAULT 0, cache_events INTEGER DEFAULT 0, hydrated_models INTEGER DEFAULT 0, peak_memory_usage INTEGER, exception_preview TEXT, context TEXT, headers TEXT, payload TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_queries (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), sql_query TEXT NOT NULL DEFAULT '', file VARCHAR(255), line INTEGER, duration INTEGER, connection VARCHAR(255), connection_type VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_exceptions (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), class VARCHAR(255) NOT NULL DEFAULT 'Unknown', message TEXT, code VARCHAR(255), file VARCHAR(255), line INTEGER, trace TEXT, php_version VARCHAR(255), laravel_version VARCHAR(255), handled BOOLEAN DEFAULT false, fingerprint VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_commands (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), user_id VARCHAR(255), command VARCHAR(255) NOT NULL DEFAULT 'unknown', exit_code INTEGER, duration INTEGER, exceptions INTEGER DEFAULT 0, logs INTEGER DEFAULT 0, queries INTEGER DEFAULT 0, lazy_loads INTEGER DEFAULT 0, jobs_queued INTEGER DEFAULT 0, mail INTEGER DEFAULT 0, notifications INTEGER DEFAULT 0, outgoing_requests INTEGER DEFAULT 0, files_read INTEGER DEFAULT 0, files_written INTEGER DEFAULT 0, cache_events INTEGER DEFAULT 0, hydrated_models INTEGER DEFAULT 0, peak_memory_usage INTEGER, exception_preview TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_jobs (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), user_id VARCHAR(255), job_class VARCHAR(255) NOT NULL DEFAULT 'Unknown', queue VARCHAR(255), connection VARCHAR(255), status VARCHAR(255), duration INTEGER, attempts INTEGER DEFAULT 1, exceptions INTEGER DEFAULT 0, logs INTEGER DEFAULT 0, queries INTEGER DEFAULT 0, lazy_loads INTEGER DEFAULT 0, jobs_queued INTEGER DEFAULT 0, mail INTEGER DEFAULT 0, notifications INTEGER DEFAULT 0, outgoing_requests INTEGER DEFAULT 0, files_read INTEGER DEFAULT 0, files_written INTEGER DEFAULT 0, cache_events INTEGER DEFAULT 0, hydrated_models INTEGER DEFAULT 0, peak_memory_usage INTEGER, exception_preview TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_cache_events (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), event_type VARCHAR(255) NOT NULL DEFAULT 'unknown', key VARCHAR(255) NOT NULL DEFAULT '', store VARCHAR(255), ttl INTEGER, duration INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_mail (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), mailer VARCHAR(255), recipients TEXT, subject VARCHAR(255), mailable VARCHAR(255), duration INTEGER, queued BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_notifications (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), notification VARCHAR(255), channel VARCHAR(255), notifiable_type VARCHAR(255), notifiable_id VARCHAR(255), duration INTEGER, queued BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_outgoing_requests (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), method VARCHAR(255) NOT NULL DEFAULT 'GET', url TEXT NOT NULL DEFAULT '', status_code INTEGER, duration INTEGER, request_size INTEGER, response_size INTEGER, request_headers TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_scheduled_tasks (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), user_id VARCHAR(255), command VARCHAR(255) NOT NULL DEFAULT 'unknown', expression VARCHAR(255), status VARCHAR(255), duration INTEGER, exit_code INTEGER, exceptions INTEGER DEFAULT 0, logs INTEGER DEFAULT 0, queries INTEGER DEFAULT 0, lazy_loads INTEGER DEFAULT 0, jobs_queued INTEGER DEFAULT 0, mail INTEGER DEFAULT 0, notifications INTEGER DEFAULT 0, outgoing_requests INTEGER DEFAULT 0, files_read INTEGER DEFAULT 0, files_written INTEGER DEFAULT 0, cache_events INTEGER DEFAULT 0, hydrated_models INTEGER DEFAULT 0, peak_memory_usage INTEGER, exception_preview TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_logs (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), level VARCHAR(255) DEFAULT 'info', message TEXT, context TEXT, channel VARCHAR(255), created_at VARCHAR(255)
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_users (
-            user_id VARCHAR(255) PRIMARY KEY, name VARCHAR(255), email VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_issues (
-            id BIGSERIAL PRIMARY KEY, type VARCHAR(255) NOT NULL, status VARCHAR(255) DEFAULT 'open', priority VARCHAR(255), exception_class VARCHAR(255), exception_message TEXT, group_hash VARCHAR(255), first_seen_at TIMESTAMP, last_seen_at TIMESTAMP, occurrences_count INTEGER DEFAULT 0, users_count INTEGER DEFAULT 0, assigned_to VARCHAR(255), description TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE (group_hash, type)
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_issue_comments (
-            id BIGSERIAL PRIMARY KEY, issue_id BIGINT NOT NULL REFERENCES nightowl_issues(id) ON DELETE CASCADE, user_id BIGINT, user_name VARCHAR(255), user_email VARCHAR(255), body TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_issue_activity (
-            id BIGSERIAL PRIMARY KEY, issue_id BIGINT NOT NULL REFERENCES nightowl_issues(id) ON DELETE CASCADE, user_id BIGINT, user_name VARCHAR(255), action VARCHAR(50) NOT NULL, old_value VARCHAR(255), new_value VARCHAR(255), created_at TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_settings (
-            id BIGSERIAL PRIMARY KEY, key VARCHAR(255) NOT NULL UNIQUE, value TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_alert_channels (
-            id BIGSERIAL PRIMARY KEY, type VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL, config TEXT NOT NULL DEFAULT '{}', enabled BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        SQL;
-
-        self::$pdo->exec($sql);
     }
 }

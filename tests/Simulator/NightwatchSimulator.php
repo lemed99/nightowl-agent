@@ -16,8 +16,11 @@ namespace NightOwl\Tests\Simulator;
 final class NightwatchSimulator
 {
     private string $tokenHash;
+
     private string $host;
+
     private int $port;
+
     private float $timeout;
 
     /** @var array<string, int> */
@@ -41,7 +44,7 @@ final class NightwatchSimulator
      * Send a batch of records over TCP.
      *
      * @param  array  $records  Array of record arrays (each must have 't' key)
-     * @return string|null  Server response ("2:OK", "5:ERROR") or null on failure
+     * @return string|null Server response ("2:OK", "5:ERROR") or null on failure
      */
     public function send(array $records): ?string
     {
@@ -56,7 +59,7 @@ final class NightwatchSimulator
     public function sendRaw(string $payload): ?string
     {
         $body = "v1:{$this->tokenHash}:{$payload}";
-        $wire = strlen($body) . ':' . $body;
+        $wire = strlen($body).':'.$body;
 
         $socket = @stream_socket_client(
             "tcp://{$this->host}:{$this->port}",
@@ -114,7 +117,7 @@ final class NightwatchSimulator
     {
         $traceId = $this->uuid();
         $now = microtime(true);
-        $userId = 'user_' . mt_rand(1, 50);
+        $userId = 'user_'.mt_rand(1, 50);
 
         $records = [];
 
@@ -199,7 +202,7 @@ final class NightwatchSimulator
     {
         $traceId = $this->uuid();
         $now = microtime(true);
-        $userId = 'user_' . mt_rand(1, 50);
+        $userId = 'user_'.mt_rand(1, 50);
 
         $records = [];
 
@@ -295,7 +298,7 @@ final class NightwatchSimulator
         $elapsed = round((microtime(true) - $start) * 1000);
         $s = $this->stats;
         fwrite(STDOUT, "\nDone: {$s['sent']} sent, {$s['failed']} failed, "
-            . number_format($s['bytes']) . " bytes, {$elapsed}ms\n");
+            .number_format($s['bytes'])." bytes, {$elapsed}ms\n");
     }
 
     private function scenarioMixed(int $count): void
@@ -432,7 +435,7 @@ final class NightwatchSimulator
             'route_domain' => null,
             'route_path' => $route[2],
             'route_action' => 'App\\Http\\Controllers\\ApiController@handle',
-            'ip' => '192.168.1.' . mt_rand(1, 254),
+            'ip' => '192.168.1.'.mt_rand(1, 254),
             'duration' => mt_rand(5_000, 800_000),
             'status_code' => $status,
             'request_size' => mt_rand(200, 5000),
@@ -447,15 +450,11 @@ final class NightwatchSimulator
             'exceptions' => 0,
             'logs' => mt_rand(0, 3),
             'queries' => mt_rand(2, 15),
-            'lazy_loads' => 0,
             'jobs_queued' => 0,
             'mail' => 0,
             'notifications' => 0,
             'outgoing_requests' => 0,
-            'files_read' => 0,
-            'files_written' => 0,
             'cache_events' => mt_rand(0, 5),
-            'hydrated_models' => mt_rand(0, 50),
             'peak_memory_usage' => mt_rand(8_000_000, 64_000_000),
             'context' => null,
             'headers' => json_encode([
@@ -533,7 +532,7 @@ final class NightwatchSimulator
             'php_version' => '8.4.15',
             'laravel_version' => '12.43.1',
             'handled' => false,
-            'fingerprint' => md5($e[0] . $e[2] . $e[3]),
+            'fingerprint' => md5($e[0].$e[2].$e[3]),
         ], $overrides);
     }
 
@@ -566,15 +565,11 @@ final class NightwatchSimulator
             'exceptions' => 0,
             'logs' => 0,
             'queries' => mt_rand(1, 10),
-            'lazy_loads' => 0,
             'jobs_queued' => 0,
             'mail' => 0,
             'notifications' => 0,
             'outgoing_requests' => 0,
-            'files_read' => 0,
-            'files_written' => 0,
             'cache_events' => 0,
-            'hydrated_models' => mt_rand(0, 20),
             'peak_memory_usage' => mt_rand(16_000_000, 64_000_000),
         ], $overrides);
     }
@@ -597,15 +592,11 @@ final class NightwatchSimulator
             'exceptions' => 0,
             'logs' => mt_rand(0, 5),
             'queries' => mt_rand(0, 50),
-            'lazy_loads' => 0,
             'jobs_queued' => 0,
             'mail' => 0,
             'notifications' => 0,
             'outgoing_requests' => 0,
-            'files_read' => mt_rand(0, 10),
-            'files_written' => mt_rand(0, 5),
             'cache_events' => 0,
-            'hydrated_models' => 0,
             'peak_memory_usage' => mt_rand(32_000_000, 128_000_000),
         ], $overrides);
     }
@@ -637,15 +628,11 @@ final class NightwatchSimulator
             'exceptions' => 0,
             'logs' => 0,
             'queries' => mt_rand(0, 20),
-            'lazy_loads' => 0,
             'jobs_queued' => 0,
             'mail' => 0,
             'notifications' => 0,
             'outgoing_requests' => 0,
-            'files_read' => 0,
-            'files_written' => 0,
             'cache_events' => 0,
-            'hydrated_models' => 0,
             'peak_memory_usage' => mt_rand(16_000_000, 64_000_000),
         ], $overrides);
     }
@@ -797,7 +784,7 @@ final class NightwatchSimulator
             't' => 'user',
             'id' => $userId,
             'name' => $names[array_rand($names)],
-            'username' => strtolower(str_replace(' ', '.', $names[array_rand($names)])) . '@example.com',
+            'username' => strtolower(str_replace(' ', '.', $names[array_rand($names)])).'@example.com',
         ];
     }
 
@@ -807,11 +794,11 @@ final class NightwatchSimulator
     {
         return sprintf(
             '%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
-            mt_rand(0, 0xffff), mt_rand(0, 0xffff),
-            mt_rand(0, 0xffff),
-            mt_rand(0, 0x0fff) | 0x4000,
-            mt_rand(0, 0x3fff) | 0x8000,
-            mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+            mt_rand(0, 0xFFFF), mt_rand(0, 0xFFFF),
+            mt_rand(0, 0xFFFF),
+            mt_rand(0, 0x0FFF) | 0x4000,
+            mt_rand(0, 0x3FFF) | 0x8000,
+            mt_rand(0, 0xFFFF), mt_rand(0, 0xFFFF), mt_rand(0, 0xFFFF),
         );
     }
 

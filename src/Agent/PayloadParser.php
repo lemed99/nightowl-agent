@@ -5,11 +5,20 @@ namespace NightOwl\Agent;
 final class PayloadParser
 {
     private const SUPPORTED_VERSIONS = ['v1'];
+
     private const MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024 * 20; // 200 MB — 20x compressed limit
 
     public function __construct(
         private bool $gzipEnabled = true,
-    ) {}
+        private ?string $debugDumpPath = null,
+    ) {
+        if ($this->debugDumpPath !== null) {
+            $dir = dirname($this->debugDumpPath);
+            if (! is_dir($dir)) {
+                @mkdir($dir, 0755, true);
+            }
+        }
+    }
 
     /**
      * Parse a Nightwatch payload.
@@ -56,7 +65,7 @@ final class PayloadParser
         if (! in_array($version, self::SUPPORTED_VERSIONS, true)) {
             return [
                 'type' => 'error',
-                'error' => "Unsupported wire format version '{$version}'. Supported: " . implode(', ', self::SUPPORTED_VERSIONS),
+                'error' => "Unsupported wire format version '{$version}'. Supported: ".implode(', ', self::SUPPORTED_VERSIONS),
             ];
         }
 
@@ -101,12 +110,44 @@ final class PayloadParser
             return null;
         }
 
+        if ($this->debugDumpPath !== null) {
+            $this->dumpDecoded($tokenHash, $payload, $records);
+        }
+
         return [
             'type' => 'json',
             'records' => $records,
             'rawPayload' => $payload,
             'tokenHash' => $tokenHash,
         ];
+    }
+
+    /**
+     * Debug-only: append a JSONL line with the decoded records so we can
+     * inspect which record types (`t` field) the upstream collector emits.
+     * Grep friendly: `grep lazy_load raw-payloads.jsonl`.
+     * Aggregate friendly: `jq -r '.records[].t' raw-payloads.jsonl | sort | uniq -c`.
+     */
+    private function dumpDecoded(string $tokenHash, string $rawPayload, array $records): void
+    {
+        $entry = [
+            'ts' => date('c'),
+            'tokenHash' => $tokenHash,
+            'bytes' => strlen($rawPayload),
+            'recordCount' => count($records),
+            'recordTypes' => array_count_values(array_map(
+                fn ($r) => is_array($r) && isset($r['t']) ? (string) $r['t'] : '<untyped>',
+                $records,
+            )),
+            'records' => $records,
+        ];
+
+        $line = json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($line === false) {
+            return;
+        }
+
+        @file_put_contents($this->debugDumpPath, $line."\n", FILE_APPEND | LOCK_EX);
     }
 
     /**

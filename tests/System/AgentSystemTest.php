@@ -2,6 +2,7 @@
 
 namespace NightOwl\Tests\System;
 
+use NightOwl\Tests\Integration\MigrationRunner;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
@@ -34,8 +35,11 @@ use PHPUnit\Framework\TestCase;
 class AgentSystemTest extends TestCase
 {
     private const TOKEN = 'system-test-token-2025';
+
     private const AGENT_HOST = '127.0.0.1';
+
     private const AGENT_PORT = 2411;
+
     private const HEALTH_PORT = 2412;
 
     /** Maximum seconds to wait for drain to flush data to PG */
@@ -45,16 +49,23 @@ class AgentSystemTest extends TestCase
     private const STARTUP_TIMEOUT = 5;
 
     private static ?PDO $pdo = null;
+
     private static string $dbHost;
+
     private static int $dbPort;
+
     private static string $dbDatabase;
+
     private static string $dbUsername;
+
     private static string $dbPassword;
 
     /** @var resource|null */
     private static $agentProcess = null;
+
     /** @var resource[] */
     private static array $agentPipes = [];
+
     private static string $sqlitePath = '';
 
     private NightwatchSimulator $sim;
@@ -78,15 +89,17 @@ class AgentSystemTest extends TestCase
             self::$pdo = new PDO($dsn, self::$dbUsername, self::$dbPassword);
             self::$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         } catch (\Exception $e) {
-            static::markTestSkipped('PostgreSQL not available: ' . $e->getMessage());
+            static::markTestSkipped('PostgreSQL not available: '.$e->getMessage());
         }
 
-        // Create tables from canonical schema
-        $schemaPath = __DIR__ . '/../Simulator/schema.sql';
-        $sql = file_get_contents($schemaPath);
-        if ($sql) {
-            self::$pdo->exec($sql);
-        }
+        // Apply the agent's migrations — single source of truth.
+        MigrationRunner::migrate(
+            self::$dbHost,
+            (int) self::$dbPort,
+            self::$dbDatabase,
+            self::$dbUsername,
+            self::$dbPassword,
+        );
 
         // Start the agent
         self::startAgent();
@@ -118,9 +131,9 @@ class AgentSystemTest extends TestCase
 
     private static function startAgent(): void
     {
-        self::$sqlitePath = sys_get_temp_dir() . '/nightowl-system-test-' . getmypid() . '.sqlite';
+        self::$sqlitePath = sys_get_temp_dir().'/nightowl-system-test-'.getmypid().'.sqlite';
 
-        $harness = realpath(__DIR__ . '/../Simulator/agent-harness-async.php');
+        $harness = realpath(__DIR__.'/../Simulator/agent-harness-async.php');
         if (! $harness) {
             static::markTestSkipped('agent-harness-async.php not found.');
         }
@@ -159,7 +172,7 @@ class AgentSystemTest extends TestCase
 
         while (microtime(true) < $deadline) {
             $sock = @stream_socket_client(
-                'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+                'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
                 $errno, $errstr, 0.5,
             );
             if ($sock) {
@@ -174,7 +187,7 @@ class AgentSystemTest extends TestCase
             // Read any output for diagnostics
             $output = stream_get_contents(self::$agentPipes[1]);
             self::stopAgent();
-            static::markTestSkipped("Agent did not start within " . self::STARTUP_TIMEOUT . "s. Output: {$output}");
+            static::markTestSkipped('Agent did not start within '.self::STARTUP_TIMEOUT."s. Output: {$output}");
         }
     }
 
@@ -220,10 +233,10 @@ class AgentSystemTest extends TestCase
         // Cleanup SQLite files
         foreach ([
             self::$sqlitePath,
-            self::$sqlitePath . '-wal',
-            self::$sqlitePath . '-shm',
-            self::$sqlitePath . '.drain-metrics.json',
-            self::$sqlitePath . '.drain-metrics.json.tmp',
+            self::$sqlitePath.'-wal',
+            self::$sqlitePath.'-shm',
+            self::$sqlitePath.'.drain-metrics.json',
+            self::$sqlitePath.'.drain-metrics.json.tmp',
         ] as $f) {
             if (file_exists($f)) {
                 @unlink($f);
@@ -257,6 +270,7 @@ class AgentSystemTest extends TestCase
     private static function fetch(string $table, string $where): ?array
     {
         $row = self::$pdo->query("SELECT * FROM {$table} WHERE {$where}")->fetch(PDO::FETCH_ASSOC);
+
         return $row ?: null;
     }
 
@@ -299,15 +313,15 @@ class AgentSystemTest extends TestCase
 
     // ─── 1. Basic Pipeline ────────────────────────────────────
 
-    public function testPingSurvivesFullStack(): void
+    public function test_ping_survives_full_stack(): void
     {
         $response = $this->sim->ping();
         $this->assertSame('2:OK', $response);
     }
 
-    public function testSingleRequestFlowsThroughEntirePipeline(): void
+    public function test_single_request_flows_through_entire_pipeline(): void
     {
-        $traceId = 'sys-req-' . uniqid();
+        $traceId = 'sys-req-'.uniqid();
 
         $this->sendAndExpectOk([
             $this->sim->makeRequest(['trace_id' => $traceId, 'method' => 'GET', 'status_code' => 200]),
@@ -323,10 +337,10 @@ class AgentSystemTest extends TestCase
 
     // ─── 2. Full Request Lifecycle ────────────────────────────
 
-    public function testRequestLifecycleWithChildRecords(): void
+    public function test_request_lifecycle_with_child_records(): void
     {
-        $traceId = 'sys-lifecycle-' . uniqid();
-        $userId = 'sys-user-' . uniqid();
+        $traceId = 'sys-lifecycle-'.uniqid();
+        $userId = 'sys-user-'.uniqid();
 
         $this->sendAndExpectOk([
             $this->sim->makeRequest([
@@ -337,25 +351,25 @@ class AgentSystemTest extends TestCase
                 'status_code' => 201,
             ]),
             $this->sim->makeQuery([
-                'trace_id' => 'sys-q1-' . uniqid(),
+                'trace_id' => 'sys-q1-'.uniqid(),
                 'execution_id' => $traceId,
                 'execution_source' => 'request',
                 'sql' => 'INSERT INTO orders (user_id, total) VALUES (?, ?)',
             ]),
             $this->sim->makeQuery([
-                'trace_id' => 'sys-q2-' . uniqid(),
+                'trace_id' => 'sys-q2-'.uniqid(),
                 'execution_id' => $traceId,
                 'execution_source' => 'request',
                 'sql' => 'SELECT * FROM products WHERE id = ?',
             ]),
             $this->sim->makeCacheEvent([
-                'trace_id' => 'sys-c1-' . uniqid(),
+                'trace_id' => 'sys-c1-'.uniqid(),
                 'execution_id' => $traceId,
                 'type' => 'hit',
                 'key' => 'products:list',
             ]),
             $this->sim->makeLog([
-                'trace_id' => 'sys-l1-' . uniqid(),
+                'trace_id' => 'sys-l1-'.uniqid(),
                 'execution_id' => $traceId,
                 'level' => 'info',
                 'message' => 'Order created',
@@ -383,13 +397,13 @@ class AgentSystemTest extends TestCase
 
     // ─── 3. Exception → Issue Creation ────────────────────────
 
-    public function testExceptionCreatesIssueAutomatically(): void
+    public function test_exception_creates_issue_automatically(): void
     {
-        $traceId = 'sys-exc-' . uniqid();
+        $traceId = 'sys-exc-'.uniqid();
         $exceptionClass = 'App\\Exceptions\\SystemTestException';
         $file = 'app/Services/Payment.php';
         $line = 42;
-        $fingerprint = md5($exceptionClass . $file . $line);
+        $fingerprint = md5($exceptionClass.$file.$line);
 
         $this->sendAndExpectOk([
             $this->sim->makeRequest([
@@ -398,7 +412,7 @@ class AgentSystemTest extends TestCase
                 'exceptions' => 1,
             ]),
             $this->sim->makeException([
-                'trace_id' => 'sys-exc-detail-' . uniqid(),
+                'trace_id' => 'sys-exc-detail-'.uniqid(),
                 'execution_id' => $traceId,
                 'class' => $exceptionClass,
                 'message' => 'Payment gateway timeout',
@@ -424,18 +438,18 @@ class AgentSystemTest extends TestCase
 
     // ─── 4. Duplicate Exceptions Increment ────────────────────
 
-    public function testDuplicateExceptionsIncrementIssueCount(): void
+    public function test_duplicate_exceptions_increment_issue_count(): void
     {
         $exceptionClass = 'App\\Exceptions\\DuplicateSystemTest';
         $file = 'app/Dup.php';
         $line = 10;
-        $fingerprint = md5($exceptionClass . $file . $line);
+        $fingerprint = md5($exceptionClass.$file.$line);
 
         // Send 5 separate payloads with the same exception fingerprint
         for ($i = 0; $i < 5; $i++) {
             $this->sendAndExpectOk([
                 $this->sim->makeException([
-                    'trace_id' => 'sys-dup-' . uniqid(),
+                    'trace_id' => 'sys-dup-'.uniqid(),
                     'class' => $exceptionClass,
                     'file' => $file,
                     'line' => $line,
@@ -454,9 +468,9 @@ class AgentSystemTest extends TestCase
 
     // ─── 5. All 12 Record Types ───────────────────────────────
 
-    public function testAllTwelveRecordTypesArriveInPostgres(): void
+    public function test_all_twelve_record_types_arrive_in_postgres(): void
     {
-        $tag = 'sys-all-' . uniqid();
+        $tag = 'sys-all-'.uniqid();
 
         $this->sendAndExpectOk([
             $this->sim->makeRequest(['trace_id' => "{$tag}-req"]),
@@ -503,17 +517,17 @@ class AgentSystemTest extends TestCase
 
     // ─── 6. Gzip Over The Wire ────────────────────────────────
 
-    public function testGzipPayloadProcessedCorrectly(): void
+    public function test_gzip_payload_processed_correctly(): void
     {
         if (! function_exists('gzencode')) {
             $this->markTestSkipped('ext-zlib not available');
         }
 
-        $traceId = 'sys-gzip-' . uniqid();
+        $traceId = 'sys-gzip-'.uniqid();
 
         $records = [
             $this->sim->makeRequest(['trace_id' => $traceId, 'method' => 'PUT', 'status_code' => 200]),
-            $this->sim->makeQuery(['trace_id' => 'sys-gzq-' . uniqid(), 'execution_id' => $traceId]),
+            $this->sim->makeQuery(['trace_id' => 'sys-gzq-'.uniqid(), 'execution_id' => $traceId]),
         ];
 
         // Build gzip wire payload manually
@@ -521,10 +535,10 @@ class AgentSystemTest extends TestCase
         $compressed = gzencode($json);
         $tokenHash = substr(hash('xxh128', self::TOKEN), 0, 7);
         $body = "v1:{$tokenHash}:{$compressed}";
-        $wire = strlen($body) . ':' . $body;
+        $wire = strlen($body).':'.$body;
 
         $sock = stream_socket_client(
-            'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+            'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
             $errno, $errstr, 3.0,
         );
         $this->assertNotFalse($sock, "TCP connect failed: {$errstr}");
@@ -544,16 +558,16 @@ class AgentSystemTest extends TestCase
 
     // ─── 7. Token Rejection ───────────────────────────────────
 
-    public function testInvalidTokenRejectedOverTcp(): void
+    public function test_invalid_token_rejected_over_tcp(): void
     {
-        $traceId = 'sys-reject-' . uniqid();
+        $traceId = 'sys-reject-'.uniqid();
 
         $json = json_encode([$this->sim->makeRequest(['trace_id' => $traceId])]);
         $body = "v1:INVALID:{$json}";
-        $wire = strlen($body) . ':' . $body;
+        $wire = strlen($body).':'.$body;
 
         $sock = stream_socket_client(
-            'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+            'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
             $errno, $errstr, 3.0,
         );
         $this->assertNotFalse($sock);
@@ -572,9 +586,9 @@ class AgentSystemTest extends TestCase
 
     // ─── 8. Batch Throughput ──────────────────────────────────
 
-    public function testBatchOf100RequestsDrainedCorrectly(): void
+    public function test_batch_of100_requests_drained_correctly(): void
     {
-        $tag = 'sys-batch-' . uniqid();
+        $tag = 'sys-batch-'.uniqid();
 
         $records = [];
         for ($i = 0; $i < 100; $i++) {
@@ -591,9 +605,9 @@ class AgentSystemTest extends TestCase
 
     // ─── 9. Sequential Payloads ───────────────────────────────
 
-    public function testMultipleSequentialPayloadsAllArrive(): void
+    public function test_multiple_sequential_payloads_all_arrive(): void
     {
-        $tag = 'sys-seq-' . uniqid();
+        $tag = 'sys-seq-'.uniqid();
         $total = 20;
 
         for ($i = 0; $i < $total; $i++) {
@@ -609,7 +623,7 @@ class AgentSystemTest extends TestCase
 
     // ─── 10. Error Storm ──────────────────────────────────────
 
-    public function testErrorStormCreatesIssuesWithoutCrashing(): void
+    public function test_error_storm_creates_issues_without_crashing(): void
     {
         $exceptionClasses = [
             'App\\Exceptions\\StormA',
@@ -624,12 +638,12 @@ class AgentSystemTest extends TestCase
             $class = $exceptionClasses[$i % 3];
             $file = 'app/Storm.php';
             $line = ($i % 3) + 1; // 3 distinct fingerprints
-            $fingerprint = md5($class . $file . $line);
+            $fingerprint = md5($class.$file.$line);
             $expectedFingerprints[$fingerprint] = true;
 
             $this->sendAndExpectOk([
                 $this->sim->makeException([
-                    'trace_id' => 'sys-storm-' . uniqid(),
+                    'trace_id' => 'sys-storm-'.uniqid(),
                     'class' => $class,
                     'message' => "Storm error #{$i}",
                     'file' => $file,
@@ -656,10 +670,10 @@ class AgentSystemTest extends TestCase
 
     // ─── 11. Job Lifecycle ────────────────────────────────────
 
-    public function testJobLifecycleProcessedAndFailed(): void
+    public function test_job_lifecycle_processed_and_failed(): void
     {
-        $successTrace = 'sys-job-ok-' . uniqid();
-        $failTrace = 'sys-job-fail-' . uniqid();
+        $successTrace = 'sys-job-ok-'.uniqid();
+        $failTrace = 'sys-job-fail-'.uniqid();
 
         // Successful job
         $this->sendAndExpectOk([
@@ -680,7 +694,7 @@ class AgentSystemTest extends TestCase
                 'exceptions' => 1,
             ]),
             $this->sim->makeException([
-                'trace_id' => 'sys-jexc-' . uniqid(),
+                'trace_id' => 'sys-jexc-'.uniqid(),
                 'execution_id' => $failTrace,
                 'execution_source' => 'job',
                 'class' => 'App\\Exceptions\\PaymentTimeout',
@@ -699,16 +713,16 @@ class AgentSystemTest extends TestCase
         $this->assertSame('failed', $failedJob['status']);
 
         // Failed job's exception should create an issue
-        $fp = md5('App\\Exceptions\\PaymentTimeout' . 'app/Jobs/ProcessPayment.php' . '88');
+        $fp = md5('App\\Exceptions\\PaymentTimeout'.'app/Jobs/ProcessPayment.php'.'88');
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fp}'");
         $this->assertNotNull($issue);
     }
 
     // ─── 12. Concurrent Connections ───────────────────────────
 
-    public function testConcurrentTcpConnectionsAllAccepted(): void
+    public function test_concurrent_tcp_connections_all_accepted(): void
     {
-        $tag = 'sys-conc-' . uniqid();
+        $tag = 'sys-conc-'.uniqid();
         $concurrency = 10;
 
         // Open all connections first
@@ -717,7 +731,7 @@ class AgentSystemTest extends TestCase
 
         for ($i = 0; $i < $concurrency; $i++) {
             $sock = @stream_socket_client(
-                'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+                'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
                 $errno, $errstr, 3.0,
             );
             $this->assertNotFalse($sock, "Connection {$i} failed: {$errstr}");
@@ -730,7 +744,7 @@ class AgentSystemTest extends TestCase
             $records = [$this->sim->makeRequest(['trace_id' => "{$tag}-{$i}"])];
             $json = json_encode($records);
             $body = "v1:{$tokenHash}:{$json}";
-            $wire = strlen($body) . ':' . $body;
+            $wire = strlen($body).':'.$body;
             fwrite($sock, $wire);
         }
 
@@ -752,9 +766,9 @@ class AgentSystemTest extends TestCase
 
     // ─── 13. Mixed Realistic Scenario ─────────────────────────
 
-    public function testRealisticMixedTrafficScenario(): void
+    public function test_realistic_mixed_traffic_scenario(): void
     {
-        $tag = 'sys-mix-' . uniqid();
+        $tag = 'sys-mix-'.uniqid();
 
         // Simulate 30 seconds of realistic traffic in fast-forward
         // 10 requests, 3 jobs, 2 commands, 1 scheduled task, 1 error
@@ -792,9 +806,9 @@ class AgentSystemTest extends TestCase
 
     // ─── 14. User Upsert Across Payloads ──────────────────────
 
-    public function testUserUpsertUpdatesAcrossPayloads(): void
+    public function test_user_upsert_updates_across_payloads(): void
     {
-        $userId = 'sys-upsert-user-' . uniqid();
+        $userId = 'sys-upsert-user-'.uniqid();
 
         // First payload: create user
         $this->sendAndExpectOk([
@@ -828,11 +842,11 @@ class AgentSystemTest extends TestCase
 
     // ─── 15. Malformed Payload Rejected ───────────────────────
 
-    public function testMalformedPayloadDoesNotCrashAgent(): void
+    public function test_malformed_payload_does_not_crash_agent(): void
     {
         // Send garbage
         $sock = stream_socket_client(
-            'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+            'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
             $errno, $errstr, 3.0,
         );
         $this->assertNotFalse($sock);
@@ -846,7 +860,7 @@ class AgentSystemTest extends TestCase
         // Response may be empty (connection closed) or 5:ERROR
         $this->assertTrue(
             $response === '' || $response === false || $response === '5:ERROR',
-            "Expected rejection, got: " . var_export($response, true),
+            'Expected rejection, got: '.var_export($response, true),
         );
 
         // Verify agent is still alive by sending a valid PING
@@ -856,9 +870,9 @@ class AgentSystemTest extends TestCase
 
     // ─── 16. Large Payload Over Wire ──────────────────────────
 
-    public function testLargePayloadWithManyRecords(): void
+    public function test_large_payload_with_many_records(): void
     {
-        $tag = 'sys-large-' . uniqid();
+        $tag = 'sys-large-'.uniqid();
 
         // 200 records in a single payload (requests + queries + cache + logs)
         $records = [];

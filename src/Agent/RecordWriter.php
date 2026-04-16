@@ -7,20 +7,27 @@ use PDO;
 final class RecordWriter
 {
     private ?PDO $pdo = null;
+
     private string $dsn;
+
     private string $username;
+
     private string $password;
 
     /** @var array<string, list<array{target?: string, duration_ms: int}>> Thresholds grouped by type */
     private array $thresholdCache = [];
+
     private float $thresholdCacheExpiry = 0;
+
     private int $thresholdCacheTtl;
 
     /** Lightweight polling: detect settings changes without full reload */
     private float $thresholdVersionCheckAt = 0;
+
     private ?string $thresholdUpdatedAt = null;
 
     private AlertNotifier $notifier;
+
     private string $appName;
 
     public function __construct(string $host, int $port, string $database, string $username, string $password, int $thresholdCacheTtl = 86400, ?AlertNotifier $notifier = null, string $appName = 'NightOwl')
@@ -181,9 +188,9 @@ final class RecordWriter
      * COPY a batch of rows into a table using PostgreSQL's COPY protocol.
      * 5-10x faster than batched INSERTs because it bypasses the SQL parser.
      *
-     * @param string   $table   Target table name
-     * @param string[] $columns Column names in order
-     * @param array[]  $rows    Each row is an array of values matching $columns order
+     * @param  string  $table  Target table name
+     * @param  string[]  $columns  Column names in order
+     * @param  array[]  $rows  Each row is an array of values matching $columns order
      */
     private function copyBatch(string $table, array $columns, array $rows): void
     {
@@ -202,8 +209,8 @@ final class RecordWriter
                 } else {
                     // Escape tab, newline, carriage return, and backslash for TSV format
                     $escaped[] = str_replace(
-                        ["\\", "\t", "\n", "\r"],
-                        ["\\\\", "\\t", "\\n", "\\r"],
+                        ['\\', "\t", "\n", "\r"],
+                        ['\\\\', '\\t', '\\n', '\\r'],
                         (string) $value,
                     );
                 }
@@ -215,7 +222,7 @@ final class RecordWriter
         // escaped string there, so any `\N` in the TSV is treated as the
         // literal string "N" for non-text columns. The text COPY default
         // null marker is already `\N`.
-        $this->pdo()->pgsqlCopyFromArray($table . ' (' . $colList . ')', $tsvRows);
+        $this->pdo()->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
     }
 
     private function writeRequests(array $records): void
@@ -227,10 +234,9 @@ final class RecordWriter
             'duration', 'status_code', 'request_size', 'response_size',
             'bootstrap', 'before_middleware', 'action', 'render',
             'after_middleware', 'sending', 'terminating',
-            'exceptions', 'logs', 'queries', 'lazy_loads',
+            'exceptions', 'logs', 'queries',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
-            'files_read', 'files_written', 'cache_events',
-            'hydrated_models', 'peak_memory_usage',
+            'cache_events', 'peak_memory_usage',
             'exception_preview', 'context', 'headers', 'payload',
         ];
 
@@ -266,15 +272,11 @@ final class RecordWriter
                 $r['exceptions'] ?? 0,
                 $r['logs'] ?? 0,
                 $r['queries'] ?? 0,
-                $r['lazy_loads'] ?? 0,
                 $r['jobs_queued'] ?? 0,
                 $r['mail'] ?? 0,
                 $r['notifications'] ?? 0,
                 $r['outgoing_requests'] ?? 0,
-                $r['files_read'] ?? 0,
-                $r['files_written'] ?? 0,
                 $r['cache_events'] ?? 0,
-                $r['hydrated_models'] ?? 0,
                 $r['peak_memory_usage'] ?? 0,
                 $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
@@ -341,7 +343,7 @@ final class RecordWriter
         $issueGroups = [];
 
         foreach ($records as $r) {
-            $fingerprint = md5(($r['class'] ?? '') . ($r['file'] ?? '') . ($r['line'] ?? ''));
+            $fingerprint = md5(($r['class'] ?? '').($r['file'] ?? '').($r['line'] ?? ''));
             $deploy = $r['deploy'] ?? null;
             $groupKey = $fingerprint.'|'.($deploy ?? '');
 
@@ -454,10 +456,9 @@ final class RecordWriter
             'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
             'user_id', 'class', 'name', 'command', 'exit_code', 'duration',
             'bootstrap', 'action', 'terminating',
-            'exceptions', 'logs', 'queries', 'lazy_loads',
+            'exceptions', 'logs', 'queries',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
-            'files_read', 'files_written', 'cache_events',
-            'hydrated_models', 'peak_memory_usage', 'exception_preview', 'context',
+            'cache_events', 'peak_memory_usage', 'exception_preview', 'context',
         ];
 
         $rows = [];
@@ -468,10 +469,9 @@ final class RecordWriter
                 $r['server'] ?? null, $r['_group'] ?? null, $r['user'] ?? null,
                 $r['class'] ?? null, $r['name'] ?? null, $r['command'] ?? 'unknown', $r['exit_code'] ?? null, $r['duration'] ?? null,
                 $r['bootstrap'] ?? null, $r['action'] ?? null, $r['terminating'] ?? null,
-                $r['exceptions'] ?? 0, $r['logs'] ?? 0, $r['queries'] ?? 0, $r['lazy_loads'] ?? 0,
+                $r['exceptions'] ?? 0, $r['logs'] ?? 0, $r['queries'] ?? 0,
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
-                $r['files_read'] ?? 0, $r['files_written'] ?? 0, $r['cache_events'] ?? 0,
-                $r['hydrated_models'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
+                $r['cache_events'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
             ];
         }
@@ -488,10 +488,9 @@ final class RecordWriter
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'job_id', 'attempt_id', 'attempt',
             'job_class', 'queue', 'connection', 'status', 'duration', 'attempts',
-            'exceptions', 'logs', 'queries', 'lazy_loads',
+            'exceptions', 'logs', 'queries',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
-            'files_read', 'files_written', 'cache_events',
-            'hydrated_models', 'peak_memory_usage', 'exception_preview', 'context',
+            'cache_events', 'peak_memory_usage', 'exception_preview', 'context',
         ];
 
         $rows = [];
@@ -504,10 +503,9 @@ final class RecordWriter
                 $r['job_id'] ?? null, $r['attempt_id'] ?? null, $r['attempt'] ?? null,
                 $r['name'] ?? $r['job_class'] ?? 'Unknown', $r['queue'] ?? null,
                 $r['connection'] ?? null, $r['status'] ?? null, $r['duration'] ?? null, $r['attempts'] ?? 1,
-                $r['exceptions'] ?? 0, $r['logs'] ?? 0, $r['queries'] ?? 0, $r['lazy_loads'] ?? 0,
+                $r['exceptions'] ?? 0, $r['logs'] ?? 0, $r['queries'] ?? 0,
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
-                $r['files_read'] ?? 0, $r['files_written'] ?? 0, $r['cache_events'] ?? 0,
-                $r['hydrated_models'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
+                $r['cache_events'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
             ];
         }
@@ -677,10 +675,9 @@ final class RecordWriter
             'user_id', 'command', 'expression',
             'timezone', 'repeat_seconds', 'without_overlapping', 'on_one_server', 'run_in_background', 'even_in_maintenance_mode',
             'status', 'duration', 'exit_code',
-            'exceptions', 'logs', 'queries', 'lazy_loads',
+            'exceptions', 'logs', 'queries',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
-            'files_read', 'files_written', 'cache_events',
-            'hydrated_models', 'peak_memory_usage', 'exception_preview', 'context',
+            'cache_events', 'peak_memory_usage', 'exception_preview', 'context',
         ];
 
         $rows = [];
@@ -694,10 +691,9 @@ final class RecordWriter
                 ($r['without_overlapping'] ?? false) ? 't' : 'f', ($r['on_one_server'] ?? false) ? 't' : 'f',
                 ($r['run_in_background'] ?? false) ? 't' : 'f', ($r['even_in_maintenance_mode'] ?? false) ? 't' : 'f',
                 $r['status'] ?? null, $r['duration'] ?? null, $r['exit_code'] ?? null,
-                $r['exceptions'] ?? 0, $r['logs'] ?? 0, $r['queries'] ?? 0, $r['lazy_loads'] ?? 0,
+                $r['exceptions'] ?? 0, $r['logs'] ?? 0, $r['queries'] ?? 0,
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
-                $r['files_read'] ?? 0, $r['files_written'] ?? 0, $r['cache_events'] ?? 0,
-                $r['hydrated_models'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
+                $r['cache_events'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
             ];
         }
@@ -834,10 +830,10 @@ final class RecordWriter
     /**
      * Check records against thresholds and upsert performance issues.
      *
-     * @param string          $type     Threshold type: 'route', 'job', 'command', 'scheduled_task', etc.
-     * @param array           $records  Raw records from the batch
-     * @param string|string[] $nameKeys Record field(s) containing the name, tried in order
-     * @param string          $groupKey Record field containing the group hash
+     * @param  string  $type  Threshold type: 'route', 'job', 'command', 'scheduled_task', etc.
+     * @param  array  $records  Raw records from the batch
+     * @param  string|string[]  $nameKeys  Record field(s) containing the name, tried in order
+     * @param  string  $groupKey  Record field containing the group hash
      */
     private function checkThresholds(string $type, array $records, string|array $nameKeys, string $groupKey = '_group'): void
     {

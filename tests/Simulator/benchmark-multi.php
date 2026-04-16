@@ -16,13 +16,14 @@
  *     -e POSTGRES_PASSWORD=test123 postgres:15-alpine
  */
 
-require_once __DIR__ . '/../../vendor/autoload.php';
+require_once __DIR__.'/../../vendor/autoload.php';
 
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
 use NightOwl\Agent\Redactor;
 use NightOwl\Agent\Sampler;
+use NightOwl\Tests\Integration\MigrationRunner;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 
 if (! function_exists('pcntl_fork')) {
@@ -34,7 +35,7 @@ $options = getopt('', ['token:', 'host:', 'port:', 'instances:', 'workers:', 'du
 
 $token = $options['token'] ?? null;
 if (! $token) {
-    fwrite(STDERR, <<<HELP
+    fwrite(STDERR, <<<'HELP'
 
     NightOwl Multi-Instance Benchmark
     ──────────────────────────────────
@@ -53,8 +54,8 @@ if (! $token) {
       --db-port     PostgreSQL port (default: 5433)
 
     Requires PostgreSQL running:
-      docker run -d --name nightowl-test-pg -p 5433:5432 \\
-        -e POSTGRES_DB=nightowl_test -e POSTGRES_USER=nightowl_test \\
+      docker run -d --name nightowl-test-pg -p 5433:5432 \
+        -e POSTGRES_DB=nightowl_test -e POSTGRES_USER=nightowl_test \
         -e POSTGRES_PASSWORD=test123 postgres:15-alpine
 
     HELP);
@@ -81,10 +82,7 @@ fwrite(STDOUT, "\nSetting up database...\n");
 try {
     $pdo = new PDO("pgsql:host={$dbHost};port={$dbPort};dbname={$dbName}", $dbUser, $dbPass);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    $sql = file_get_contents(__DIR__ . '/schema.sql');
-    if ($sql) {
-        $pdo->exec($sql);
-    }
+    MigrationRunner::migrate($dbHost, (int) $dbPort, $dbName, $dbUser, $dbPass);
     // Truncate all tables
     $tables = ['nightowl_issue_activity', 'nightowl_issue_comments', 'nightowl_issues',
         'nightowl_requests', 'nightowl_queries', 'nightowl_exceptions', 'nightowl_commands',
@@ -108,7 +106,7 @@ $agentPids = [];
 $tmpFiles = [];
 
 for ($i = 0; $i < $instances; $i++) {
-    $sqlitePath = sys_get_temp_dir() . "/nightowl-bench-inst-{$i}-" . getmypid() . '.sqlite';
+    $sqlitePath = sys_get_temp_dir()."/nightowl-bench-inst-{$i}-".getmypid().'.sqlite';
     $tmpFiles[] = $sqlitePath;
 
     $pid = pcntl_fork();
@@ -179,7 +177,7 @@ $payloadBuilders = [
         [$sim->makeRequest()],
         array_map(fn () => $sim->makeQuery(), range(1, 8)),
         array_map(fn () => $sim->makeCacheEvent(), range(1, 3)),
-        [$sim->makeOutgoingRequest(), $sim->makeMail(), $sim->makeUser('bench_' . mt_rand(1, 100))],
+        [$sim->makeOutgoingRequest(), $sim->makeMail(), $sim->makeUser('bench_'.mt_rand(1, 100))],
     ),
 ];
 
@@ -192,7 +190,8 @@ function buildWire(array $records, string $tokenHash): string
 {
     $json = json_encode($records, JSON_THROW_ON_ERROR);
     $body = "v1:{$tokenHash}:{$json}";
-    return strlen($body) . ':' . $body;
+
+    return strlen($body).':'.$body;
 }
 
 // ─── Run benchmark workers ─────────────────────────────────
@@ -206,7 +205,7 @@ fwrite(STDOUT, "Duration:   {$duration}s\n");
 fwrite(STDOUT, "Payload:    {$payloadType} ({$recordsPerPayload} records/payload)\n");
 fwrite(STDOUT, "\nRunning...\n\n");
 
-$resultsFile = sys_get_temp_dir() . '/nightowl-mbench-' . getmypid() . '.json';
+$resultsFile = sys_get_temp_dir().'/nightowl-mbench-'.getmypid().'.json';
 $startTime = microtime(true) + 0.5;
 $endTime = $startTime + $duration;
 
@@ -237,6 +236,7 @@ for ($w = 0; $w < $workers; $w++) {
             $sock = @stream_socket_client("tcp://{$host}:{$port}", $errno, $errstr, 1.0);
             if (! $sock) {
                 $failed++;
+
                 continue;
             }
 
@@ -255,7 +255,7 @@ for ($w = 0; $w < $workers; $w++) {
 
         $fp = fopen($resultsFile, 'a');
         flock($fp, LOCK_EX);
-        fwrite($fp, json_encode(['worker' => $w, 'sent' => $sent, 'failed' => $failed, 'bytes' => $bytes]) . "\n");
+        fwrite($fp, json_encode(['worker' => $w, 'sent' => $sent, 'failed' => $failed, 'bytes' => $bytes])."\n");
         flock($fp, LOCK_UN);
         fclose($fp);
         exit(0);
@@ -314,7 +314,7 @@ sleep(8);
 
 try {
     $pdo = new PDO("pgsql:host={$dbHost};port={$dbPort};dbname={$dbName}", $dbUser, $dbPass);
-    $total = (int) $pdo->query("SELECT COUNT(*) FROM nightowl_requests")->fetchColumn();
+    $total = (int) $pdo->query('SELECT COUNT(*) FROM nightowl_requests')->fetchColumn();
     fwrite(STDOUT, sprintf("  PostgreSQL:  %s requests drained\n\n", number_format($total)));
 } catch (Exception $e) {
     fwrite(STDOUT, "  (Could not query PostgreSQL: {$e->getMessage()})\n\n");

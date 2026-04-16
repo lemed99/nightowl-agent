@@ -4,8 +4,8 @@ namespace NightOwl\Tests\Integration;
 
 use NightOwl\Agent\ConnectionHandler;
 use NightOwl\Agent\PayloadParser;
-use NightOwl\Agent\Redactor;
 use NightOwl\Agent\RecordWriter;
+use NightOwl\Agent\Redactor;
 use NightOwl\Agent\Sampler;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 use PDO;
@@ -22,14 +22,21 @@ use PHPUnit\Framework\TestCase;
 class EndToEndTest extends TestCase
 {
     private static ?PDO $pdo = null;
+
     private static string $host;
+
     private static int $port;
+
     private static string $database;
+
     private static string $username;
+
     private static string $password;
 
     private string $token = 'e2e-test-token';
+
     private ConnectionHandler $handler;
+
     private NightwatchSimulator $sim;
 
     public static function setUpBeforeClass(): void
@@ -49,7 +56,7 @@ class EndToEndTest extends TestCase
         }
 
         if (self::$pdo) {
-            self::createTables();
+            MigrationRunner::migrate(self::$host, self::$port, self::$database, self::$username, self::$password);
         }
     }
 
@@ -91,7 +98,7 @@ class EndToEndTest extends TestCase
         $tokenHash = substr(hash('xxh128', $this->token), 0, 7);
         $body = "v1:{$tokenHash}:{$json}";
 
-        return strlen($body) . ':' . $body;
+        return strlen($body).':'.$body;
     }
 
     private static function rowCount(string $table, string $where = '1=1'): int
@@ -122,69 +129,9 @@ class EndToEndTest extends TestCase
         }
     }
 
-    private static function createTables(): void
-    {
-        // Same schema as RecordWriterTest — ensures EndToEndTest is self-contained
-        $sql = <<<'SQL'
-        CREATE TABLE IF NOT EXISTS nightowl_requests (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), user_id VARCHAR(255), method VARCHAR(255) NOT NULL DEFAULT 'GET', url TEXT NOT NULL DEFAULT '/', route_name VARCHAR(255), route_methods TEXT, route_domain VARCHAR(255), route_path VARCHAR(255), route_action VARCHAR(255), ip VARCHAR(255), duration INTEGER, status_code INTEGER NOT NULL DEFAULT 200, request_size INTEGER, response_size INTEGER, bootstrap INTEGER, before_middleware INTEGER, action INTEGER, render INTEGER, after_middleware INTEGER, sending INTEGER, terminating INTEGER, exceptions INTEGER DEFAULT 0, logs INTEGER DEFAULT 0, queries INTEGER DEFAULT 0, lazy_loads INTEGER DEFAULT 0, jobs_queued INTEGER DEFAULT 0, mail INTEGER DEFAULT 0, notifications INTEGER DEFAULT 0, outgoing_requests INTEGER DEFAULT 0, files_read INTEGER DEFAULT 0, files_written INTEGER DEFAULT 0, cache_events INTEGER DEFAULT 0, hydrated_models INTEGER DEFAULT 0, peak_memory_usage INTEGER, exception_preview TEXT, context TEXT, headers TEXT, payload TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_queries (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), sql_query TEXT NOT NULL DEFAULT '', file VARCHAR(255), line INTEGER, duration INTEGER, connection VARCHAR(255), connection_type VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_exceptions (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), class VARCHAR(255) NOT NULL DEFAULT 'Unknown', message TEXT, code VARCHAR(255), file VARCHAR(255), line INTEGER, trace TEXT, php_version VARCHAR(255), laravel_version VARCHAR(255), handled BOOLEAN DEFAULT false, fingerprint VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_commands (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), user_id VARCHAR(255), command VARCHAR(255) NOT NULL DEFAULT 'unknown', exit_code INTEGER, duration INTEGER, exceptions INTEGER DEFAULT 0, logs INTEGER DEFAULT 0, queries INTEGER DEFAULT 0, lazy_loads INTEGER DEFAULT 0, jobs_queued INTEGER DEFAULT 0, mail INTEGER DEFAULT 0, notifications INTEGER DEFAULT 0, outgoing_requests INTEGER DEFAULT 0, files_read INTEGER DEFAULT 0, files_written INTEGER DEFAULT 0, cache_events INTEGER DEFAULT 0, hydrated_models INTEGER DEFAULT 0, peak_memory_usage INTEGER, exception_preview TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_jobs (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), user_id VARCHAR(255), job_class VARCHAR(255) NOT NULL DEFAULT 'Unknown', queue VARCHAR(255), connection VARCHAR(255), status VARCHAR(255), duration INTEGER, attempts INTEGER DEFAULT 1, exceptions INTEGER DEFAULT 0, logs INTEGER DEFAULT 0, queries INTEGER DEFAULT 0, lazy_loads INTEGER DEFAULT 0, jobs_queued INTEGER DEFAULT 0, mail INTEGER DEFAULT 0, notifications INTEGER DEFAULT 0, outgoing_requests INTEGER DEFAULT 0, files_read INTEGER DEFAULT 0, files_written INTEGER DEFAULT 0, cache_events INTEGER DEFAULT 0, hydrated_models INTEGER DEFAULT 0, peak_memory_usage INTEGER, exception_preview TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_cache_events (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), event_type VARCHAR(255) NOT NULL DEFAULT 'unknown', key VARCHAR(255) NOT NULL DEFAULT '', store VARCHAR(255), ttl INTEGER, duration INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_mail (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), mailer VARCHAR(255), recipients TEXT, subject VARCHAR(255), mailable VARCHAR(255), duration INTEGER, queued BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_notifications (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), notification VARCHAR(255), channel VARCHAR(255), notifiable_type VARCHAR(255), notifiable_id VARCHAR(255), duration INTEGER, queued BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_outgoing_requests (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), method VARCHAR(255) NOT NULL DEFAULT 'GET', url TEXT NOT NULL DEFAULT '', status_code INTEGER, duration INTEGER, request_size INTEGER, response_size INTEGER, request_headers TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_scheduled_tasks (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), group_hash VARCHAR(255), user_id VARCHAR(255), command VARCHAR(255) NOT NULL DEFAULT 'unknown', expression VARCHAR(255), status VARCHAR(255), duration INTEGER, exit_code INTEGER, exceptions INTEGER DEFAULT 0, logs INTEGER DEFAULT 0, queries INTEGER DEFAULT 0, lazy_loads INTEGER DEFAULT 0, jobs_queued INTEGER DEFAULT 0, mail INTEGER DEFAULT 0, notifications INTEGER DEFAULT 0, outgoing_requests INTEGER DEFAULT 0, files_read INTEGER DEFAULT 0, files_written INTEGER DEFAULT 0, cache_events INTEGER DEFAULT 0, hydrated_models INTEGER DEFAULT 0, peak_memory_usage INTEGER, exception_preview TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_logs (
-            id BIGSERIAL PRIMARY KEY, trace_id VARCHAR(255) NOT NULL, timestamp VARCHAR(255), deploy VARCHAR(255), server VARCHAR(255), execution_source VARCHAR(255), execution_id VARCHAR(255), execution_stage VARCHAR(255), user_id VARCHAR(255), level VARCHAR(255) DEFAULT 'info', message TEXT, context TEXT, channel VARCHAR(255), created_at VARCHAR(255)
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_users (
-            user_id VARCHAR(255) PRIMARY KEY, name VARCHAR(255), email VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_issues (
-            id BIGSERIAL PRIMARY KEY, type VARCHAR(255) NOT NULL, status VARCHAR(255) DEFAULT 'open', priority VARCHAR(255), exception_class VARCHAR(255), exception_message TEXT, group_hash VARCHAR(255), first_seen_at TIMESTAMP, last_seen_at TIMESTAMP, occurrences_count INTEGER DEFAULT 0, users_count INTEGER DEFAULT 0, assigned_to VARCHAR(255), description TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE (group_hash, type)
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_issue_comments (
-            id BIGSERIAL PRIMARY KEY, issue_id BIGINT NOT NULL REFERENCES nightowl_issues(id) ON DELETE CASCADE, user_id BIGINT, user_name VARCHAR(255), user_email VARCHAR(255), body TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_issue_activity (
-            id BIGSERIAL PRIMARY KEY, issue_id BIGINT NOT NULL REFERENCES nightowl_issues(id) ON DELETE CASCADE, user_id BIGINT, user_name VARCHAR(255), action VARCHAR(50) NOT NULL, old_value VARCHAR(255), new_value VARCHAR(255), created_at TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_settings (
-            id BIGSERIAL PRIMARY KEY, key VARCHAR(255) NOT NULL UNIQUE, value TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS nightowl_alert_channels (
-            id BIGSERIAL PRIMARY KEY, type VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL, config TEXT NOT NULL DEFAULT '{}', enabled BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        SQL;
-
-        self::$pdo->exec($sql);
-    }
-
     // ─── Full request lifecycle ────────────────────────────
 
-    public function testRequestLifecycleE2E(): void
+    public function test_request_lifecycle_e2_e(): void
     {
         $traceId = 'e2e-req-001';
         $userId = 'user_e2e';
@@ -242,7 +189,7 @@ class EndToEndTest extends TestCase
 
     // ─── Error request → exception → issue ─────────────────
 
-    public function testErrorRequestCreatesIssueE2E(): void
+    public function test_error_request_creates_issue_e2_e(): void
     {
         $traceId = 'e2e-err-001';
 
@@ -272,7 +219,7 @@ class EndToEndTest extends TestCase
         $this->assertSame('App\\Exceptions\\PaymentFailed', $exception['class']);
 
         // Issue auto-created
-        $fingerprint = md5('App\\Exceptions\\PaymentFailed' . 'app/Services/Payment.php' . '42');
+        $fingerprint = md5('App\\Exceptions\\PaymentFailed'.'app/Services/Payment.php'.'42');
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fingerprint}'");
         $this->assertNotNull($issue);
         $this->assertSame('open', $issue['status']);
@@ -282,7 +229,7 @@ class EndToEndTest extends TestCase
 
     // ─── Duplicate exceptions increment issue count ────────
 
-    public function testDuplicateExceptionsIncrementIssueE2E(): void
+    public function test_duplicate_exceptions_increment_issue_e2_e(): void
     {
         $base = [
             'class' => 'App\\Exceptions\\DupE2E',
@@ -302,7 +249,7 @@ class EndToEndTest extends TestCase
             $this->assertSame('2:OK', $response);
         }
 
-        $fingerprint = md5('App\\Exceptions\\DupE2E' . 'app/Dup.php' . '10');
+        $fingerprint = md5('App\\Exceptions\\DupE2E'.'app/Dup.php'.'10');
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fingerprint}'");
 
         $this->assertSame(3, (int) $issue['occurrences_count']);
@@ -311,7 +258,7 @@ class EndToEndTest extends TestCase
 
     // ─── Job lifecycle ─────────────────────────────────────
 
-    public function testJobLifecycleE2E(): void
+    public function test_job_lifecycle_e2_e(): void
     {
         $traceId = 'e2e-job-001';
 
@@ -352,7 +299,7 @@ class EndToEndTest extends TestCase
 
     // ─── Failed job with exception ─────────────────────────
 
-    public function testFailedJobCreatesIssueE2E(): void
+    public function test_failed_job_creates_issue_e2_e(): void
     {
         $traceId = 'e2e-fail-001';
 
@@ -380,14 +327,14 @@ class EndToEndTest extends TestCase
         $job = self::fetch('nightowl_jobs', "trace_id = 'e2e-fail-001'");
         $this->assertSame('failed', $job['status']);
 
-        $fingerprint = md5('App\\Exceptions\\PaymentTimeout' . 'app/Jobs/ProcessPayment.php' . '88');
+        $fingerprint = md5('App\\Exceptions\\PaymentTimeout'.'app/Jobs/ProcessPayment.php'.'88');
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fingerprint}'");
         $this->assertNotNull($issue);
     }
 
     // ─── Command lifecycle ─────────────────────────────────
 
-    public function testCommandLifecycleE2E(): void
+    public function test_command_lifecycle_e2_e(): void
     {
         $records = [
             $this->sim->makeCommand([
@@ -414,7 +361,7 @@ class EndToEndTest extends TestCase
 
     // ─── Redaction works in pipeline ───────────────────────
 
-    public function testRedactionAppliedBeforeStorageE2E(): void
+    public function test_redaction_applied_before_storage_e2_e(): void
     {
         $records = [
             $this->sim->makeRequest([
@@ -437,7 +384,7 @@ class EndToEndTest extends TestCase
 
     // ─── All 12 types in single payload ────────────────────
 
-    public function testAll12TypesInSinglePayloadE2E(): void
+    public function test_all12_types_in_single_payload_e2_e(): void
     {
         $records = [
             $this->sim->makeRequest(['trace_id' => 'e2e-all-req']),
@@ -476,7 +423,7 @@ class EndToEndTest extends TestCase
 
     // ─── Throughput: batch of 50 requests ──────────────────
 
-    public function testBatchOf50RequestsE2E(): void
+    public function test_batch_of50_requests_e2_e(): void
     {
         $records = [];
         for ($i = 0; $i < 50; $i++) {
@@ -491,11 +438,11 @@ class EndToEndTest extends TestCase
 
     // ─── Token rejection doesn't write ─────────────────────
 
-    public function testInvalidTokenDoesNotWriteE2E(): void
+    public function test_invalid_token_does_not_write_e2_e(): void
     {
         $json = json_encode([$this->sim->makeRequest(['trace_id' => 'e2e-reject'])]);
         $body = "v1:INVALID:{$json}";
-        $wire = strlen($body) . ':' . $body;
+        $wire = strlen($body).':'.$body;
 
         $response = $this->handleWire($wire);
         $this->assertSame('5:ERROR', $response);
@@ -505,7 +452,7 @@ class EndToEndTest extends TestCase
 
     // ─── Gzip payload ──────────────────────────────────────
 
-    public function testGzipPayloadE2E(): void
+    public function test_gzip_payload_e2_e(): void
     {
         if (! function_exists('gzencode')) {
             $this->markTestSkipped('ext-zlib not available');
@@ -517,7 +464,7 @@ class EndToEndTest extends TestCase
 
         $tokenHash = substr(hash('xxh128', $this->token), 0, 7);
         $body = "v1:{$tokenHash}:{$compressed}";
-        $wire = strlen($body) . ':' . $body;
+        $wire = strlen($body).':'.$body;
 
         $response = $this->handleWire($wire);
         $this->assertSame('2:OK', $response);
@@ -527,7 +474,7 @@ class EndToEndTest extends TestCase
 
     // ─── Multiple payloads to same handler instance ────────
 
-    public function testMultiplePayloadsSequentialE2E(): void
+    public function test_multiple_payloads_sequential_e2_e(): void
     {
         for ($i = 0; $i < 5; $i++) {
             $records = [$this->sim->makeRequest(['trace_id' => "e2e-seq-{$i}"])];

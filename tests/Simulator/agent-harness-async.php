@@ -20,13 +20,14 @@
  *   php tests/Simulator/run.php --token=test-token --scenario=high-throughput --count=500
  */
 
-require_once __DIR__ . '/../../vendor/autoload.php';
+require_once __DIR__.'/../../vendor/autoload.php';
 
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
 use NightOwl\Agent\Redactor;
 use NightOwl\Agent\Sampler;
+use NightOwl\Tests\Integration\MigrationRunner;
 
 if (! function_exists('pcntl_fork') || ! function_exists('posix_kill')) {
     fwrite(STDERR, "Error: pcntl and posix extensions required for async driver.\n");
@@ -50,25 +51,23 @@ $dbName = $options['db-name'] ?? getenv('NIGHTOWL_TEST_DB_DATABASE') ?: 'nightow
 $dbUser = $options['db-user'] ?? getenv('NIGHTOWL_TEST_DB_USERNAME') ?: 'nightowl_test';
 $dbPass = $options['db-pass'] ?? getenv('NIGHTOWL_TEST_DB_PASSWORD') ?: 'test123';
 
-// Create tables
 fwrite(STDOUT, "Connecting to PostgreSQL {$dbHost}:{$dbPort}/{$dbName}...\n");
 
 try {
     $pdo = new PDO("pgsql:host={$dbHost};port={$dbPort};dbname={$dbName}", $dbUser, $dbPass);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    $sql = file_get_contents(__DIR__ . '/schema.sql');
-    if ($sql) {
-        $pdo->exec($sql);
-    }
-    fwrite(STDOUT, "Tables ready.\n");
 } catch (Exception $e) {
     fwrite(STDERR, "Failed to connect to PostgreSQL: {$e->getMessage()}\n");
     exit(1);
 }
 unset($pdo);
 
+// Apply the agent's migrations — single source of truth.
+MigrationRunner::migrate($dbHost, $dbPort, $dbName, $dbUser, $dbPass);
+fwrite(STDOUT, "Tables ready.\n");
+
 // SQLite buffer path
-$sqlitePath = sys_get_temp_dir() . '/nightowl-harness-' . getmypid() . '.sqlite';
+$sqlitePath = sys_get_temp_dir().'/nightowl-harness-'.getmypid().'.sqlite';
 
 $drainWorkers = (int) ($options['drain-workers'] ?? 1);
 $sampleRate = (float) ($options['sample-rate'] ?? 1.0);
@@ -120,7 +119,7 @@ fwrite(STDOUT, "\nPress Ctrl+C to stop.\n\n");
 $server->listen($host, $port);
 
 // Cleanup SQLite files
-foreach ([$sqlitePath, $sqlitePath . '-wal', $sqlitePath . '-shm', $sqlitePath . '.drain-metrics.json', $sqlitePath . '.drain-metrics.json.tmp'] as $f) {
+foreach ([$sqlitePath, $sqlitePath.'-wal', $sqlitePath.'-shm', $sqlitePath.'.drain-metrics.json', $sqlitePath.'.drain-metrics.json.tmp'] as $f) {
     if (file_exists($f)) {
         @unlink($f);
     }

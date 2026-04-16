@@ -2,6 +2,7 @@
 
 namespace NightOwl\Tests\System;
 
+use NightOwl\Tests\Integration\MigrationRunner;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
@@ -22,23 +23,33 @@ use PHPUnit\Framework\TestCase;
 class AgentScalingSystemTest extends TestCase
 {
     private const TOKEN = 'scaling-test-token-2025';
+
     private const AGENT_HOST = '127.0.0.1';
+
     private const AGENT_PORT = 2415;
 
     private const DRAIN_TIMEOUT = 20;
+
     private const STARTUP_TIMEOUT = 5;
 
     private static ?PDO $pdo = null;
+
     private static string $dbHost;
+
     private static int $dbPort;
+
     private static string $dbDatabase;
+
     private static string $dbUsername;
+
     private static string $dbPassword;
 
     /** @var resource|null */
     private static $agentProcess = null;
+
     /** @var resource[] */
     private static array $agentPipes = [];
+
     private static string $sqlitePath = '';
 
     private NightwatchSimulator $sim;
@@ -62,14 +73,16 @@ class AgentScalingSystemTest extends TestCase
             self::$pdo = new PDO($dsn, self::$dbUsername, self::$dbPassword);
             self::$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         } catch (\Exception $e) {
-            static::markTestSkipped('PostgreSQL not available: ' . $e->getMessage());
+            static::markTestSkipped('PostgreSQL not available: '.$e->getMessage());
         }
 
-        $schemaPath = __DIR__ . '/../Simulator/schema.sql';
-        $sql = file_get_contents($schemaPath);
-        if ($sql) {
-            self::$pdo->exec($sql);
-        }
+        MigrationRunner::migrate(
+            self::$dbHost,
+            (int) self::$dbPort,
+            self::$dbDatabase,
+            self::$dbUsername,
+            self::$dbPassword,
+        );
 
         self::startAgent();
     }
@@ -100,9 +113,9 @@ class AgentScalingSystemTest extends TestCase
 
     private static function startAgent(): void
     {
-        self::$sqlitePath = sys_get_temp_dir() . '/nightowl-scaling-test-' . getmypid() . '.sqlite';
+        self::$sqlitePath = sys_get_temp_dir().'/nightowl-scaling-test-'.getmypid().'.sqlite';
 
-        $harness = realpath(__DIR__ . '/../Simulator/agent-harness-async.php');
+        $harness = realpath(__DIR__.'/../Simulator/agent-harness-async.php');
         if (! $harness) {
             static::markTestSkipped('agent-harness-async.php not found.');
         }
@@ -142,7 +155,7 @@ class AgentScalingSystemTest extends TestCase
         $ready = false;
         while (microtime(true) < $deadline) {
             $sock = @stream_socket_client(
-                'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+                'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
                 $errno, $errstr, 0.5,
             );
             if ($sock) {
@@ -156,7 +169,7 @@ class AgentScalingSystemTest extends TestCase
         if (! $ready) {
             $output = stream_get_contents(self::$agentPipes[1]);
             self::stopAgent();
-            static::markTestSkipped("Agent did not start within " . self::STARTUP_TIMEOUT . "s. Output: {$output}");
+            static::markTestSkipped('Agent did not start within '.self::STARTUP_TIMEOUT."s. Output: {$output}");
         }
     }
 
@@ -195,12 +208,12 @@ class AgentScalingSystemTest extends TestCase
 
         foreach ([
             self::$sqlitePath,
-            self::$sqlitePath . '-wal',
-            self::$sqlitePath . '-shm',
-            self::$sqlitePath . '.drain-metrics-0.json',
-            self::$sqlitePath . '.drain-metrics-0.json.tmp',
-            self::$sqlitePath . '.drain-metrics-1.json',
-            self::$sqlitePath . '.drain-metrics-1.json.tmp',
+            self::$sqlitePath.'-wal',
+            self::$sqlitePath.'-shm',
+            self::$sqlitePath.'.drain-metrics-0.json',
+            self::$sqlitePath.'.drain-metrics-0.json.tmp',
+            self::$sqlitePath.'.drain-metrics-1.json',
+            self::$sqlitePath.'.drain-metrics-1.json.tmp',
         ] as $f) {
             if (file_exists($f)) {
                 @unlink($f);
@@ -249,10 +262,10 @@ class AgentScalingSystemTest extends TestCase
         $json = json_encode($records, JSON_THROW_ON_ERROR);
         $tokenHash = substr(hash('xxh128', self::TOKEN), 0, 7);
         $body = "v1:{$tokenHash}:{$json}";
-        $wire = strlen($body) . ':' . $body;
+        $wire = strlen($body).':'.$body;
 
         $sock = @stream_socket_client(
-            'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+            'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
             $errno, $errstr, 3.0,
         );
         if (! $sock) {
@@ -262,6 +275,7 @@ class AgentScalingSystemTest extends TestCase
         fwrite($sock, $wire);
         $response = fread($sock, 128);
         fclose($sock);
+
         return $response ?: false;
     }
 
@@ -269,9 +283,9 @@ class AgentScalingSystemTest extends TestCase
     //  MULTI-WORKER DRAIN TESTS (2 drain workers)
     // ═══════════════════════════════════════════════════════════
 
-    public function testMultiWorkerDrainProcessesAllRecords(): void
+    public function test_multi_worker_drain_processes_all_records(): void
     {
-        $tag = 'scale-mw-' . uniqid();
+        $tag = 'scale-mw-'.uniqid();
 
         // Send 40 requests — both drain workers should pick up work
         for ($i = 0; $i < 40; $i++) {
@@ -288,9 +302,9 @@ class AgentScalingSystemTest extends TestCase
         $this->assertSame(40, $count, 'All 40 requests should arrive via multi-worker drain');
     }
 
-    public function testMultiWorkerDrainNoDuplicates(): void
+    public function test_multi_worker_drain_no_duplicates(): void
     {
-        $tag = 'scale-nodup-' . uniqid();
+        $tag = 'scale-nodup-'.uniqid();
 
         // Send 30 requests that should be claimed by different workers
         for ($i = 0; $i < 30; $i++) {
@@ -312,9 +326,9 @@ class AgentScalingSystemTest extends TestCase
         $this->assertSame(30, $distinct, 'All trace_ids should be unique (no claiming overlap)');
     }
 
-    public function testMultiWorkerDrainMixedTypes(): void
+    public function test_multi_worker_drain_mixed_types(): void
     {
-        $tag = 'scale-mix-' . uniqid();
+        $tag = 'scale-mix-'.uniqid();
 
         // Mixed payload: requests, queries, jobs, exceptions — all should be
         // processed correctly regardless of which worker picks up the batch
@@ -347,7 +361,7 @@ class AgentScalingSystemTest extends TestCase
         $this->assertSame(5, self::rowCount('nightowl_exceptions', "trace_id LIKE '{$tag}-exc-%'"));
 
         // Issue upsert should work correctly even when two workers race
-        $fp = md5('App\\Exceptions\\MultiWorkerTest' . 'app/MultiWorker.php' . '1');
+        $fp = md5('App\\Exceptions\\MultiWorkerTest'.'app/MultiWorker.php'.'1');
         $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fp}'")->fetch(PDO::FETCH_ASSOC);
         $this->assertNotFalse($issue);
         $this->assertSame(5, (int) $issue['occurrences_count']);
@@ -357,7 +371,7 @@ class AgentScalingSystemTest extends TestCase
     //  BACK-PRESSURE TESTS (max_pending_rows=50, drain_interval=2000ms)
     // ═══════════════════════════════════════════════════════════
 
-    public function testBackPressureRejectsWhenBufferFull(): void
+    public function test_back_pressure_rejects_when_buffer_full(): void
     {
         // Back-pressure depends on the periodic 5s monitor check catching pending > max.
         // With fast drain workers, sequential sends can't outpace drain reliably.
@@ -366,7 +380,7 @@ class AgentScalingSystemTest extends TestCase
         // Strategy: open N sockets simultaneously, write to all, then read responses.
         // This floods the SQLite buffer before drain workers can process.
 
-        $tag = 'scale-bp-' . uniqid();
+        $tag = 'scale-bp-'.uniqid();
         $tokenHash = substr(hash('xxh128', self::TOKEN), 0, 7);
 
         $accepted = 0;
@@ -381,7 +395,7 @@ class AgentScalingSystemTest extends TestCase
             for ($i = 0; $i < $batchSize; $i++) {
                 $idx = ($wave * $batchSize) + $i;
                 $sock = @stream_socket_client(
-                    'tcp://' . self::AGENT_HOST . ':' . self::AGENT_PORT,
+                    'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
                     $errno, $errstr, 2.0,
                 );
                 if (! $sock) {
@@ -392,7 +406,7 @@ class AgentScalingSystemTest extends TestCase
                 $records = [$this->sim->makeRequest(['trace_id' => "{$tag}-{$idx}"])];
                 $json = json_encode($records);
                 $body = "v1:{$tokenHash}:{$json}";
-                $wire = strlen($body) . ':' . $body;
+                $wire = strlen($body).':'.$body;
                 fwrite($sock, $wire);
                 $sockets[] = $sock;
             }
@@ -448,9 +462,9 @@ class AgentScalingSystemTest extends TestCase
         $this->assertSame('2:OK', $response, 'Agent must survive back-pressure load');
     }
 
-    public function testBackPressureRecoveryAcceptsAfterDrain(): void
+    public function test_back_pressure_recovery_accepts_after_drain(): void
     {
-        $tag = 'scale-bprecov-' . uniqid();
+        $tag = 'scale-bprecov-'.uniqid();
 
         // Fill buffer to trigger back-pressure
         for ($i = 0; $i < 80; $i++) {
@@ -486,9 +500,9 @@ class AgentScalingSystemTest extends TestCase
     //  because this test kills the agent process — any test after it will skip.
     // ═══════════════════════════════════════════════════════════
 
-    public function testZzGracefulShutdownDrainsRemainingRows(): void
+    public function test_zz_graceful_shutdown_drains_remaining_rows(): void
     {
-        $tag = 'scale-shutdown-' . uniqid();
+        $tag = 'scale-shutdown-'.uniqid();
 
         // Send payloads
         for ($i = 0; $i < 10; $i++) {

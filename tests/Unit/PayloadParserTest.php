@@ -3,7 +3,6 @@
 namespace NightOwl\Tests\Unit;
 
 use NightOwl\Agent\PayloadParser;
-use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 class PayloadParserTest extends TestCase
@@ -15,12 +14,12 @@ class PayloadParserTest extends TestCase
         $this->parser = new PayloadParser(gzipEnabled: true);
     }
 
-    public function testParseValidJsonPayload(): void
+    public function test_parse_valid_json_payload(): void
     {
         $records = [['t' => 'request', 'url' => '/test']];
         $json = json_encode($records);
         $body = "v1:abc1234:{$json}";
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $result = $this->parser->parse($raw);
 
@@ -31,10 +30,10 @@ class PayloadParserTest extends TestCase
         $this->assertSame('abc1234', $result['tokenHash']);
     }
 
-    public function testParsePingPayload(): void
+    public function test_parse_ping_payload(): void
     {
         $body = 'v1:abc1234:PING';
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $result = $this->parser->parse($raw);
 
@@ -43,10 +42,10 @@ class PayloadParserTest extends TestCase
         $this->assertSame('PING', $result['payload']);
     }
 
-    public function testRejectsUnsupportedVersion(): void
+    public function test_rejects_unsupported_version(): void
     {
         $body = 'v2:abc1234:[]';
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $result = $this->parser->parse($raw);
 
@@ -55,47 +54,47 @@ class PayloadParserTest extends TestCase
         $this->assertStringContains('Unsupported', $result['error']);
     }
 
-    public function testReturnsNullForMissingFirstColon(): void
+    public function test_returns_null_for_missing_first_colon(): void
     {
         $this->assertNull($this->parser->parse('no-colon-here'));
     }
 
-    public function testReturnsNullForEmptyBody(): void
+    public function test_returns_null_for_empty_body(): void
     {
         $this->assertNull($this->parser->parse('0:'));
     }
 
-    public function testReturnsNullForMissingVersionColon(): void
+    public function test_returns_null_for_missing_version_colon(): void
     {
         $raw = '5:hello';
         $this->assertNull($this->parser->parse($raw));
     }
 
-    public function testReturnsNullForMissingTokenColon(): void
+    public function test_returns_null_for_missing_token_colon(): void
     {
         $body = 'v1:notokencolon';
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $this->assertNull($this->parser->parse($raw));
     }
 
-    public function testReturnsNullForInvalidJson(): void
+    public function test_returns_null_for_invalid_json(): void
     {
         $body = 'v1:abc1234:{not valid json}';
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $this->assertNull($this->parser->parse($raw));
     }
 
-    public function testReturnsNullForNonArrayJson(): void
+    public function test_returns_null_for_non_array_json(): void
     {
         $body = 'v1:abc1234:"just a string"';
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $this->assertNull($this->parser->parse($raw));
     }
 
-    public function testParsesGzipPayload(): void
+    public function test_parses_gzip_payload(): void
     {
         if (! function_exists('gzencode')) {
             $this->markTestSkipped('ext-zlib not available');
@@ -105,7 +104,7 @@ class PayloadParserTest extends TestCase
         $json = json_encode($records);
         $compressed = gzencode($json);
         $body = "v1:abc1234:{$compressed}";
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $result = $this->parser->parse($raw);
 
@@ -114,7 +113,7 @@ class PayloadParserTest extends TestCase
         $this->assertSame($records, $result['records']);
     }
 
-    public function testGzipDisabledTreatsCompressedAsRaw(): void
+    public function test_gzip_disabled_treats_compressed_as_raw(): void
     {
         if (! function_exists('gzencode')) {
             $this->markTestSkipped('ext-zlib not available');
@@ -124,30 +123,30 @@ class PayloadParserTest extends TestCase
         $records = [['t' => 'request']];
         $compressed = gzencode(json_encode($records));
         $body = "v1:abc1234:{$compressed}";
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         // With gzip disabled, compressed data won't decode as JSON
         $result = $parser->parse($raw);
         $this->assertNull($result);
     }
 
-    public function testCorruptGzipReturnsNull(): void
+    public function test_corrupt_gzip_returns_null(): void
     {
         // Magic bytes but corrupt body
-        $fakeGzip = "\x1f\x8b" . str_repeat("\x00", 10);
+        $fakeGzip = "\x1f\x8b".str_repeat("\x00", 10);
         $body = "v1:abc1234:{$fakeGzip}";
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $this->assertNull($this->parser->parse($raw));
     }
 
-    public function testSupportedVersionsReturnsArray(): void
+    public function test_supported_versions_returns_array(): void
     {
         $versions = PayloadParser::supportedVersions();
         $this->assertContains('v1', $versions);
     }
 
-    public function testMultipleRecordsInPayload(): void
+    public function test_multiple_records_in_payload(): void
     {
         $records = [
             ['t' => 'request', 'url' => '/a'],
@@ -156,7 +155,7 @@ class PayloadParserTest extends TestCase
         ];
         $json = json_encode($records);
         $body = "v1:tok1234:{$json}";
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $result = $this->parser->parse($raw);
 
@@ -167,10 +166,10 @@ class PayloadParserTest extends TestCase
         $this->assertSame('exception', $result['records'][2]['t']);
     }
 
-    public function testEmptyArrayPayload(): void
+    public function test_empty_array_payload(): void
     {
         $body = 'v1:abc1234:[]';
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $result = $this->parser->parse($raw);
 
@@ -179,12 +178,12 @@ class PayloadParserTest extends TestCase
         $this->assertSame([], $result['records']);
     }
 
-    public function testLengthPrefixTruncatesBody(): void
+    public function test_length_prefix_truncates_body(): void
     {
         // Length is 10 but body is longer — parser only reads 10 bytes
         $json = json_encode([['t' => 'request']]);
         $body = "v1:abc1234:{$json}";
-        $raw = '10:' . $body; // wrong length
+        $raw = '10:'.$body; // wrong length
 
         // With truncated body, parsing should fail gracefully
         $result = $this->parser->parse($raw);
@@ -195,7 +194,7 @@ class PayloadParserTest extends TestCase
 
     // --- Gzip bomb protection ---
 
-    public function testRejectsGzipBombExceedingDecompressionLimit(): void
+    public function test_rejects_gzip_bomb_exceeding_decompression_limit(): void
     {
         if (! function_exists('gzencode')) {
             $this->markTestSkipped('ext-zlib not available');
@@ -220,7 +219,7 @@ class PayloadParserTest extends TestCase
         // Test via the parse method - the 5MB decompressed payload is well within
         // the 200MB limit, so it should parse successfully
         $body = "v1:abc1234:{$compressed}";
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $result = $this->parser->parse($raw);
         // 5MB of zeros is not valid JSON, so it should return null (JSON parse failure)
@@ -233,7 +232,7 @@ class PayloadParserTest extends TestCase
         $this->assertSame(5 * 1024 * 1024, strlen($decoded));
     }
 
-    public function testSafeGzipDecodeRejectsCorruptData(): void
+    public function test_safe_gzip_decode_rejects_corrupt_data(): void
     {
         if (! function_exists('gzencode')) {
             $this->markTestSkipped('ext-zlib not available');
@@ -242,11 +241,11 @@ class PayloadParserTest extends TestCase
         $ref = new \ReflectionMethod($this->parser, 'safeGzipDecode');
 
         // Corrupt gzip magic bytes + garbage
-        $result = $ref->invoke($this->parser, "\x1f\x8b\x08\x00" . str_repeat("\xFF", 20));
+        $result = $ref->invoke($this->parser, "\x1f\x8b\x08\x00".str_repeat("\xFF", 20));
         $this->assertFalse($result);
     }
 
-    public function testSafeGzipDecodeHandlesValidSmallPayload(): void
+    public function test_safe_gzip_decode_handles_valid_small_payload(): void
     {
         if (! function_exists('gzencode')) {
             $this->markTestSkipped('ext-zlib not available');
@@ -261,7 +260,7 @@ class PayloadParserTest extends TestCase
         $this->assertSame($original, $result);
     }
 
-    public function testAcceptsNormalGzipPayloadWithinLimit(): void
+    public function test_accepts_normal_gzip_payload_within_limit(): void
     {
         if (! function_exists('gzencode')) {
             $this->markTestSkipped('ext-zlib not available');
@@ -276,7 +275,7 @@ class PayloadParserTest extends TestCase
         $compressed = gzencode($json);
 
         $body = "v1:abc1234:{$compressed}";
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $result = $this->parser->parse($raw);
 
@@ -285,14 +284,79 @@ class PayloadParserTest extends TestCase
         $this->assertCount(100, $result['records']);
     }
 
-    public function testRejectsCorruptGzipViaSafeDecoder(): void
+    public function test_rejects_corrupt_gzip_via_safe_decoder(): void
     {
         // Magic bytes present but truncated/corrupt body
-        $fakeGzip = "\x1f\x8b\x08\x00" . str_repeat("\xFF", 20);
+        $fakeGzip = "\x1f\x8b\x08\x00".str_repeat("\xFF", 20);
         $body = "v1:abc1234:{$fakeGzip}";
-        $raw = strlen($body) . ":{$body}";
+        $raw = strlen($body).":{$body}";
 
         $this->assertNull($this->parser->parse($raw));
+    }
+
+    // --- Debug raw-payload dump (Phase 0 upstream inspection) ---
+
+    public function test_debug_dump_writes_jsonl_on_decode(): void
+    {
+        $dumpPath = sys_get_temp_dir().'/nightowl-debug-'.bin2hex(random_bytes(8)).'.jsonl';
+        $parser = new PayloadParser(gzipEnabled: true, debugDumpPath: $dumpPath);
+
+        try {
+            $records = [
+                ['t' => 'request', 'url' => '/a'],
+                ['t' => 'query', 'sql' => 'SELECT 1'],
+                ['t' => 'query', 'sql' => 'SELECT 2'],
+            ];
+            $json = json_encode($records);
+            $body = "v1:tok1234:{$json}";
+            $raw = strlen($body).":{$body}";
+
+            $result = $parser->parse($raw);
+            $this->assertSame('json', $result['type']);
+
+            $this->assertFileExists($dumpPath);
+            $line = trim(file_get_contents($dumpPath));
+            $this->assertNotEmpty($line);
+
+            $entry = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
+            $this->assertSame('tok1234', $entry['tokenHash']);
+            $this->assertSame(3, $entry['recordCount']);
+            $this->assertSame(['request' => 1, 'query' => 2], $entry['recordTypes']);
+            $this->assertSame($records, $entry['records']);
+        } finally {
+            @unlink($dumpPath);
+        }
+    }
+
+    public function test_debug_dump_disabled_by_default(): void
+    {
+        $dumpPath = sys_get_temp_dir().'/nightowl-debug-disabled-'.bin2hex(random_bytes(8)).'.jsonl';
+        // No debugDumpPath — feature off
+        $parser = new PayloadParser(gzipEnabled: true);
+        $body = 'v1:tok1234:'.json_encode([['t' => 'request']]);
+        $raw = strlen($body).":{$body}";
+        $parser->parse($raw);
+        $this->assertFileDoesNotExist($dumpPath);
+    }
+
+    public function test_debug_dump_skips_ping_and_errors(): void
+    {
+        $dumpPath = sys_get_temp_dir().'/nightowl-debug-nopings-'.bin2hex(random_bytes(8)).'.jsonl';
+        $parser = new PayloadParser(gzipEnabled: true, debugDumpPath: $dumpPath);
+
+        try {
+            // PING should not dump
+            $pingBody = 'v1:tok1234:PING';
+            $parser->parse(strlen($pingBody).":{$pingBody}");
+
+            // Unsupported version should not dump
+            $errBody = 'v9:tok1234:[]';
+            $parser->parse(strlen($errBody).":{$errBody}");
+
+            $this->assertFileDoesNotExist($dumpPath);
+        } finally {
+            @unlink($dumpPath);
+        }
     }
 
     private function assertStringContains(string $needle, string $haystack): void

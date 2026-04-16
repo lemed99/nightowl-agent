@@ -66,6 +66,17 @@ return [
         // Gzip decompression for compressed payloads
         'gzip_enabled' => env('NIGHTOWL_GZIP_ENABLED', true),
 
+        // Debug: dump every decoded payload as JSONL for upstream record-type
+        // inspection. DO NOT enable in production — writes on every ingest.
+        // Used to answer "does laravel/nightwatch emit per-event records for
+        // lazy_load, hydrated_model, file_read, file_write?" — grep the dump
+        // after hitting a known scenario. Defaults to off.
+        'debug_raw_payloads' => (bool) env('NIGHTOWL_DEBUG_RAW_PAYLOADS', false),
+        'debug_raw_payloads_path' => env(
+            'NIGHTOWL_DEBUG_RAW_PAYLOADS_PATH',
+            storage_path('nightowl/raw-payloads.jsonl'),
+        ),
+
         // Health & status API
         'health_enabled' => env('NIGHTOWL_HEALTH_ENABLED', true),
         'health_port' => env('NIGHTOWL_HEALTH_PORT', 2409),
