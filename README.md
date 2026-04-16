@@ -133,6 +133,7 @@ All configuration is in `config/nightowl.php` after running the installer. Key e
 | `NIGHTOWL_REDACT_KEYS`                | —           | Comma-separated key names to redact (e.g. `password,token,authorization`)                  |
 | `NIGHTOWL_THRESHOLD_CACHE_TTL`        | `86400`     | Seconds to cache performance thresholds (restart agent to pick up changes immediately)     |
 | `NIGHTOWL_RETENTION_DAYS`             | `14`        | Days to keep monitoring data                                                               |
+| `NIGHTOWL_PARALLEL_WITH_NIGHTWATCH`   | `false`     | Fan telemetry out to both Nightwatch and NightOwl (see _Running Alongside Nightwatch_)     |
 
 ## Commands
 
@@ -210,120 +211,32 @@ NIGHTOWL_REDACT_ENABLED=true
 NIGHTOWL_REDACT_KEYS=password,token,authorization,cookie,secret
 ```
 
-## Running Alongside Nightwatch's Agent
+## Running Alongside Nightwatch
 
-Already using Nightwatch and not ready to fully switch? You can run both agents side by side — Nightwatch sends telemetry to both, so you can compare them in parallel before committing.
+By default, the NightOwl service provider redirects Nightwatch's collector entirely at the NightOwl agent — Laravel Cloud (or your local `nightwatch:agent`) receives nothing.
 
-### 1. Set NightOwl to a different port
-
-In your `.env`, set the NightOwl agent to a different port and provide both tokens:
+If you're migrating from Nightwatch and want to compare dashboards side by side, flip one flag and the provider will fan every record out to both destinations using the bundled `NightOwl\Support\MultiIngest`:
 
 ```env
+NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=true
+```
+
+With the flag on, `Laravel\Nightwatch\Core::$ingest` is wrapped so every `write`/`writeNow`/`ping`/`digest` call fans out to **both** Nightwatch's original destination (Laravel Cloud or a local `nightwatch:agent`) and the NightOwl agent. Failures on one side are swallowed so they can't take the other down.
+
+### Running two local agents on the same host
+
+If you're running `nightwatch:agent` locally (not shipping to Laravel Cloud), put the NightOwl agent on a different port so it doesn't collide with Nightwatch's 2407:
+
+```env
+NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=true
 NIGHTOWL_AGENT_PORT=2410
 NIGHTOWL_TOKEN=your-nightowl-token-from-dashboard
 NIGHTWATCH_TOKEN=your-nightwatch-token
 ```
 
-> `NIGHTWATCH_TOKEN` is used by the Nightwatch package to send telemetry. `NIGHTOWL_TOKEN` is the token from the NightOwl dashboard — the NightOwl agent uses it for payload authentication and health reporting.
+> `NIGHTWATCH_TOKEN` is used by the Nightwatch package to authenticate with Nightwatch's ingest. `NIGHTOWL_TOKEN` is the token from the NightOwl dashboard — the NightOwl agent uses it for payload authentication and health reporting. If `NIGHTOWL_TOKEN` is unset, the agent falls back to `NIGHTWATCH_TOKEN`.
 
-### 2. Create a MultiIngest wrapper
-
-Create `app/Support/MultiIngest.php`:
-
-```php
-<?php
-
-namespace App\Support;
-
-use Laravel\Nightwatch\Contracts\Ingest;
-
-final class MultiIngest implements Ingest
-{
-    /** @var Ingest[] */
-    private array $ingests;
-
-    public function __construct(Ingest ...$ingests)
-    {
-        $this->ingests = $ingests;
-    }
-
-    public function write(array $record): void
-    {
-        foreach ($this->ingests as $ingest) {
-            try { $ingest->write($record); } catch (\Throwable) {}
-        }
-    }
-
-    public function writeNow(array $record): void
-    {
-        foreach ($this->ingests as $ingest) {
-            try { $ingest->writeNow($record); } catch (\Throwable) {}
-        }
-    }
-
-    public function ping(): void
-    {
-        foreach ($this->ingests as $ingest) {
-            try { $ingest->ping(); } catch (\Throwable) {}
-        }
-    }
-
-    public function shouldDigest(bool $bool = true): void
-    {
-        foreach ($this->ingests as $ingest) { $ingest->shouldDigest($bool); }
-    }
-
-    public function shouldDigestWhenBufferIsFull(bool $bool = true): void
-    {
-        foreach ($this->ingests as $ingest) { $ingest->shouldDigestWhenBufferIsFull($bool); }
-    }
-
-    public function digest(): void
-    {
-        foreach ($this->ingests as $ingest) {
-            try { $ingest->digest(); } catch (\Throwable) {}
-        }
-    }
-
-    public function flush(): void
-    {
-        foreach ($this->ingests as $ingest) { $ingest->flush(); }
-    }
-}
-```
-
-### 3. Wire it up in AppServiceProvider
-
-In your `app/Providers/AppServiceProvider.php`, add to the `register` method:
-
-```php
-public function register(): void
-{
-    $this->app->booted(function () {
-        if (! $this->app->bound(\Laravel\Nightwatch\Core::class)) {
-            return;
-        }
-
-        $core = $this->app->make(\Laravel\Nightwatch\Core::class);
-        $nightowlPort = config('nightowl.agent.port', 2410);
-        $nightowlToken = config('nightowl.agent.token', config('nightwatch.token', ''));
-        $tokenHash = substr(hash('xxh128', $nightowlToken), 0, 7);
-
-        $nightowlIngest = new \Laravel\Nightwatch\Ingest(
-            transmitTo: "127.0.0.1:{$nightowlPort}",
-            connectionTimeout: 0.5,
-            timeout: 0.5,
-            streamFactory: new \Laravel\Nightwatch\SocketStreamFactory,
-            buffer: new \Laravel\Nightwatch\RecordsBuffer(length: 500),
-            tokenHash: $tokenHash,
-        );
-
-        $core->ingest = new \App\Support\MultiIngest($core->ingest, $nightowlIngest);
-    });
-}
-```
-
-### 4. Run both agents
+Then run both agents:
 
 ```bash
 # Terminal 1 — Nightwatch agent (default port 2407)
@@ -333,7 +246,7 @@ php artisan nightwatch:agent
 php artisan nightowl:agent
 ```
 
-Both agents receive identical telemetry. If one agent goes down, the other continues unaffected. When you're ready to switch fully to NightOwl, remove the `MultiIngest` wrapper and set `NIGHTOWL_AGENT_PORT=2407`.
+When you're ready to cut over fully, remove `NIGHTOWL_PARALLEL_WITH_NIGHTWATCH` (or set it to `false`) and point `NIGHTOWL_AGENT_PORT` back to 2407.
 
 ## How It Works
 

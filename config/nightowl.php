@@ -96,7 +96,6 @@ return [
     |
     */
     'parallel_with_nightwatch' => (bool) env('NIGHTOWL_PARALLEL_WITH_NIGHTWATCH', false),
-    'nightwatch_agent_port' => (int) env('NIGHTWATCH_AGENT_PORT', 2407),
 
     /*
     |--------------------------------------------------------------------------
