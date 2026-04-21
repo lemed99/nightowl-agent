@@ -8,7 +8,9 @@ use RuntimeException;
 final class SqliteBuffer
 {
     private PDO $pdo;
+
     private \PDOStatement $appendStmt;
+
     private string $path;
 
     public function __construct(string $path)
@@ -88,7 +90,7 @@ final class SqliteBuffer
         $json = json_encode($records, JSON_INVALID_UTF8_SUBSTITUTE);
 
         if ($json === false) {
-            throw new RuntimeException('Failed to JSON-encode payload: ' . json_last_error_msg());
+            throw new RuntimeException('Failed to JSON-encode payload: '.json_last_error_msg());
         }
 
         $this->appendStmt->execute([
@@ -131,18 +133,24 @@ final class SqliteBuffer
     {
         $claimValue = 100 + $workerId;
 
-        // Atomic claim: mark unclaimed rows for this worker
-        $this->pdo->exec(
-            "UPDATE buffer SET synced = {$claimValue} WHERE id IN ("
-            . "SELECT id FROM buffer WHERE synced = 0 ORDER BY id ASC LIMIT {$limit}"
-            . ')'
+        // Atomic claim: mark unclaimed rows for this worker.
+        // Values are internally-supplied ints but we bind them anyway — matches
+        // the codebase's prepared-statement pattern and defends against future
+        // callers that might pass user input.
+        $claimStmt = $this->pdo->prepare(
+            'UPDATE buffer SET synced = :claim WHERE id IN ('
+            .'SELECT id FROM buffer WHERE synced = 0 ORDER BY id ASC LIMIT :lim'
+            .')'
         );
+        $claimStmt->bindValue('claim', $claimValue, PDO::PARAM_INT);
+        $claimStmt->bindValue('lim', $limit, PDO::PARAM_INT);
+        $claimStmt->execute();
 
-        // Fetch claimed rows
         $stmt = $this->pdo->prepare(
             'SELECT id, payload, record_count FROM buffer WHERE synced = :claim ORDER BY id ASC'
         );
-        $stmt->execute(['claim' => $claimValue]);
+        $stmt->bindValue('claim', $claimValue, PDO::PARAM_INT);
+        $stmt->execute();
 
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
@@ -150,7 +158,7 @@ final class SqliteBuffer
     /**
      * Mark the given row IDs as synced (fully drained).
      *
-     * @param int[] $ids
+     * @param  int[]  $ids
      */
     public function markSynced(array $ids): void
     {
@@ -170,7 +178,9 @@ final class SqliteBuffer
     public function releaseClaimed(int $workerId): void
     {
         $claimValue = 100 + $workerId;
-        $this->pdo->exec("UPDATE buffer SET synced = 0 WHERE synced = {$claimValue}");
+        $stmt = $this->pdo->prepare('UPDATE buffer SET synced = 0 WHERE synced = :claim');
+        $stmt->bindValue('claim', $claimValue, PDO::PARAM_INT);
+        $stmt->execute();
     }
 
     /**
@@ -202,7 +212,7 @@ final class SqliteBuffer
      */
     public function walSize(): int
     {
-        $walPath = $this->path . '-wal';
+        $walPath = $this->path.'-wal';
         clearstatcache(true, $walPath);
 
         return file_exists($walPath) ? (int) filesize($walPath) : 0;

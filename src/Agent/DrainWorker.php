@@ -16,9 +16,13 @@ final class DrainWorker
 
     // Drain metrics for IPC with parent process
     private int $batchesDrained = 0;
+
     private int $batchesFailed = 0;
+
     private int $rowsDrained = 0;
+
     private float $pgLatencyEwma = 0.0; // EWMA in ms
+
     private const EWMA_ALPHA = 0.3;
 
     public function __construct(
@@ -71,7 +75,7 @@ final class DrainWorker
         $workerLabel = $this->totalWorkers > 1
             ? "Worker #{$this->workerId}"
             : 'Worker';
-        error_log("[NightOwl Drain] {$workerLabel} started (pid: " . getmypid() . ')');
+        error_log("[NightOwl Drain] {$workerLabel} started (pid: ".getmypid().')');
 
         $lastCleanup = time();
         $lastFlushTime = microtime(true);
@@ -155,15 +159,17 @@ final class DrainWorker
 
         $walSize = $buffer->walSize();
 
-        // Escalate to TRUNCATE when WAL exceeds 200MB — this blocks writers
-        // but resets the file to zero bytes, preventing unbounded growth
-        if ($walSize > 200 * 1024 * 1024) {
+        // Escalate to TRUNCATE when WAL exceeds 100MB — smaller, more frequent
+        // checkpoints (50-200ms each) beat one rare 200-500ms stall.
+        if ($walSize > 100 * 1024 * 1024) {
             $walMb = round($walSize / 1024 / 1024);
             error_log("[NightOwl Drain] WAL is {$walMb}MB, running TRUNCATE checkpoint to reset...");
 
             try {
+                $start = microtime(true);
                 $buffer->checkpointTruncate();
-                error_log('[NightOwl Drain] TRUNCATE checkpoint complete. WAL reset to zero.');
+                $elapsed = (int) round((microtime(true) - $start) * 1000);
+                error_log("[NightOwl Drain] TRUNCATE checkpoint complete in {$elapsed}ms. WAL reset to zero.");
             } catch (\Throwable $e) {
                 // TRUNCATE can fail if a reader/writer can't be interrupted within busy_timeout.
                 // Not fatal — PASSIVE already made partial progress. We'll try again next cycle.
@@ -191,7 +197,12 @@ final class DrainWorker
 
             foreach ($rows as $row) {
                 $ids[] = $row['id'];
-                $records = json_decode($row['payload'], true);
+                try {
+                    $records = json_decode($row['payload'], true, 512, JSON_THROW_ON_ERROR);
+                } catch (\JsonException) {
+                    // Row is corrupt — skip it rather than crash the drain worker.
+                    continue;
+                }
                 if (is_array($records)) {
                     array_push($allRecords, ...$records);
                 }
@@ -219,6 +230,7 @@ final class DrainWorker
         } catch (\Throwable $e) {
             $this->batchesFailed++;
             error_log("[NightOwl Drain] Error: {$e->getMessage()}");
+
             return false;
         }
     }
@@ -230,9 +242,9 @@ final class DrainWorker
     private function writeDrainMetrics(): void
     {
         $metricsPath = $this->totalWorkers > 1
-            ? $this->sqlitePath . ".drain-metrics-{$this->workerId}.json"
-            : $this->sqlitePath . '.drain-metrics.json';
-        $tmpPath = $metricsPath . '.tmp';
+            ? $this->sqlitePath.".drain-metrics-{$this->workerId}.json"
+            : $this->sqlitePath.'.drain-metrics.json';
+        $tmpPath = $metricsPath.'.tmp';
 
         $data = json_encode([
             'batches_drained' => $this->batchesDrained,

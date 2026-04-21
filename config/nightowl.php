@@ -57,10 +57,14 @@ return [
         // Time-based flush (max ms between drains during low traffic)
         'drain_max_wait_ms' => env('NIGHTOWL_DRAIN_MAX_WAIT_MS', 5000),
 
-        // PII redaction
-        'redact_enabled' => env('NIGHTOWL_REDACT_ENABLED', false),
+        // PII redaction — scrubs sensitive keys from payloads before they
+        // land in SQLite. Also redacts query-string parameters matching
+        // these names inside any `url`/`uri`/`endpoint`/`href` field.
+        // Enabled by default: if you have a legitimate reason to capture
+        // credentials in telemetry (unlikely), set NIGHTOWL_REDACT_ENABLED=false.
+        'redact_enabled' => env('NIGHTOWL_REDACT_ENABLED', true),
         'redact_keys' => array_filter(
-            explode(',', env('NIGHTOWL_REDACT_KEYS', 'password,token,authorization,cookie,secret'))
+            explode(',', env('NIGHTOWL_REDACT_KEYS', 'password,token,authorization,cookie,secret,api_key'))
         ),
 
         // Gzip decompression for compressed payloads

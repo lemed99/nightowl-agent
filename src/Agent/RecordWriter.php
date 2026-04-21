@@ -8,18 +8,10 @@ final class RecordWriter
 {
     private ?PDO $pdo = null;
 
-    private string $dsn;
-
-    private string $username;
-
-    private string $password;
-
     /** @var array<string, list<array{target?: string, duration_ms: int}>> Thresholds grouped by type */
     private array $thresholdCache = [];
 
     private float $thresholdCacheExpiry = 0;
-
-    private int $thresholdCacheTtl;
 
     /** Lightweight polling: detect settings changes without full reload */
     private float $thresholdVersionCheckAt = 0;
@@ -28,21 +20,27 @@ final class RecordWriter
 
     private AlertNotifier $notifier;
 
-    private string $appName;
-
-    public function __construct(string $host, int $port, string $database, string $username, string $password, int $thresholdCacheTtl = 86400, ?AlertNotifier $notifier = null, string $appName = 'NightOwl')
-    {
-        $this->dsn = "pgsql:host={$host};port={$port};dbname={$database}";
-        $this->username = $username;
-        $this->password = $password;
-        $this->thresholdCacheTtl = $thresholdCacheTtl;
+    public function __construct(
+        private string $host,
+        private int $port,
+        private string $database,
+        private string $username,
+        private string $password,
+        private int $thresholdCacheTtl = 86400,
+        ?AlertNotifier $notifier = null,
+        private string $appName = 'NightOwl',
+        private string $environment = 'production',
+    ) {
         $this->notifier = $notifier ?? new AlertNotifier;
-        $this->appName = $appName;
     }
 
     private function connect(): void
     {
-        $this->pdo = new PDO($this->dsn, $this->username, $this->password);
+        $this->pdo = new PDO(
+            "pgsql:host={$this->host};port={$this->port};dbname={$this->database}",
+            $this->username,
+            $this->password,
+        );
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
         // Disable synchronous commit — don't wait for WAL flush on each transaction.
@@ -75,6 +73,10 @@ final class RecordWriter
             (int) config('nightowl.threshold_cache_ttl', 86400),
             AlertNotifier::fromConfig(),
             config('app.name', 'NightOwl'),
+            // NIGHTOWL_ENVIRONMENT overrides APP_ENV for rare cases where the
+            // agent runs outside the Laravel app (standalone harness) or
+            // customers want an explicit label like "prod-us-east".
+            env('NIGHTOWL_ENVIRONMENT', config('app.env', 'production')),
         );
     }
 
@@ -207,12 +209,14 @@ final class RecordWriter
                 if ($value === null) {
                     $escaped[] = '\\N';
                 } else {
-                    // Escape tab, newline, carriage return, and backslash for TSV format
-                    $escaped[] = str_replace(
-                        ['\\', "\t", "\n", "\r"],
-                        ['\\\\', '\\t', '\\n', '\\r'],
-                        (string) $value,
-                    );
+                    // strtr single-pass substitution — marginally faster than
+                    // str_replace with parallel arrays for the same result.
+                    $escaped[] = strtr((string) $value, [
+                        '\\' => '\\\\',
+                        "\t" => '\\t',
+                        "\n" => '\\n',
+                        "\r" => '\\r',
+                    ]);
                 }
             }
             $tsvRows[] = implode("\t", $escaped);
@@ -228,7 +232,7 @@ final class RecordWriter
     private function writeRequests(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'user_id', 'method', 'url', 'route_name', 'route_methods',
             'route_domain', 'route_path', 'route_action', 'ip',
             'duration', 'status_code', 'request_size', 'response_size',
@@ -247,6 +251,7 @@ final class RecordWriter
                 $r['trace_id'] ?? null,
                 $r['timestamp'] ?? null,
                 $r['deploy'] ?? null,
+                $this->environment,
                 $r['server'] ?? null,
                 $r['_group'] ?? null,
                 $r['user'] ?? null,
@@ -293,7 +298,7 @@ final class RecordWriter
     private function writeQueries(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'sql_query', 'file', 'line', 'duration', 'connection', 'connection_type',
         ];
@@ -305,6 +310,7 @@ final class RecordWriter
                 $r['trace_id'] ?? null,
                 $r['timestamp'] ?? null,
                 $r['deploy'] ?? null,
+                $this->environment,
                 $r['server'] ?? null,
                 $r['_group'] ?? null,
                 $r['execution_source'] ?? null,
@@ -329,12 +335,12 @@ final class RecordWriter
     private function writeExceptions(array $records): void
     {
         $stmt = $this->pdo()->prepare('INSERT INTO nightowl_exceptions (
-            v, trace_id, timestamp, deploy, server, group_hash,
+            v, trace_id, timestamp, deploy, environment, server, group_hash,
             execution_source, execution_id, execution_stage, execution_preview, user_id,
             class, message, code, file, line, trace,
             php_version, laravel_version, handled, fingerprint
         ) VALUES (
-            :v, :trace_id, :timestamp, :deploy, :server, :group_hash,
+            :v, :trace_id, :timestamp, :deploy, :environment, :server, :group_hash,
             :execution_source, :execution_id, :execution_stage, :execution_preview, :user_id,
             :class, :message, :code, :file, :line, :trace,
             :php_version, :laravel_version, :handled, :fingerprint
@@ -345,13 +351,14 @@ final class RecordWriter
         foreach ($records as $r) {
             $fingerprint = md5(($r['class'] ?? '').($r['file'] ?? '').($r['line'] ?? ''));
             $deploy = $r['deploy'] ?? null;
-            $groupKey = $fingerprint.'|'.($deploy ?? '');
+            $groupKey = $fingerprint.'|'.$this->environment;
 
             $stmt->execute([
                 'v' => $r['v'] ?? null,
                 'trace_id' => $r['trace_id'] ?? null,
                 'timestamp' => $r['timestamp'] ?? null,
                 'deploy' => $deploy,
+                'environment' => $this->environment,
                 'server' => $r['server'] ?? null,
                 'group_hash' => $r['_group'] ?? null,
                 'execution_source' => $r['execution_source'] ?? null,
@@ -375,6 +382,7 @@ final class RecordWriter
                 $issueGroups[$groupKey] = [
                     'fingerprint' => $fingerprint,
                     'deploy' => $deploy,
+                    'environment' => $this->environment,
                     'class' => $r['class'] ?? 'Unknown',
                     'message' => $r['message'] ?? null,
                     'count' => 0,
@@ -403,22 +411,22 @@ final class RecordWriter
         // (which inflates the count when the same user appears across batches).
         $upsertStmt = $this->pdo()->prepare('
             INSERT INTO nightowl_issues (
-                type, deploy, status, exception_class, exception_message, group_hash,
+                type, deploy, environment, status, exception_class, exception_message, group_hash,
                 first_seen_at, last_seen_at, occurrences_count, users_count,
                 created_at, updated_at
             ) VALUES (
-                :type, :deploy, :status, :exception_class, :exception_message, :group_hash,
+                :type, :deploy, :environment, :status, :exception_class, :exception_message, :group_hash,
                 :first_seen_at, :last_seen_at, :occurrences_count, :users_count,
                 :created_at, :updated_at
             )
-            ON CONFLICT (group_hash, type, deploy) DO UPDATE SET
+            ON CONFLICT (group_hash, type, environment) DO UPDATE SET
                 exception_message = EXCLUDED.exception_message,
                 last_seen_at = GREATEST(nightowl_issues.last_seen_at, EXCLUDED.last_seen_at),
                 occurrences_count = nightowl_issues.occurrences_count + EXCLUDED.occurrences_count,
                 users_count = (
                     SELECT COUNT(DISTINCT user_id) FROM nightowl_exceptions
                     WHERE fingerprint = EXCLUDED.group_hash
-                      AND deploy IS NOT DISTINCT FROM EXCLUDED.deploy
+                      AND environment IS NOT DISTINCT FROM EXCLUDED.environment
                       AND user_id IS NOT NULL
                 ),
                 updated_at = EXCLUDED.updated_at
@@ -436,6 +444,7 @@ final class RecordWriter
             $upsertStmt->execute([
                 'type' => 'exception',
                 'deploy' => $group['deploy'] ?? null,
+                'environment' => $group['environment'] ?? $this->environment,
                 'status' => 'open',
                 'exception_class' => $group['class'],
                 'exception_message' => $group['message'],
@@ -453,7 +462,7 @@ final class RecordWriter
     private function writeCommands(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'user_id', 'class', 'name', 'command', 'exit_code', 'duration',
             'bootstrap', 'action', 'terminating',
             'exceptions', 'logs', 'queries',
@@ -465,7 +474,7 @@ final class RecordWriter
         foreach ($records as $r) {
             $rows[] = [
                 $r['v'] ?? null,
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment,
                 $r['server'] ?? null, $r['_group'] ?? null, $r['user'] ?? null,
                 $r['class'] ?? null, $r['name'] ?? null, $r['command'] ?? 'unknown', $r['exit_code'] ?? null, $r['duration'] ?? null,
                 $r['bootstrap'] ?? null, $r['action'] ?? null, $r['terminating'] ?? null,
@@ -484,7 +493,7 @@ final class RecordWriter
     private function writeJobs(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'job_id', 'attempt_id', 'attempt',
             'job_class', 'queue', 'connection', 'status', 'duration', 'attempts',
@@ -497,7 +506,7 @@ final class RecordWriter
         foreach ($records as $r) {
             $rows[] = [
                 $r['v'] ?? null,
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment,
                 $r['server'] ?? null, $r['_group'] ?? null, $r['execution_source'] ?? null,
                 $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['job_id'] ?? null, $r['attempt_id'] ?? null, $r['attempt'] ?? null,
@@ -518,7 +527,7 @@ final class RecordWriter
     private function writeCacheEvents(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'event_type', 'key', 'store', 'ttl', 'duration',
         ];
@@ -527,7 +536,7 @@ final class RecordWriter
         foreach ($records as $r) {
             $rows[] = [
                 $r['v'] ?? null,
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null, $r['_group'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment, $r['server'] ?? null, $r['_group'] ?? null,
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['type'] ?? 'unknown', $r['key'] ?? '', $r['store'] ?? null, $r['ttl'] ?? null, $r['duration'] ?? null,
             ];
@@ -541,7 +550,7 @@ final class RecordWriter
     private function writeMail(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'mailer', 'recipients', 'cc', 'bcc', 'attachments', 'subject', 'mailable', 'duration', 'failed', 'queued',
         ];
@@ -550,7 +559,7 @@ final class RecordWriter
         foreach ($records as $r) {
             $rows[] = [
                 $r['v'] ?? null,
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null, $r['_group'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment, $r['server'] ?? null, $r['_group'] ?? null,
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['mailer'] ?? null, is_array($r['to'] ?? null) ? json_encode($r['to']) : ($r['to'] ?? null),
                 $r['cc'] ?? 0, $r['bcc'] ?? 0, $r['attachments'] ?? 0,
@@ -567,7 +576,7 @@ final class RecordWriter
     private function writeNotifications(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'notification', 'channel', 'notifiable_type', 'notifiable_id', 'duration', 'failed', 'queued',
         ];
@@ -576,7 +585,7 @@ final class RecordWriter
         foreach ($records as $r) {
             $rows[] = [
                 $r['v'] ?? null,
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null, $r['_group'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment, $r['server'] ?? null, $r['_group'] ?? null,
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['class'] ?? $r['notification'] ?? null, $r['channel'] ?? null, $r['notifiable_type'] ?? null, $r['notifiable_id'] ?? null,
                 $r['duration'] ?? null, ($r['failed'] ?? false) ? 't' : 'f', ($r['queued'] ?? false) ? 't' : 'f',
@@ -591,7 +600,7 @@ final class RecordWriter
     private function writeOutgoingRequests(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'host', 'method', 'url', 'status_code', 'duration',
             'request_size', 'response_size', 'request_headers',
@@ -601,7 +610,7 @@ final class RecordWriter
         foreach ($records as $r) {
             $rows[] = [
                 $r['v'] ?? null,
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null, $r['_group'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment, $r['server'] ?? null, $r['_group'] ?? null,
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['host'] ?? null, $r['method'] ?? 'GET', $r['url'] ?? '', $r['status_code'] ?? null, $r['duration'] ?? null,
                 $r['request_size'] ?? null, $r['response_size'] ?? null, $r['request_headers'] ?? null,
@@ -616,7 +625,7 @@ final class RecordWriter
     private function writeLogs(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'level', 'message', 'context', 'extra', 'channel', 'created_at',
         ];
@@ -625,7 +634,7 @@ final class RecordWriter
         foreach ($records as $r) {
             $rows[] = [
                 $r['v'] ?? null,
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $r['server'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment, $r['server'] ?? null,
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['level'] ?? 'info', $r['message'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
@@ -671,7 +680,7 @@ final class RecordWriter
     private function writeScheduledTasks(array $records): void
     {
         $columns = [
-            'v', 'trace_id', 'timestamp', 'deploy', 'server', 'group_hash',
+            'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'user_id', 'command', 'expression',
             'timezone', 'repeat_seconds', 'without_overlapping', 'on_one_server', 'run_in_background', 'even_in_maintenance_mode',
             'status', 'duration', 'exit_code',
@@ -684,7 +693,7 @@ final class RecordWriter
         foreach ($records as $r) {
             $rows[] = [
                 $r['v'] ?? null,
-                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null,
+                $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment,
                 $r['server'] ?? null, $r['_group'] ?? null, $r['user'] ?? null,
                 $r['name'] ?? $r['command'] ?? 'unknown', $r['cron'] ?? $r['expression'] ?? null,
                 $r['timezone'] ?? null, $r['repeat_seconds'] ?? 0,
@@ -719,7 +728,14 @@ final class RecordWriter
         foreach ($records as &$r) {
             $methods = $r['route_methods'] ?? [];
             if (is_string($methods)) {
-                $methods = json_decode($methods, true) ?? [];
+                try {
+                    $methods = json_decode($methods, true, 8, JSON_THROW_ON_ERROR);
+                } catch (\JsonException) {
+                    $methods = [];
+                }
+                if (! is_array($methods)) {
+                    $methods = [];
+                }
             }
             $prefix = ! empty($methods) ? implode('|', $methods).' ' : '';
             $r['_route_composite'] = $prefix.($r['route_path'] ?? '');
@@ -779,7 +795,11 @@ final class RecordWriter
                 return $this->thresholdCache;
             }
 
-            $items = json_decode($row['value'], true);
+            try {
+                $items = json_decode((string) $row['value'], true, 16, JSON_THROW_ON_ERROR);
+            } catch (\JsonException) {
+                return $this->thresholdCache;
+            }
             if (! is_array($items)) {
                 return $this->thresholdCache;
             }
@@ -869,12 +889,13 @@ final class RecordWriter
                 continue;
             }
             $deploy = $r['deploy'] ?? null;
-            $compositeKey = $groupHash.'|'.($deploy ?? '');
+            $compositeKey = $groupHash.'|'.$this->environment;
 
             if (! isset($issueGroups[$compositeKey])) {
                 $issueGroups[$compositeKey] = [
                     'fingerprint' => $groupHash,
                     'deploy' => $deploy,
+                    'environment' => $this->environment,
                     'name' => $name ?? 'Unknown',
                     'subtype' => $type,
                     'count' => 0,
@@ -917,17 +938,17 @@ final class RecordWriter
         // GREATEST to prevent unbounded inflation while keeping the high-water mark.
         $upsertStmt = $this->pdo()->prepare('
             INSERT INTO nightowl_issues (
-                type, deploy, subtype, status, exception_class, exception_message, group_hash,
+                type, deploy, environment, subtype, status, exception_class, exception_message, group_hash,
                 first_seen_at, last_seen_at, occurrences_count, users_count,
                 threshold_ms, triggered_duration_ms,
                 created_at, updated_at
             ) VALUES (
-                :type, :deploy, :subtype, :status, :exception_class, :exception_message, :group_hash,
+                :type, :deploy, :environment, :subtype, :status, :exception_class, :exception_message, :group_hash,
                 :first_seen_at, :last_seen_at, :occurrences_count, :users_count,
                 :threshold_ms, :triggered_duration_ms,
                 :created_at, :updated_at
             )
-            ON CONFLICT (group_hash, type, deploy) DO UPDATE SET
+            ON CONFLICT (group_hash, type, environment) DO UPDATE SET
                 subtype = COALESCE(EXCLUDED.subtype, nightowl_issues.subtype),
                 last_seen_at = GREATEST(nightowl_issues.last_seen_at, EXCLUDED.last_seen_at),
                 occurrences_count = nightowl_issues.occurrences_count + EXCLUDED.occurrences_count,
@@ -957,6 +978,7 @@ final class RecordWriter
             $upsertStmt->execute([
                 'type' => 'performance',
                 'deploy' => $group['deploy'] ?? null,
+                'environment' => $group['environment'] ?? $this->environment,
                 'subtype' => $group['subtype'] ?? null,
                 'status' => 'open',
                 'exception_class' => $group['name'],

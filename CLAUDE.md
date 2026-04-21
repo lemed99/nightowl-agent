@@ -124,6 +124,10 @@ src/Commands/
 - Error logging: `error_log("[NightOwl Agent] ...")` with component tags
 - Thresholds polled every 30s (live config changes without restart)
 - Threshold checks extend beyond requests → queries, cache, mail, notifications, outgoing_requests
+- Raw HTTP dispatchers (AlertNotifier, HealthAlertNotifier `httpPost`) reject non-http(s) schemes before `file_get_contents` — PHP's URL wrappers otherwise allow `file://`/`phar://` etc.
+- SMTP header builders must pass user-controllable fields (from/to/subject) through `sanitizeHeader()` to strip CR/LF (email-header injection).
+- `json_decode` in drain/runtime paths uses `(..., true, N, JSON_THROW_ON_ERROR)` — never no-args decode. Depth N: 512 for payload re-parse, 32 for channel config, 16 for metrics/thresholds.
+- Redactor enabled by default; scrubs keys + URL query-string params under url/uri/endpoint/href fields.
 
 ## Performance
 - **Ingest**: 13,400 payloads/s single instance (ReactPHP + SQLite WAL)
@@ -163,6 +167,7 @@ docker run -d --name nightowl-test-pg -p 5433:5432 \
 
 ## Configuration
 ```
+NIGHTOWL_ENVIRONMENT=                    # Override APP_ENV for the environment column (rare: standalone harness or custom labels)
 NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=false  # Run alongside Nightwatch (fan-out via MultiIngest)
 NIGHTOWL_DRAIN_BATCH_SIZE=5000           # Rows per COPY batch
 NIGHTOWL_DRAIN_WORKERS=1                 # Parallel drain workers
@@ -171,6 +176,12 @@ NIGHTOWL_SAMPLE_RATE=1.0                 # 1.0 = keep all (exceptions always kep
 NIGHTOWL_MAX_PENDING_ROWS=100000         # Back-pressure threshold
 NIGHTOWL_MAX_BUFFER_MEMORY=268435456     # 256MB RSS limit
 ```
+
+### `environment` vs `deploy` columns
+
+Every telemetry row carries both:
+- **`environment`** — where the app is running (`production`, `staging`, `local`). Read from `APP_ENV` (or `NIGHTOWL_ENVIRONMENT` override) by the agent at boot, stamped on every row. Drives the env filter in the dashboard and the issue dedup key `(group_hash, type, environment)` — staging noise can't mute production alerts.
+- **`deploy`** — release/commit identifier, populated by the Nightwatch SDK from `NIGHTWATCH_DEPLOY` / `LARAVEL_CLOUD_DEPLOY_UUID` / `FORGE_DEPLOY_COMMIT` / `VAPOR_COMMIT_HASH`. Used for release tracking (seeing the same fingerprint reappear after a deploy).
 
 ## composer.json
 - **Package**: `nightowl/agent`, PHP `^8.2`

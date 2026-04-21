@@ -37,7 +37,7 @@ final class HealthReporter
     public function start(LoopInterface $loop, AsyncServer $agent): void
     {
         $browser = new Browser();
-        $url = rtrim($this->dashboardUrl, '/') . '/api/agent/health';
+        $url = rtrim($this->dashboardUrl, '/') . '/agent/health';
         $instanceId = gethostname() . ':' . getmypid();
 
         $scheduleNext = function () use (&$scheduleNext, $browser, $url, $instanceId, $agent, $loop) {

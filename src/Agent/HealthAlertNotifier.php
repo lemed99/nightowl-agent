@@ -19,13 +19,16 @@ final class HealthAlertNotifier
 
     /** @var array<int, array{type: string, name: string, config: array}> */
     private array $channelCache = [];
+
     private float $channelCacheExpiry = 0;
 
     /** Lightweight polling: detect channel changes without full reload */
     private float $channelVersionCheckAt = 0;
+
     private ?string $channelFingerprint = null;
 
     private const CHANNEL_CACHE_TTL = 3600;
+
     private const MAX_DISPATCH_SECONDS = 5.0;
 
     public function __construct(
@@ -54,7 +57,7 @@ final class HealthAlertNotifier
     /**
      * Dispatch alerts for newly active diagnoses.
      *
-     * @param array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}> $diagnoses
+     * @param  array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}>  $diagnoses
      */
     public function dispatch(array $diagnoses): void
     {
@@ -64,7 +67,7 @@ final class HealthAlertNotifier
     /**
      * Dispatch recovery notifications for resolved diagnoses.
      *
-     * @param array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}> $diagnoses
+     * @param  array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}>  $diagnoses
      */
     public function dispatchRecovered(array $diagnoses): void
     {
@@ -160,7 +163,7 @@ final class HealthAlertNotifier
         $this->channelVersionCheckAt = $now + 30;
 
         $rows = $this->pdo()->query(
-            "SELECT type, name, config, updated_at FROM nightowl_alert_channels WHERE enabled = true"
+            'SELECT type, name, config, updated_at FROM nightowl_alert_channels WHERE enabled = true'
         )->fetchAll(PDO::FETCH_ASSOC);
 
         $maxUpdatedAt = '';
@@ -168,13 +171,18 @@ final class HealthAlertNotifier
             if (($row['updated_at'] ?? '') > $maxUpdatedAt) {
                 $maxUpdatedAt = $row['updated_at'];
             }
+            try {
+                $config = json_decode((string) $row['config'], true, 32, JSON_THROW_ON_ERROR);
+            } catch (\JsonException) {
+                continue;
+            }
             $this->channelCache[] = [
                 'type' => $row['type'],
                 'name' => $row['name'],
-                'config' => json_decode($row['config'], true) ?? [],
+                'config' => is_array($config) ? $config : [],
             ];
         }
-        $this->channelFingerprint = count($rows) . ':' . $maxUpdatedAt;
+        $this->channelFingerprint = count($rows).':'.$maxUpdatedAt;
 
         return $this->channelCache;
     }
@@ -277,22 +285,25 @@ final class HealthAlertNotifier
         $username = $config['username'] ?? '';
         $password = $config['password'] ?? '';
         $encryption = $config['encryption'] ?? 'tls';
-        $fromAddress = $config['from_address'] ?? '';
-        $fromName = str_replace(["\r", "\n"], '', $config['from_name'] ?? 'NightOwl');
-        $toAddresses = $config['to_addresses'] ?? [];
+        $fromAddress = self::sanitizeHeader((string) ($config['from_address'] ?? ''));
+        $fromName = self::sanitizeHeader((string) ($config['from_name'] ?? 'NightOwl'));
+        $toAddresses = array_map(
+            fn ($a) => self::sanitizeHeader((string) $a),
+            (array) ($config['to_addresses'] ?? []),
+        );
 
         if ($host === '' || $fromAddress === '' || empty($toAddresses)) {
             return;
         }
 
         if ($variant === 'recovered') {
-            $subject = str_replace(["\r", "\n"], '', "[{$this->appName}] Recovered: {$d['code']}");
+            $subject = self::sanitizeHeader("[{$this->appName}] Recovered: {$d['code']}");
             $body = "Agent Health Recovered — {$this->appName}{$this->instanceLabel()}\n\n";
             $body .= "{$d['code']} — {$d['message']} (resolved)\n";
         } else {
-            $subject = str_replace(["\r", "\n"], '', "[{$this->appName}] Agent Health: {$d['code']}");
+            $subject = self::sanitizeHeader("[{$this->appName}] Agent Health: {$d['code']}");
             $body = "Agent Health Alert — {$this->appName}{$this->instanceLabel()}\n\n";
-            $body .= strtoupper($d['level']) . ": {$d['code']}\n";
+            $body .= strtoupper($d['level']).": {$d['code']}\n";
             $body .= "{$d['message']}\n";
             if (! empty($d['recommendation'])) {
                 $body .= "\nRecommendation: {$d['recommendation']}\n";
@@ -309,18 +320,18 @@ final class HealthAlertNotifier
 
         try {
             $this->smtpExpect($socket, 2);
-            $this->smtpCommand($socket, "EHLO nightowl", 2);
+            $this->smtpCommand($socket, 'EHLO nightowl', 2);
 
             if ($encryption === 'tls') {
-                $this->smtpCommand($socket, "STARTTLS", 2);
+                $this->smtpCommand($socket, 'STARTTLS', 2);
                 if (! stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT)) {
                     return;
                 }
-                $this->smtpCommand($socket, "EHLO nightowl", 2);
+                $this->smtpCommand($socket, 'EHLO nightowl', 2);
             }
 
             if ($username !== '') {
-                $this->smtpCommand($socket, "AUTH LOGIN", 3);
+                $this->smtpCommand($socket, 'AUTH LOGIN', 3);
                 $this->smtpCommand($socket, base64_encode($username), 3);
                 $this->smtpCommand($socket, base64_encode($password), 2);
             }
@@ -330,7 +341,7 @@ final class HealthAlertNotifier
                 $this->smtpCommand($socket, "RCPT TO:<{$to}>", 2);
             }
 
-            $this->smtpCommand($socket, "DATA", 3);
+            $this->smtpCommand($socket, 'DATA', 3);
 
             $toHeader = implode(', ', $toAddresses);
             $smtpBody = str_replace(["\r\n", "\r", "\n"], ["\n", "\n", "\r\n"], $body);
@@ -353,9 +364,35 @@ final class HealthAlertNotifier
 
     // ─── Raw HTTP / SMTP ─────────────────────────────────────────────
 
+    /**
+     * Strip CR/LF from a string to prevent email header / SMTP command injection.
+     */
+    private static function sanitizeHeader(string $value): string
+    {
+        return str_replace(["\r", "\n"], '', $value);
+    }
+
+    /**
+     * Reject non-http(s) URLs before they reach file_get_contents. PHP's URL
+     * wrappers include file://, phar://, compress.zlib:// etc. — a malicious
+     * channel config could otherwise make the agent read local files.
+     */
+    private static function isSafeWebhookUrl(string $url): bool
+    {
+        $scheme = strtolower((string) parse_url($url, PHP_URL_SCHEME));
+
+        return $scheme === 'http' || $scheme === 'https';
+    }
+
     private function httpPost(string $url, string $body, array $extraHeaders = []): void
     {
-        $headers = "Content-Type: application/json\r\nContent-Length: " . strlen($body) . "\r\n";
+        if (! self::isSafeWebhookUrl($url)) {
+            error_log("[NightOwl Agent] Rejected webhook URL (scheme must be http/https): {$url}");
+
+            return;
+        }
+
+        $headers = "Content-Type: application/json\r\nContent-Length: ".strlen($body)."\r\n";
         foreach ($extraHeaders as $key => $value) {
             $headers .= "{$key}: {$value}\r\n";
         }
@@ -373,7 +410,7 @@ final class HealthAlertNotifier
 
     private function smtpCommand($socket, string $command, int $expectFirstDigit): string
     {
-        fwrite($socket, $command . "\r\n");
+        fwrite($socket, $command."\r\n");
 
         return $this->smtpExpect($socket, $expectFirstDigit);
     }
@@ -389,7 +426,7 @@ final class HealthAlertNotifier
         }
 
         if ($response === '' || (int) $response[0] !== $expectFirstDigit) {
-            throw new \RuntimeException("SMTP error: " . trim($response));
+            throw new \RuntimeException('SMTP error: '.trim($response));
         }
 
         return $response;

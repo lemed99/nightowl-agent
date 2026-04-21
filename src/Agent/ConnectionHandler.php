@@ -21,8 +21,8 @@ final class ConnectionHandler
     /**
      * Handle a complete payload from a client connection.
      *
-     * @param resource $stream  The client stream (for writing responses)
-     * @param string   $data    The complete payload data already read by the server
+     * @param  resource  $stream  The client stream (for writing responses)
+     * @param  string  $data  The complete payload data already read by the server
      */
     public function handle($stream, string $data): void
     {
@@ -55,11 +55,13 @@ final class ConnectionHandler
             return;
         }
 
-        // Validate token hash if configured
+        // Validate token hash if configured. hash_equals is constant-time —
+        // overkill for a 7-char local-port hash, but defense-in-depth costs
+        // nothing and future-proofs the comparison.
         if ($this->expectedTokenHash !== null) {
-            $receivedHash = $result['tokenHash'] ?? null;
+            $receivedHash = (string) ($result['tokenHash'] ?? '');
 
-            if ($receivedHash !== $this->expectedTokenHash) {
+            if (! hash_equals($this->expectedTokenHash, $receivedHash)) {
                 error_log('[NightOwl Agent] Rejected payload: invalid token hash');
                 fwrite($stream, '5:ERROR');
 
@@ -72,6 +74,7 @@ final class ConnectionHandler
             // Sampling — drop non-critical payloads transparently
             if (! $this->sampler->shouldKeep($result['records'])) {
                 fwrite($stream, '2:OK');
+
                 return;
             }
 

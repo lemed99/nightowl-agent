@@ -18,34 +18,54 @@ final class MetricsCollector
 
     // Diagnosis thresholds
     private const BACKLOG_HIGH_PCT = 0.5;
+
     private const BACKLOG_CRITICAL_PCT = 0.8;
+
     private const PG_LATENCY_WARNING_MS = 500;
+
     private const PG_LATENCY_CRITICAL_MS = 2000;
+
     private const DRAIN_ERROR_RATE_PCT = 10;
+
     private const LOOP_LAG_WARNING_MS = 50;
+
     private const LOOP_LAG_CRITICAL_MS = 200;
+
     private const WAL_LARGE_BYTES = 100 * 1024 * 1024; // 100MB
+
     private const DRAIN_METRICS_STALE_SECONDS = 15;
+
     private const MEMORY_HIGH_PCT = 0.7;
 
     // System metrics thresholds
     private const CPU_HIGH_PCT = 70.0;
+
     private const CPU_CRITICAL_PCT = 90.0;
+
     private const SYS_MEMORY_HIGH_PCT = 75.0;
+
     private const SYS_MEMORY_CRITICAL_PCT = 90.0;
+
     private const REJECT_RATE_HIGH_PCT = 2.0;
+
     private const REJECT_RATE_CRITICAL_PCT = 10.0;
 
     // Ingest counters
     private int $ingestTotal = 0;
+
     private int $ingestRejected = 0;
+
     private int $ingestThisSecond = 0;
+
     private int $rejectsThisSecond = 0;
 
     // Drain metrics (read from temp file written by DrainWorker)
     private int $drainTotal = 0;
+
     private int $drainBatchesFailed = 0;
+
     private float $drainPgLatencyMs = 0.0;
+
     private float $drainMetricsUpdatedAt = 0.0;
 
     // Previous drain totals for rate calculation
@@ -54,50 +74,67 @@ final class MetricsCollector
     // Ring buffers
     /** @var int[] */
     private array $ingestRing = [];
+
     private int $ingestRingIdx = 0;
 
     /** @var int[] */
     private array $drainRing = [];
+
     private int $drainRingIdx = 0;
 
     /** @var int[] */
     private array $rejectRing = [];
+
     private int $rejectRingIdx = 0;
 
     // Loop lag tracking
     private float $lastTickTime = 0.0;
+
     /** @var float[] */
     private array $lagRing = [];
+
     private int $lagRingIdx = 0;
+
     private float $lagMax = 0.0;
 
     // System metrics (Linux /proc, updated every 10s diagnosis tick)
     private float $cpuUsagePct = 0.0;
+
     private float $sysMemoryUsedPct = 0.0;
+
     private int $sysMemoryTotalBytes = 0;
+
     private int $sysMemoryAvailableBytes = 0;
+
     /** @var float[] */
     private array $loadAvg = [0.0, 0.0, 0.0];
+
     // Previous CPU jiffies for delta calculation
     private int $prevCpuTotal = 0;
+
     private int $prevCpuIdle = 0;
 
     // Diagnosis results
     /** @var array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}> */
     private array $diagnoses = [];
+
     private int $healthScore = 100;
+
     private string $status = 'healthy';
 
     // Diagnosis lifecycle tracking
     /** @var array<string, array{first_seen_at: string, last_seen_at: string, status: string, consecutive_ticks: int, level: string, message: string, recommendation: string, value: float|int}> */
     private array $diagnosisLifecycle = [];
+
     /** @var array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}> Diagnoses that resolved on the current tick */
     private array $newlyResolved = [];
 
     // Anti-flapping: minimum consecutive ticks before a diagnosis is reported
     private const DEBOUNCE_TICKS = 2;
+
     // Minimum ticks of active state before a diagnosis can be marked as resolved (vs transient)
     private const MIN_TICKS_FOR_RESOLVE = 3;
+
     // How long to keep resolved diagnoses before garbage collection (seconds)
     private const RESOLVED_RETENTION_SECONDS = 300;
 
@@ -185,8 +222,8 @@ final class MetricsCollector
 
         for ($w = 0; $w < $workerCount; $w++) {
             $metricsPath = $workerCount > 1
-                ? $path . ".drain-metrics-{$w}.json"
-                : $path . '.drain-metrics.json';
+                ? $path.".drain-metrics-{$w}.json"
+                : $path.'.drain-metrics.json';
 
             if (! file_exists($metricsPath)) {
                 continue;
@@ -197,7 +234,11 @@ final class MetricsCollector
                 continue;
             }
 
-            $data = json_decode($json, true);
+            try {
+                $data = json_decode($json, true, 16, JSON_THROW_ON_ERROR);
+            } catch (\JsonException) {
+                continue;
+            }
             if (! is_array($data)) {
                 continue;
             }
@@ -648,6 +689,7 @@ final class MetricsCollector
             }
             $enriched[] = $d;
         }
+
         return $enriched;
     }
 
@@ -673,6 +715,7 @@ final class MetricsCollector
                 'status' => 'resolved',
             ];
         }
+
         return $resolved;
     }
 
@@ -775,23 +818,26 @@ final class MetricsCollector
         $ingest = $this->ringAvg($this->ingestRing);
         $reject = $this->ringAvg($this->rejectRing);
         $total = $ingest + $reject;
+
         return $total > 0 ? round(($reject / $total) * 100, 2) : 0.0;
     }
 
     private function formatBytes(int $bytes): string
     {
         if ($bytes < 1024 * 1024) {
-            return round($bytes / 1024, 1) . ' KB';
+            return round($bytes / 1024, 1).' KB';
         }
         if ($bytes < 1024 * 1024 * 1024) {
-            return round($bytes / 1024 / 1024, 1) . ' MB';
+            return round($bytes / 1024 / 1024, 1).' MB';
         }
-        return round($bytes / 1024 / 1024 / 1024, 1) . ' GB';
+
+        return round($bytes / 1024 / 1024 / 1024, 1).' GB';
     }
 
     private function ringAvg(array $ring): float
     {
         $sum = array_sum($ring);
+
         return $sum / self::RING_SIZE;
     }
 
@@ -801,6 +847,7 @@ final class MetricsCollector
         foreach ($ring as $v) {
             $sum += $v;
         }
+
         return $sum / self::RING_SIZE;
     }
 }

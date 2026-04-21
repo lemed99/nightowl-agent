@@ -59,8 +59,8 @@ class NightOwlAgentServiceProvider extends ServiceProvider
 
         $this->app->singleton(Redactor::class, function ($app) {
             return new Redactor(
-                config('nightowl.agent.redact_keys', ['password', 'token', 'authorization', 'cookie', 'secret']),
-                (bool) config('nightowl.agent.redact_enabled', false),
+                config('nightowl.agent.redact_keys', ['password', 'token', 'authorization', 'cookie', 'secret', 'api_key']),
+                (bool) config('nightowl.agent.redact_enabled', true),
             );
         });
 

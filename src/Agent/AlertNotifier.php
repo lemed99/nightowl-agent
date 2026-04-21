@@ -17,11 +17,12 @@ final class AlertNotifier
 {
     /** @var array<int, array{type: string, name: string, config: array}> */
     private array $channelCache = [];
+
     private float $channelCacheExpiry = 0;
-    private int $cacheTtl;
 
     /** Lightweight polling: detect channel changes without full reload */
     private float $channelVersionCheckAt = 0;
+
     private ?string $channelFingerprint = null;
 
     /** Maximum total time for notification dispatch per flush (seconds) */
@@ -30,13 +31,10 @@ final class AlertNotifier
     /** @var list<array{appName: string, issueGroups: array, issueType: string, newHashes: string[]}> */
     private array $pendingNotifications = [];
 
-    private string $frontendUrl;
-
-    public function __construct(int $cacheTtl = 86400, string $frontendUrl = '')
-    {
-        $this->cacheTtl = $cacheTtl;
-        $this->frontendUrl = $frontendUrl;
-    }
+    public function __construct(
+        private int $cacheTtl = 86400,
+        private string $frontendUrl = '',
+    ) {}
 
     public static function fromConfig(): self
     {
@@ -48,11 +46,10 @@ final class AlertNotifier
 
     /**
      * Stage 1: Call BEFORE the issue upsert to snapshot existing composite keys.
-     * Returns the set of (group_hash|deploy) keys that already exist, for diffing after upsert.
+     * Returns the set of (group_hash|environment) keys that already exist, for diffing after upsert.
      *
-     * @param  PDO    $pdo
-     * @param  array  $issueGroups  Groups keyed by "fingerprint|deploy", each carrying 'fingerprint' and 'deploy'
-     * @param  string $issueType    'exception' or 'performance'
+     * @param  array  $issueGroups  Groups keyed by "fingerprint|environment", each carrying 'fingerprint' and 'environment'
+     * @param  string  $issueType  'exception' or 'performance'
      * @return string[] Composite keys that already exist
      */
     public function snapshotExistingIssues(PDO $pdo, array $issueGroups, string $issueType): array
@@ -70,12 +67,12 @@ final class AlertNotifier
             $existing = [];
             $stmt = $pdo->prepare("
                 SELECT 1 FROM nightowl_issues
-                WHERE group_hash = ? AND type = ? AND deploy IS NOT DISTINCT FROM ? AND status != 'resolved'
+                WHERE group_hash = ? AND type = ? AND environment IS NOT DISTINCT FROM ? AND status != 'resolved'
                 LIMIT 1
             ");
 
             foreach ($issueGroups as $key => $group) {
-                $stmt->execute([$group['fingerprint'], $issueType, $group['deploy'] ?? null]);
+                $stmt->execute([$group['fingerprint'], $issueType, $group['environment'] ?? null]);
                 if ($stmt->fetchColumn() !== false) {
                     $existing[] = $key;
                 }
@@ -91,10 +88,10 @@ final class AlertNotifier
      * Stage 2: Call AFTER the upsert (still inside transaction) to queue notifications.
      * Does NOT dispatch yet — just records what needs to be sent.
      *
-     * @param string   $appName        Application name
-     * @param array    $issueGroups    Groups keyed by group_hash
-     * @param string   $issueType      'exception' or 'performance'
-     * @param string[] $existingBefore Hashes that existed before the upsert (from snapshotExistingIssues)
+     * @param  string  $appName  Application name
+     * @param  array  $issueGroups  Groups keyed by group_hash
+     * @param  string  $issueType  'exception' or 'performance'
+     * @param  string[]  $existingBefore  Hashes that existed before the upsert (from snapshotExistingIssues)
      */
     public function queueNewIssueNotifications(string $appName, array $issueGroups, string $issueType, array $existingBefore): void
     {
@@ -156,7 +153,8 @@ final class AlertNotifier
 
             foreach ($channels as $channel) {
                 if (microtime(true) > $deadline) {
-                    error_log('[NightOwl Agent] Notification dispatch budget exceeded (' . self::MAX_NOTIFICATION_SECONDS . 's), skipping remaining');
+                    error_log('[NightOwl Agent] Notification dispatch budget exceeded ('.self::MAX_NOTIFICATION_SECONDS.'s), skipping remaining');
+
                     return;
                 }
 
@@ -169,7 +167,8 @@ final class AlertNotifier
 
                 foreach ($enrichedGroups as $group) {
                     if (microtime(true) > $deadline) {
-                        error_log('[NightOwl Agent] Notification dispatch budget exceeded (' . self::MAX_NOTIFICATION_SECONDS . 's), skipping remaining');
+                        error_log('[NightOwl Agent] Notification dispatch budget exceeded ('.self::MAX_NOTIFICATION_SECONDS.'s), skipping remaining');
+
                         return;
                     }
 
@@ -188,8 +187,7 @@ final class AlertNotifier
     private function enrichFromDb(PDO $pdo, array $group, string $compositeKey, string $issueType): array
     {
         $fingerprint = $group['fingerprint'] ?? $compositeKey;
-        $deploy = $group['deploy'] ?? null;
-        $group['environment'] = $deploy;
+        $environment = $group['environment'] ?? null;
 
         $issue = null;
         try {
@@ -197,10 +195,10 @@ final class AlertNotifier
                 SELECT id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype,
                        threshold_ms, triggered_duration_ms
                 FROM nightowl_issues
-                WHERE group_hash = ? AND type = ? AND deploy IS NOT DISTINCT FROM ?
+                WHERE group_hash = ? AND type = ? AND environment IS NOT DISTINCT FROM ?
                 LIMIT 1
             ');
-            $stmt->execute([$fingerprint, $issueType, $deploy]);
+            $stmt->execute([$fingerprint, $issueType, $environment]);
             $issue = $stmt->fetch(PDO::FETCH_ASSOC);
         } catch (\Throwable) {
             // Threshold columns may not exist yet on customer DBs pending migration —
@@ -209,10 +207,10 @@ final class AlertNotifier
                 $stmt = $pdo->prepare('
                     SELECT id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype
                     FROM nightowl_issues
-                    WHERE group_hash = ? AND type = ? AND deploy IS NOT DISTINCT FROM ?
+                    WHERE group_hash = ? AND type = ? AND environment IS NOT DISTINCT FROM ?
                     LIMIT 1
                 ');
-                $stmt->execute([$fingerprint, $issueType, $deploy]);
+                $stmt->execute([$fingerprint, $issueType, $environment]);
                 $issue = $stmt->fetch(PDO::FETCH_ASSOC);
             } catch (\Throwable) {
                 // Best-effort — dispatch with whatever we have
@@ -235,11 +233,11 @@ final class AlertNotifier
                 $stmt = $pdo->prepare('
                     SELECT file, line, server, php_version, laravel_version, handled
                     FROM nightowl_exceptions
-                    WHERE fingerprint = ? AND deploy IS NOT DISTINCT FROM ?
+                    WHERE fingerprint = ? AND environment IS NOT DISTINCT FROM ?
                     ORDER BY created_at DESC
                     LIMIT 1
                 ');
-                $stmt->execute([$fingerprint, $deploy]);
+                $stmt->execute([$fingerprint, $environment]);
                 $exc = $stmt->fetch(PDO::FETCH_ASSOC);
 
                 if ($exc) {
@@ -248,7 +246,7 @@ final class AlertNotifier
                     $group['php_version'] = ! empty($exc['php_version']) ? $exc['php_version'] : null;
                     $group['laravel_version'] = ! empty($exc['laravel_version']) ? $exc['laravel_version'] : null;
                     if (! empty($exc['file'])) {
-                        $group['location'] = $exc['file'] . (! empty($exc['line']) ? ':' . $exc['line'] : '');
+                        $group['location'] = $exc['file'].(! empty($exc['line']) ? ':'.$exc['line'] : '');
                     }
                 }
             } catch (\Throwable) {
@@ -293,7 +291,7 @@ final class AlertNotifier
 
         try {
             $rows = $pdo->query(
-                "SELECT type, name, config, updated_at FROM nightowl_alert_channels WHERE enabled = true"
+                'SELECT type, name, config, updated_at FROM nightowl_alert_channels WHERE enabled = true'
             )->fetchAll(PDO::FETCH_ASSOC);
 
             $maxUpdatedAt = '';
@@ -301,13 +299,18 @@ final class AlertNotifier
                 if (($row['updated_at'] ?? '') > $maxUpdatedAt) {
                     $maxUpdatedAt = $row['updated_at'];
                 }
+                try {
+                    $cfg = json_decode((string) $row['config'], true, 32, JSON_THROW_ON_ERROR);
+                } catch (\JsonException) {
+                    continue;
+                }
                 $this->channelCache[] = [
                     'type' => $row['type'],
                     'name' => $row['name'],
-                    'config' => json_decode($row['config'], true) ?? [],
+                    'config' => is_array($cfg) ? $cfg : [],
                 ];
             }
-            $this->channelFingerprint = count($rows) . ':' . $maxUpdatedAt;
+            $this->channelFingerprint = count($rows).':'.$maxUpdatedAt;
         } catch (\Throwable) {
             // Table may not exist yet
         }
@@ -345,7 +348,7 @@ final class AlertNotifier
     {
         $message = $group['message'] ?? '';
         if ($message !== '' && mb_strlen($message) > 200) {
-            $message = mb_substr($message, 0, 200) . '...';
+            $message = mb_substr($message, 0, 200).'...';
         }
 
         return $message;
@@ -353,7 +356,7 @@ final class AlertNotifier
 
     private function logoUrl(): string
     {
-        return rtrim($this->frontendUrl, '/') . '/logo.png';
+        return rtrim($this->frontendUrl, '/').'/logo.png';
     }
 
     private function buildViewUrl(?int $issueId): ?string
@@ -363,7 +366,7 @@ final class AlertNotifier
         }
 
         // Agent doesn't know the app ID in the dashboard, so link to the issues list
-        return rtrim($this->frontendUrl, '/') . '/dashboard';
+        return rtrim($this->frontendUrl, '/').'/dashboard';
     }
 
     /**
@@ -514,7 +517,7 @@ final class AlertNotifier
         ];
 
         if ($issueId !== null) {
-            $fields[] = ['name' => 'Issue', 'value' => '#' . $issueId, 'inline' => true];
+            $fields[] = ['name' => 'Issue', 'value' => '#'.$issueId, 'inline' => true];
         }
 
         if (! empty($group['environment'])) {
@@ -525,7 +528,7 @@ final class AlertNotifier
             $statusText = ($handled === true) ? 'Handled' : 'Unhandled';
             $fields[] = ['name' => 'Status', 'value' => $statusText, 'inline' => true];
             if (! empty($group['location'])) {
-                $fields[] = ['name' => 'Location', 'value' => '`' . $group['location'] . '`', 'inline' => false];
+                $fields[] = ['name' => 'Location', 'value' => '`'.$group['location'].'`', 'inline' => false];
             }
             if (! empty($group['laravel_version'])) {
                 $fields[] = ['name' => 'Laravel', 'value' => (string) $group['laravel_version'], 'inline' => true];
@@ -535,18 +538,18 @@ final class AlertNotifier
             }
         } else {
             $subtypeLabel = EmailTemplate::subtypeLabel($subtype);
-            $fields[] = ['name' => $subtypeLabel, 'value' => '`' . $name . '`', 'inline' => false];
+            $fields[] = ['name' => $subtypeLabel, 'value' => '`'.$name.'`', 'inline' => false];
             $duration = $group['duration_ms'] ?? null;
             $threshold = $group['threshold_ms'] ?? null;
             if ($duration !== null) {
-                $fields[] = ['name' => 'Duration', 'value' => $duration . 'ms', 'inline' => true];
+                $fields[] = ['name' => 'Duration', 'value' => $duration.'ms', 'inline' => true];
             }
             if ($threshold !== null) {
-                $fields[] = ['name' => 'Threshold', 'value' => $threshold . 'ms', 'inline' => true];
+                $fields[] = ['name' => 'Threshold', 'value' => $threshold.'ms', 'inline' => true];
             }
             if ($duration !== null && $threshold !== null && $duration > $threshold) {
                 $over = $duration - $threshold;
-                $fields[] = ['name' => 'Over by', 'value' => $over . 'ms', 'inline' => true];
+                $fields[] = ['name' => 'Over by', 'value' => $over.'ms', 'inline' => true];
             }
         }
 
@@ -658,9 +661,27 @@ final class AlertNotifier
 
     // ─── Raw HTTP ────────────────────────────────────────────────────
 
+    /**
+     * Reject non-http(s) URLs before they reach file_get_contents. PHP's URL
+     * wrappers include file://, phar://, compress.zlib:// etc. — a malicious
+     * channel config could otherwise make the agent read local files.
+     */
+    private static function isSafeWebhookUrl(string $url): bool
+    {
+        $scheme = strtolower((string) parse_url($url, PHP_URL_SCHEME));
+
+        return $scheme === 'http' || $scheme === 'https';
+    }
+
     private function httpPost(string $url, string $body, array $extraHeaders = []): void
     {
-        $headers = "Content-Type: application/json\r\nContent-Length: " . strlen($body) . "\r\n";
+        if (! self::isSafeWebhookUrl($url)) {
+            error_log("[NightOwl Agent] Rejected webhook URL (scheme must be http/https): {$url}");
+
+            return;
+        }
+
+        $headers = "Content-Type: application/json\r\nContent-Length: ".strlen($body)."\r\n";
         foreach ($extraHeaders as $key => $value) {
             $headers .= "{$key}: {$value}\r\n";
         }
@@ -706,20 +727,20 @@ final class AlertNotifier
 
         try {
             $this->smtpExpect($socket, 2); // greeting
-            $this->smtpCommand($socket, "EHLO nightowl", 2);
+            $this->smtpCommand($socket, 'EHLO nightowl', 2);
 
             if ($encryption === 'tls') {
-                $this->smtpCommand($socket, "STARTTLS", 2);
+                $this->smtpCommand($socket, 'STARTTLS', 2);
                 if (! stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT)) {
                     error_log('[NightOwl Agent] SMTP STARTTLS failed');
 
                     return;
                 }
-                $this->smtpCommand($socket, "EHLO nightowl", 2);
+                $this->smtpCommand($socket, 'EHLO nightowl', 2);
             }
 
             if ($username !== '') {
-                $this->smtpCommand($socket, "AUTH LOGIN", 3);
+                $this->smtpCommand($socket, 'AUTH LOGIN', 3);
                 $this->smtpCommand($socket, base64_encode($username), 3);
                 $this->smtpCommand($socket, base64_encode($password), 2);
             }
@@ -729,7 +750,7 @@ final class AlertNotifier
                 $this->smtpCommand($socket, "RCPT TO:<{$to}>", 2);
             }
 
-            $this->smtpCommand($socket, "DATA", 3);
+            $this->smtpCommand($socket, 'DATA', 3);
 
             $toHeader = implode(', ', $toAddresses);
             // Normalize body to CRLF line endings for SMTP
@@ -763,7 +784,7 @@ final class AlertNotifier
      */
     private function smtpCommand($socket, string $command, int $expectFirstDigit): string
     {
-        fwrite($socket, $command . "\r\n");
+        fwrite($socket, $command."\r\n");
 
         return $this->smtpExpect($socket, $expectFirstDigit);
     }
@@ -784,10 +805,9 @@ final class AlertNotifier
         }
 
         if ($response === '' || (int) $response[0] !== $expectFirstDigit) {
-            throw new \RuntimeException("SMTP error: " . trim($response));
+            throw new \RuntimeException('SMTP error: '.trim($response));
         }
 
         return $response;
     }
-
 }
