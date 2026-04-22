@@ -1,0 +1,39 @@
+name: Question
+description: Ask a question about using or configuring the NightOwl agent.
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening an issue, please check the [documentation](https://usenightowl.com/docs) and [existing issues](https://github.com/lemed99/nightowl-agent/issues?q=is%3Aissue) — your question may already be answered.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: Be as specific as possible — include config snippets, env vars, and command output where relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Docs pages you've read, configs you've tested, search terms you've used.
+
+  - type: input
+    id: agent-version
+    attributes:
+      label: Agent version
+      placeholder: 1.0.0
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked the docs at https://usenightowl.com/docs.
+          required: true
+        - label: I searched existing issues before opening this one.
+          required: true

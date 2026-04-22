@@ -1,0 +1,100 @@
+name: Bug report
+description: Report a reproducible bug in the NightOwl agent.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please fill out the sections below so we can reproduce and fix it quickly.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug.
+      placeholder: The agent crashes on startup when DRAIN_WORKERS > 1...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, commands, or code needed to reproduce the issue.
+      placeholder: |
+        1. Set NIGHTOWL_DRAIN_WORKERS=4 in .env
+        2. Run `php artisan nightowl:agent`
+        3. See error in the logs
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / stack traces
+      description: Paste any relevant output from `storage/logs/laravel.log` or the agent's stderr. Redact secrets.
+      render: shell
+
+  - type: input
+    id: agent-version
+    attributes:
+      label: Agent version
+      description: Output of `composer show nightowl/agent | grep versions`
+      placeholder: 1.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: php-version
+    attributes:
+      label: PHP version
+      placeholder: 8.3.4
+    validations:
+      required: true
+
+  - type: input
+    id: laravel-version
+    attributes:
+      label: Laravel version
+      placeholder: 12.0
+    validations:
+      required: true
+
+  - type: input
+    id: postgres-version
+    attributes:
+      label: PostgreSQL version
+      placeholder: 16.2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows (WSL)
+        - Docker
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and this bug has not been reported.
+          required: true
+        - label: I am running a supported version (PHP 8.2+, Laravel 11/12, PostgreSQL 14+).
+          required: true

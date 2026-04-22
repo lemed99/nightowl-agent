@@ -1,271 +1,97 @@
-# NightOwl Agent
+<p align="center">
+  <img src=".github/assets/logo.svg" alt="NightOwl" width="160">
+</p>
 
-Self-hosted Laravel application monitoring. Collects telemetry from [laravel/nightwatch](https://github.com/laravel/nightwatch) and writes it to your PostgreSQL database.
+<h1 align="center">NightOwl Agent</h1>
 
-Full documentation: [usenightowl.com/docs](https://usenightowl.com/docs)
+<p align="center">
+  <strong>Self-hosted Laravel monitoring agent. Drop-in Nightwatch alternative, open-source.</strong>
+</p>
 
-## Requirements
+<p align="center">
+  <a href="https://packagist.org/packages/nightowl/agent"><img src="https://img.shields.io/packagist/v/nightowl/agent.svg?style=flat-square" alt="Packagist Version"></a>
+  <a href="https://packagist.org/packages/nightowl/agent"><img src="https://img.shields.io/packagist/php-v/nightowl/agent.svg?style=flat-square" alt="PHP 8.2+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/lemed99/nightowl-agent.svg?style=flat-square" alt="MIT License"></a>
+  <a href="https://github.com/lemed99/nightowl-agent/actions/workflows/tests.yml"><img src="https://img.shields.io/github/actions/workflow/status/lemed99/nightowl-agent/tests.yml?branch=main&label=tests&style=flat-square" alt="Tests"></a>
+</p>
 
-- PHP 8.2+
-- Laravel 11 or 12
-- PostgreSQL 15+
-- PHP extensions: `pdo_pgsql`, `pdo_sqlite`
-- Recommended: `pcntl`, `posix` (for the async driver)
+---
 
-## Installation
+<p align="center">
+  <img src=".github/assets/demo.gif" alt="NightOwl dashboard demo" width="800">
+</p>
 
-### 1. Create an account
+## What is this?
 
-Sign up at your NightOwl dashboard, create a new app, and provide your PostgreSQL database credentials. You'll receive an agent token — copy it, you'll only see it once.
+NightOwl is an open-source Laravel monitoring agent paired with a closed-source hosted dashboard. The agent runs inside your app, buffers telemetry locally, and drains directly into **your own** PostgreSQL database — your request data never touches our servers. The dashboard at [usenightowl.com](https://usenightowl.com) connects to your database with credentials you control to render the monitoring UI.
 
-### 2. Install the packages
-
-NightOwl receives telemetry from Laravel's Nightwatch package, so install both:
+## Install
 
 ```bash
 composer require nightowl/agent
-```
-
-### 3. Configure environment
-
-Add these to your `.env`:
-
-```env
-NIGHTWATCH_TOKEN=your-token-from-the-dashboard
-
-NIGHTOWL_DB_HOST=127.0.0.1
-NIGHTOWL_DB_PORT=5432
-NIGHTOWL_DB_DATABASE=nightowl
-NIGHTOWL_DB_USERNAME=nightowl
-NIGHTOWL_DB_PASSWORD=your-db-password
-```
-
-> The `NIGHTWATCH_TOKEN` is used by both Nightwatch (to send telemetry) and the NightOwl agent (to validate it). Use the same database credentials you entered when creating the app in the dashboard.
-
-### 4. Run the installer
-
-```bash
 php artisan nightowl:install
 ```
 
-This publishes the config file and runs migrations to create the monitoring tables in your database.
+Sign up and create an app to get your agent token: **[usenightowl.com/signup](https://usenightowl.com/signup)**
 
-### 5. Ensure the buffer directory exists
+Full installation guide: [docs.usenightowl.com](https://docs.usenightowl.com)
 
-The agent uses a local SQLite file to buffer data before draining to PostgreSQL. Make sure the storage directory exists and is writable:
-
-```bash
-mkdir -p storage/nightowl && chmod 775 storage/nightowl
-```
-
-> **Docker users**: This step is required inside your container before starting the agent.
-
-### 6. Start the agent
-
-```bash
-php artisan nightowl:agent
-```
-
-The agent listens on port 2407 by default. Nightwatch sends telemetry to the agent, which buffers it locally and drains to your PostgreSQL database.
-
-Open your NightOwl dashboard to see monitoring data.
-
-## Running in Production
-
-Use a process manager to keep the agent running:
-
-**Supervisor** (recommended):
-
-```ini
-[program:nightowl-agent]
-command=php /path/to/your/app/artisan nightowl:agent
-autostart=true
-autorestart=true
-user=www-data
-redirect_stderr=true
-stdout_logfile=/var/log/nightowl-agent.log
-```
-
-**systemd:**
-
-```ini
-[Unit]
-Description=NightOwl Agent
-After=network.target postgresql.service
-
-[Service]
-User=www-data
-WorkingDirectory=/path/to/your/app
-ExecStart=/usr/bin/php artisan nightowl:agent
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## Configuration
-
-All configuration is in `config/nightowl.php` after running the installer. Key environment variables:
-
-| Variable                              | Default     | Description                                                                                |
-| ------------------------------------- | ----------- | ------------------------------------------------------------------------------------------ |
-| `NIGHTWATCH_TOKEN`                    | —           | Token from the dashboard (used by both Nightwatch and the agent)                           |
-| `NIGHTOWL_DB_HOST`                    | `127.0.0.1` | PostgreSQL host                                                                            |
-| `NIGHTOWL_DB_PORT`                    | `5432`      | PostgreSQL port                                                                            |
-| `NIGHTOWL_DB_DATABASE`                | `nightowl`  | PostgreSQL database name                                                                   |
-| `NIGHTOWL_DB_USERNAME`                | `nightowl`  | PostgreSQL username                                                                        |
-| `NIGHTOWL_DB_PASSWORD`                | `nightowl`  | PostgreSQL password                                                                        |
-| `NIGHTOWL_AGENT_HOST`                 | `127.0.0.1` | TCP host the agent binds to (set to `0.0.0.0` or an LB VIP for multi-host)                 |
-| `NIGHTOWL_AGENT_PORT`                 | `2407`      | TCP port the agent listens on                                                              |
-| `NIGHTOWL_AGENT_DRIVER`               | `async`     | Server driver (`async` or `sync`)                                                          |
-| `NIGHTOWL_SO_REUSEPORT`               | `false`     | Allow multiple agents to bind the same port (Linux only, see _Running Multiple Instances_) |
-| `NIGHTOWL_DRAIN_WORKERS`              | `1`         | Number of parallel drain worker processes                                                  |
-| `NIGHTOWL_DRAIN_BATCH_SIZE`           | `5000`      | Rows per PostgreSQL `COPY` batch                                                           |
-| `NIGHTOWL_DRAIN_INTERVAL_MS`          | `100`       | Drain loop sleep interval when the buffer is idle                                          |
-| `NIGHTOWL_MAX_PENDING_ROWS`           | `100000`    | Reject new payloads once buffer hits this depth                                            |
-| `NIGHTOWL_MAX_BUFFER_MEMORY`          | `268435456` | RSS ceiling (bytes) before back-pressure kicks in                                          |
-| `NIGHTOWL_SAMPLE_RATE`                | `1.0`       | Global sampling rate (1.0 = keep all, exceptions always kept)                              |
-| `NIGHTOWL_REQUEST_SAMPLE_RATE`        | —           | Override sample rate for HTTP requests                                                     |
-| `NIGHTOWL_COMMAND_SAMPLE_RATE`        | —           | Override sample rate for artisan commands                                                  |
-| `NIGHTOWL_SCHEDULED_TASK_SAMPLE_RATE` | —           | Override sample rate for scheduled tasks                                                   |
-| `NIGHTOWL_REDACT_ENABLED`             | `false`     | Redact sensitive keys from payloads before writing                                         |
-| `NIGHTOWL_REDACT_KEYS`                | —           | Comma-separated key names to redact (e.g. `password,token,authorization`)                  |
-| `NIGHTOWL_THRESHOLD_CACHE_TTL`        | `86400`     | Seconds to cache performance thresholds (restart agent to pick up changes immediately)     |
-| `NIGHTOWL_RETENTION_DAYS`             | `14`        | Days to keep monitoring data                                                               |
-| `NIGHTOWL_PARALLEL_WITH_NIGHTWATCH`   | `false`     | Fan telemetry out to both Nightwatch and NightOwl (see _Running Alongside Nightwatch_)     |
-
-## Commands
-
-| Command            | Description                                        |
-| ------------------ | -------------------------------------------------- |
-| `nightowl:agent`   | Start the monitoring agent                         |
-| `nightowl:install` | Publish config and run migrations                  |
-| `nightowl:prune`   | Delete monitoring data older than retention period |
-| `nightowl:clear`   | Truncate all monitoring tables                     |
-
-## Data Retention
-
-NightOwl never deletes your data automatically — you have full control. Use the `nightowl:prune` command to clean up old monitoring data when you're ready:
-
-```bash
-# Delete data older than 14 days (default)
-php artisan nightowl:prune
-
-# Delete data older than 30 days
-php artisan nightowl:prune --days=30
-```
-
-To automate pruning, add it to your app's scheduler in `routes/console.php`:
-
-```php
-use Illuminate\Support\Facades\Schedule;
-
-Schedule::command('nightowl:prune --days=14')->daily();
-```
-
-The default retention is controlled by `NIGHTOWL_RETENTION_DAYS` in your `.env` (defaults to 14 days). This only affects `nightowl:prune` — no data is deleted unless you run the command.
-
-## Filtering & Context
-
-NightOwl works with Nightwatch's built-in filtering. Since the agent receives whatever Nightwatch sends, these features work out of the box:
-
-**Sampling** — Control how much data is collected per entry point type:
-
-```env
-NIGHTOWL_REQUEST_SAMPLE_RATE=0.1        # Keep ~10% of requests
-NIGHTOWL_COMMAND_SAMPLE_RATE=1.0         # Keep all commands
-NIGHTOWL_SCHEDULED_TASK_SAMPLE_RATE=1.0  # Keep all scheduled tasks
-```
-
-Exceptions and 5xx requests are always kept regardless of sample rate. When an entry point is sampled in, the entire trace (queries, cache, logs, etc.) is captured.
-
-**In-code filtering** — Use Nightwatch's filtering API to exclude specific events:
-
-```php
-// Exclude events within this callback from capture
-Nightwatch::ignore(function () {
-    // queries, jobs, etc. here won't be recorded
-});
-
-// Pause/resume for finer control
-Nightwatch::pause();
-// ... unmonitored code ...
-Nightwatch::resume();
-```
-
-**Context metadata** — Attach custom key-value data to traces using Laravel Context (11+):
-
-```php
-Context::add('user_role', $user->role);
-Context::add('feature_flags', ['new-checkout' => true]);
-Context::add('tenant', ['id' => $tenant->id, 'plan' => 'pro']);
-```
-
-Context data is captured by Nightwatch, stored by the agent, and displayed in the request detail page in the NightOwl dashboard as a collapsible JSON tree. Maximum 65KB per request.
-
-**Redaction** — The agent can redact sensitive data before writing to the database:
-
-```env
-NIGHTOWL_REDACT_ENABLED=true
-NIGHTOWL_REDACT_KEYS=password,token,authorization,cookie,secret
-```
-
-## Running Alongside Nightwatch
-
-By default, the NightOwl service provider redirects Nightwatch's collector entirely at the NightOwl agent — Laravel Cloud (or your local `nightwatch:agent`) receives nothing.
-
-If you're migrating from Nightwatch and want to compare dashboards side by side, flip one flag and the provider will fan every record out to both destinations using the bundled `NightOwl\Support\MultiIngest`:
-
-```env
-NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=true
-```
-
-With the flag on, `Laravel\Nightwatch\Core::$ingest` is wrapped so every `write`/`writeNow`/`ping`/`digest` call fans out to **both** Nightwatch's original destination (Laravel Cloud or a local `nightwatch:agent`) and the NightOwl agent. Failures on one side are swallowed so they can't take the other down.
-
-### Running two local agents on the same host
-
-If you're running `nightwatch:agent` locally (not shipping to Laravel Cloud), put the NightOwl agent on a different port so it doesn't collide with Nightwatch's 2407:
-
-```env
-NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=true
-NIGHTOWL_AGENT_PORT=2410
-NIGHTOWL_TOKEN=your-nightowl-token-from-dashboard
-NIGHTWATCH_TOKEN=your-nightwatch-token
-```
-
-> `NIGHTWATCH_TOKEN` is used by the Nightwatch package to authenticate with Nightwatch's ingest. `NIGHTOWL_TOKEN` is the token from the NightOwl dashboard — the NightOwl agent uses it for payload authentication and health reporting. If `NIGHTOWL_TOKEN` is unset, the agent falls back to `NIGHTWATCH_TOKEN`.
-
-Then run both agents:
-
-```bash
-# Terminal 1 — Nightwatch agent (default port 2407)
-php artisan nightwatch:agent
-
-# Terminal 2 — NightOwl agent (port 2410)
-php artisan nightowl:agent
-```
-
-When you're ready to cut over fully, remove `NIGHTOWL_PARALLEL_WITH_NIGHTWATCH` (or set it to `false`) and point `NIGHTOWL_AGENT_PORT` back to 2407.
-
-## How It Works
+## Architecture
 
 ```
-Your Laravel App
-  └─ laravel/nightwatch (collects telemetry)
-       └─ TCP → NightOwl Agent (port 2407)
-            ├─ SQLite buffer (local, crash-safe)
-            │    └─ PostgreSQL (your database)
-            └─ Host metrics (/proc/stat, /proc/meminfo, load avg)
-                 └─ HTTPS → NightOwl Dashboard (agent health only)
-
-NightOwl Dashboard (hosted)
-  └─ Reads from your PostgreSQL database for monitoring data
-  └─ Receives agent + host health reports
+ Your Laravel app                             Your infrastructure
+ ┌──────────────────┐    TCP    ┌──────────────────────────────┐
+ │ laravel/         │──2407────▶│ NightOwl Agent (ReactPHP)    │
+ │ nightwatch       │           │  ├─ SQLite WAL buffer        │
+ └──────────────────┘           │  └─ pcntl drain workers      │
+                                │         │                    │
+                                │         │ COPY protocol      │
+                                │         ▼                    │
+                                │   PostgreSQL (yours)         │
+                                └──────────────────────────────┘
+                                            ▲
+                                            │ reads via your creds
+                                 ┌──────────┴──────────┐
+                                 │ NightOwl Dashboard  │
+                                 │ (hosted, closed)    │
+                                 └─────────────────────┘
 ```
 
-The agent never sends your application data to the dashboard. It writes directly to your database. The dashboard connects to your database (using the credentials you provided) to display monitoring data. The only thing sent to the dashboard is agent and host health (ingest/drain rates, buffer depth, CPU/memory/load).
+> **13,400 payloads/s** on a single instance — ReactPHP non-blocking TCP ingest, SQLite WAL buffering, PostgreSQL `COPY` drain with `synchronous_commit = off`.
+
+## Features
+
+- [x] **Requests** — durations, status codes, routes, P95, slow endpoints
+- [x] **Jobs** — queue latency, attempts, failures, per-queue breakdowns
+- [x] **Queries** — N+1 detection, slow queries, per-request SQL timelines
+- [x] **Exceptions** — fingerprinted groups, stack traces, assignees, resolve/ignore
+- [x] **Logs** — level filtering, context metadata, per-request log streams
+- [x] **Users** — request and exception counts per authenticated user
+- [x] **Alerts** — Email (BYO SMTP), Webhook (HMAC), Slack, Discord
+- [x] **Host metrics** — CPU, memory, load average
+- [x] **Agent health** — ingest/drain rates, back-pressure, 19 diagnosis rules
+
+## Requirements
+
+- PHP **8.2+** (with `pdo_pgsql`, `pdo_sqlite`; `pcntl` + `posix` for the async driver)
+- PostgreSQL **14+**
+- Laravel **11 or 12**
+- Redis — _optional_, only if your app already uses it for queues/cache
+
+## Self-hosting
+
+The agent writes telemetry **directly to your PostgreSQL database**, never to ours. The only data the agent sends to NightOwl is agent/host health (ingest rates, buffer depth, CPU/memory) — zero request, query, or exception data leaves your infrastructure. The dashboard is hosted but connects to your DB using credentials you provided, which you can rotate or revoke at any time.
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, test suite structure, and conventions. Bug reports and feature requests go through [GitHub Issues](https://github.com/lemed99/nightowl-agent/issues).
 
 ## License
 
-MIT
+[MIT](LICENSE) — use it, fork it, ship it.
+
+## Related
+
+- 🦉 **Dashboard** — [usenightowl.com/signup](https://usenightowl.com/signup)
+- 📖 **Docs** — [docs.usenightowl.com](https://docs.usenightowl.com)
+- 🌐 **Website** — [usenightowl.com](https://usenightowl.com)

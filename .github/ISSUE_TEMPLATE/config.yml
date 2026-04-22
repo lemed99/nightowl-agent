@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://usenightowl.com/docs
+    about: Installation, configuration, and troubleshooting guides.
+  - name: Dashboard support
+    url: https://usenightowl.com/contact
+    about: Account, billing, or hosted dashboard issues (not the open-source agent).

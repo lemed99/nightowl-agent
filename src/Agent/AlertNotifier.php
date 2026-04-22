@@ -34,13 +34,17 @@ final class AlertNotifier
     public function __construct(
         private int $cacheTtl = 86400,
         private string $frontendUrl = '',
+        private ?string $appId = null,
     ) {}
 
     public static function fromConfig(): self
     {
+        $appId = config('nightowl.agent.app_id');
+
         return new self(
             (int) config('nightowl.threshold_cache_ttl', 86400),
             (string) config('app.frontend_url', ''),
+            is_string($appId) && $appId !== '' ? $appId : null,
         );
     }
 
@@ -193,7 +197,7 @@ final class AlertNotifier
         try {
             $stmt = $pdo->prepare('
                 SELECT id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype,
-                       threshold_ms, triggered_duration_ms
+                       status, priority, threshold_ms, triggered_duration_ms
                 FROM nightowl_issues
                 WHERE group_hash = ? AND type = ? AND environment IS NOT DISTINCT FROM ?
                 LIMIT 1
@@ -205,7 +209,8 @@ final class AlertNotifier
             // fall back to the legacy column set so enrichment still succeeds.
             try {
                 $stmt = $pdo->prepare('
-                    SELECT id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype
+                    SELECT id, first_seen_at, last_seen_at, occurrences_count, users_count, subtype,
+                           status, priority
                     FROM nightowl_issues
                     WHERE group_hash = ? AND type = ? AND environment IS NOT DISTINCT FROM ?
                     LIMIT 1
@@ -224,6 +229,8 @@ final class AlertNotifier
             $group['count'] = (int) ($issue['occurrences_count'] ?? $group['count']);
             $group['users_count'] = (int) ($issue['users_count'] ?? count($group['users']));
             $group['subtype'] = $issue['subtype'] ?? ($group['subtype'] ?? null);
+            $group['status'] = $issue['status'] ?? null;
+            $group['priority'] = $issue['priority'] ?? null;
             $group['threshold_ms'] = isset($issue['threshold_ms']) && $issue['threshold_ms'] !== null ? (int) $issue['threshold_ms'] : ($group['threshold_ms'] ?? null);
             $group['duration_ms'] = isset($issue['triggered_duration_ms']) && $issue['triggered_duration_ms'] !== null ? (int) $issue['triggered_duration_ms'] : ($group['duration_ms'] ?? null);
         }
@@ -365,8 +372,15 @@ final class AlertNotifier
             return null;
         }
 
-        // Agent doesn't know the app ID in the dashboard, so link to the issues list
-        return rtrim($this->frontendUrl, '/').'/dashboard';
+        $base = rtrim($this->frontendUrl, '/');
+
+        if ($this->appId === null) {
+            // No app_id configured (NIGHTOWL_APP_ID unset) — link to the
+            // generic dashboard since we can't build the per-app issue URL.
+            return $base.'/dashboard';
+        }
+
+        return "{$base}/dashboard/{$this->appId}/issues/{$issueId}";
     }
 
     /**
@@ -594,32 +608,43 @@ final class AlertNotifier
             return;
         }
 
+        $title = $this->issueName($group);
+        $message = $this->issueMessage($group);
+        $issueId = $group['issue_id'] ?? null;
+        $isException = $issueType === 'exception';
+
+        // Canonical issue payload — same shape as the backend WebhookDispatcher
+        // emits for issue.resolved/ignored/reopened. Every key is always
+        // present; null for non-applicable fields. Receivers can key off
+        // `event` to discriminate new issues (issue.new) vs status changes.
         $issue = [
-            'id' => $group['issue_id'] ?? null,
+            'issue_id' => $issueId,
             'type' => $issueType,
-            'subtype' => $group['subtype'] ?? null,
-            'class' => $this->issueName($group),
-            'message' => $group['message'] ?? '',
-            'occurrences' => (int) ($group['count'] ?? 0),
-            'users' => (int) ($group['users_count'] ?? count($group['users'] ?? [])),
+            'title' => $title,
+            'message' => $message !== '' ? $message : null,
+            'status' => $group['status'] ?? 'open',
+            'priority' => $group['priority'] ?? null,
             'first_seen_at' => $group['first_seen_at'] ?? null,
             'last_seen_at' => $group['last_seen_at'] ?? null,
+            'occurrences' => (int) ($group['count'] ?? 0),
+            'users' => (int) ($group['users_count'] ?? count($group['users'] ?? [])),
+            'handled' => $isException ? ($group['handled'] ?? null) : null,
+            'environment' => $group['environment'] ?? null,
+            'location' => $isException ? ($group['location'] ?? null) : null,
+            'php_version' => $isException ? ($group['php_version'] ?? null) : null,
+            'laravel_version' => $isException ? ($group['laravel_version'] ?? null) : null,
+            'subtype' => $group['subtype'] ?? null,
+            'route' => ! $isException ? $title : null,
+            'action' => null,
+            'threshold_ms' => ! $isException ? ($group['threshold_ms'] ?? null) : null,
+            'duration_ms' => ! $isException ? ($group['duration_ms'] ?? null) : null,
         ];
-
-        if ($issueType === 'exception') {
-            $issue['handled'] = $group['handled'] ?? null;
-            $issue['environment'] = $group['environment'] ?? null;
-            $issue['location'] = $group['location'] ?? null;
-            $issue['php_version'] = $group['php_version'] ?? null;
-            $issue['laravel_version'] = $group['laravel_version'] ?? null;
-        } else {
-            $issue['threshold_ms'] = $group['threshold_ms'] ?? null;
-            $issue['duration_ms'] = $group['duration_ms'] ?? null;
-        }
 
         $payload = json_encode([
             'event' => 'issue.new',
             'app' => $appName,
+            'app_id' => $this->appId,
+            'view_url' => $this->buildViewUrl($issueId),
             'issue' => $issue,
             'timestamp' => date('c'),
         ], JSON_INVALID_UTF8_SUBSTITUTE);

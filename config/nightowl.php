@@ -34,6 +34,13 @@ return [
         'host' => env('NIGHTOWL_AGENT_HOST', '127.0.0.1'),
         'port' => env('NIGHTOWL_AGENT_PORT', 2407),
         'token' => env('NIGHTOWL_TOKEN', env('NIGHTWATCH_TOKEN')),
+
+        // Platform app ID for this connected app — shown in the NightOwl
+        // dashboard under Settings. When set, the agent embeds it in webhook
+        // payloads (alongside view_url) so receivers can round-trip back to
+        // the dashboard. Without it, alert webhooks still fire but ship
+        // app_id=null and omit the direct-link view_url.
+        'app_id' => env('NIGHTOWL_APP_ID'),
         'driver' => env('NIGHTOWL_AGENT_DRIVER', 'async'),
         'sqlite_path' => env('NIGHTOWL_AGENT_SQLITE_PATH', storage_path('nightowl/agent-buffer.sqlite')),
         'drain_interval_ms' => env('NIGHTOWL_DRAIN_INTERVAL_MS', 100),
