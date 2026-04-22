@@ -38,6 +38,8 @@ final class DrainWorker
         private int $workerId = 0,
         private int $totalWorkers = 1,
         private int $thresholdCacheTtl = 86400,
+        private string $appName = 'NightOwl',
+        private string $environment = 'production',
     ) {}
 
     /**
@@ -64,12 +66,14 @@ final class DrainWorker
         // Create own connections — NOT inherited from parent
         $buffer = new SqliteBuffer($this->sqlitePath);
         $writer = new RecordWriter(
-            $this->pgHost,
-            $this->pgPort,
-            $this->pgDatabase,
-            $this->pgUsername,
-            $this->pgPassword,
-            $this->thresholdCacheTtl,
+            host: $this->pgHost,
+            port: $this->pgPort,
+            database: $this->pgDatabase,
+            username: $this->pgUsername,
+            password: $this->pgPassword,
+            thresholdCacheTtl: $this->thresholdCacheTtl,
+            appName: $this->appName,
+            environment: $this->environment,
         );
 
         $workerLabel = $this->totalWorkers > 1

@@ -75,8 +75,9 @@ final class RecordWriter
             config('app.name', 'NightOwl'),
             // NIGHTOWL_ENVIRONMENT overrides APP_ENV for rare cases where the
             // agent runs outside the Laravel app (standalone harness) or
-            // customers want an explicit label like "prod-us-east".
-            env('NIGHTOWL_ENVIRONMENT', config('app.env', 'production')),
+            // customers want an explicit label like "prod-us-east". Read via
+            // the config key so `php artisan config:cache` doesn't nuke it.
+            config('nightowl.environment') ?: config('app.env', 'production'),
         );
     }
 

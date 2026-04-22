@@ -121,6 +121,21 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Environment Override
+    |--------------------------------------------------------------------------
+    |
+    | Stamped on every telemetry row as the `environment` column, and used
+    | in the issue dedup key (group_hash, type, environment). Leave null to
+    | fall back to APP_ENV — set this only for rare cases like standalone
+    | harnesses running outside the host Laravel app, or when you want a
+    | custom label like "prod-us-east". Pulled in via env() at config-load
+    | so `php artisan config:cache` preserves it.
+    |
+    */
+    'environment' => env('NIGHTOWL_ENVIRONMENT'),
+
+    /*
+    |--------------------------------------------------------------------------
     | Dashboard
     |--------------------------------------------------------------------------
     |

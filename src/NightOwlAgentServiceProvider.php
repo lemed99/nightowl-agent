@@ -86,15 +86,17 @@ class NightOwlAgentServiceProvider extends ServiceProvider
 
         $this->app->singleton(DrainWorker::class, function ($app) {
             return new DrainWorker(
-                config('nightowl.agent.sqlite_path', storage_path('nightowl/agent-buffer.sqlite')),
-                config('nightowl.database.host', '127.0.0.1'),
-                (int) config('nightowl.database.port', 5432),
-                config('nightowl.database.database', 'nightowl'),
-                config('nightowl.database.username', 'nightowl'),
-                config('nightowl.database.password', 'nightowl'),
-                (int) config('nightowl.agent.drain_batch_size', 1000),
-                (int) config('nightowl.agent.drain_interval_ms', 100),
-                (int) config('nightowl.agent.drain_max_wait_ms', 5000),
+                sqlitePath: config('nightowl.agent.sqlite_path', storage_path('nightowl/agent-buffer.sqlite')),
+                pgHost: config('nightowl.database.host', '127.0.0.1'),
+                pgPort: (int) config('nightowl.database.port', 5432),
+                pgDatabase: config('nightowl.database.database', 'nightowl'),
+                pgUsername: config('nightowl.database.username', 'nightowl'),
+                pgPassword: config('nightowl.database.password', 'nightowl'),
+                batchSize: (int) config('nightowl.agent.drain_batch_size', 1000),
+                intervalMs: (int) config('nightowl.agent.drain_interval_ms', 100),
+                maxWaitMs: (int) config('nightowl.agent.drain_max_wait_ms', 5000),
+                appName: config('app.name', 'NightOwl'),
+                environment: config('nightowl.environment') ?: config('app.env', 'production'),
             );
         });
 
