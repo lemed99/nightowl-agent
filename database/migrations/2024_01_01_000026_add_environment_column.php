@@ -58,8 +58,27 @@ return new class extends Migration
                 ->update(['environment' => $env]);
         }
 
-        // Swap the issue dedup unique constraint AFTER backfill, so the new
-        // constraint doesn't violate on existing rows.
+        // The old unique key was (group_hash, type, deploy). The same fingerprint
+        // could legitimately exist across deploys with different statuses (e.g.
+        // resolved under deploy=abc, open under deploy=def). Backfilling a single
+        // environment value collapses those into duplicates that would violate
+        // the new unique. Keep the most-recent row per (group_hash, type, env) —
+        // matches runtime upsert semantics (a new occurrence reopens/updates the
+        // existing row) — and delete the rest.
+        $connection->statement("
+            DELETE FROM nightowl_issues
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY group_hash, type, environment
+                        ORDER BY last_seen_at DESC NULLS LAST, id DESC
+                    ) AS rn
+                    FROM nightowl_issues
+                ) ranked
+                WHERE ranked.rn > 1
+            )
+        ");
+
         $schema->table('nightowl_issues', function (Blueprint $t) {
             $t->dropUnique(['group_hash', 'type', 'deploy']);
             $t->unique(['group_hash', 'type', 'environment']);
