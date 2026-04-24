@@ -403,7 +403,7 @@ class AgentSystemTest extends TestCase
         $exceptionClass = 'App\\Exceptions\\SystemTestException';
         $file = 'app/Services/Payment.php';
         $line = 42;
-        $fingerprint = md5($exceptionClass.$file.$line);
+        $fingerprint = md5($exceptionClass.'|'.'0'.'|'.$file.'|'.$line);
 
         $this->sendAndExpectOk([
             $this->sim->makeRequest([
@@ -443,7 +443,7 @@ class AgentSystemTest extends TestCase
         $exceptionClass = 'App\\Exceptions\\DuplicateSystemTest';
         $file = 'app/Dup.php';
         $line = 10;
-        $fingerprint = md5($exceptionClass.$file.$line);
+        $fingerprint = md5($exceptionClass.'|'.'0'.'|'.$file.'|'.$line);
 
         // Send 5 separate payloads with the same exception fingerprint
         for ($i = 0; $i < 5; $i++) {
@@ -638,7 +638,7 @@ class AgentSystemTest extends TestCase
             $class = $exceptionClasses[$i % 3];
             $file = 'app/Storm.php';
             $line = ($i % 3) + 1; // 3 distinct fingerprints
-            $fingerprint = md5($class.$file.$line);
+            $fingerprint = md5($class.'|'.'0'.'|'.$file.'|'.$line);
             $expectedFingerprints[$fingerprint] = true;
 
             $this->sendAndExpectOk([
@@ -713,7 +713,7 @@ class AgentSystemTest extends TestCase
         $this->assertSame('failed', $failedJob['status']);
 
         // Failed job's exception should create an issue
-        $fp = md5('App\\Exceptions\\PaymentTimeout'.'app/Jobs/ProcessPayment.php'.'88');
+        $fp = md5('App\\Exceptions\\PaymentTimeout'.'|'.'0'.'|'.'app/Jobs/ProcessPayment.php'.'|'.'88');
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fp}'");
         $this->assertNotNull($issue);
     }

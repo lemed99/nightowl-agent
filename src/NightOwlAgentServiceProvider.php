@@ -16,7 +16,6 @@ use NightOwl\Agent\Redactor;
 use NightOwl\Agent\Sampler;
 use NightOwl\Agent\Server;
 use NightOwl\Commands\AgentCommand;
-use NightOwl\Commands\CheckThresholdsCommand;
 use NightOwl\Commands\ClearCommand;
 use NightOwl\Commands\InstallCommand;
 use NightOwl\Commands\PruneCommand;
@@ -174,7 +173,6 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 InstallCommand::class,
                 PruneCommand::class,
                 ClearCommand::class,
-                CheckThresholdsCommand::class,
             ]);
         }
     }

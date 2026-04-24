@@ -87,14 +87,11 @@ src/Agent/
   ConnectionHandler.php  — Sync payload handler
 src/Support/
   MultiIngest.php        — Nightwatch coexistence adapter (fan-out wrapper)
-src/Notifications/
-  BrandedMail.php, ThresholdExceeded.php
 src/Commands/
   AgentCommand.php        — nightowl:agent [--driver=async|sync]
   InstallCommand.php      — nightowl:install
   PruneCommand.php        — nightowl:prune (retention cleanup)
   ClearCommand.php        — nightowl:clear (truncate all tables)
-  CheckThresholdsCommand.php — nightowl:check-thresholds
 ```
 
 ## Artisan Commands
@@ -105,15 +102,14 @@ src/Commands/
 | `nightowl:install` | Publish config, run migrations |
 | `nightowl:prune` | Delete telemetry older than retention (14d default) |
 | `nightowl:clear` | Truncate all NightOwl tables |
-| `nightowl:check-thresholds` | Poll and dispatch threshold notifications |
 
 ## Database
 
-24 migrations, 17 tables (12 telemetry + 3 issues + alerts/channels/settings):
+25 migrations, 16 tables (12 telemetry + 3 issues + alert_channels/settings):
 
 - **Telemetry**: requests, queries, exceptions, commands, jobs, cache_events, mail, notifications, outgoing_requests, scheduled_tasks, logs, users
 - **Issues**: issues (fingerprint upsert, subtype: exception/performance/health, threshold_metrics, deploy), issue_activity (with `actor_type`/`actor_meta` for MCP), issue_comments (with actor columns)
-- **Alerts**: alerts, alert_channels, settings
+- **Alerts**: alert_channels, settings
 
 **DB connection name**: `nightowl` (registered by service provider).
 

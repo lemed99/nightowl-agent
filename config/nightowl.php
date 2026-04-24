@@ -136,35 +136,6 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Dashboard
-    |--------------------------------------------------------------------------
-    |
-    | URL of the hosted NightOwl dashboard.
-    |
-    */
-    'dashboard_url' => 'https://api.usenightowl.com',
-
-    /*
-    |--------------------------------------------------------------------------
-    | Alerts
-    |--------------------------------------------------------------------------
-    |
-    | Configure alerting for exceptions and performance thresholds.
-    |
-    */
-    'alerts' => [
-        'enabled' => env('NIGHTOWL_ALERTS_ENABLED', true),
-        'channels' => ['mail'],
-        'mail_to' => env('NIGHTOWL_ALERT_EMAIL'),
-        'slack_webhook' => env('NIGHTOWL_SLACK_WEBHOOK'),
-        'cooldown_minutes' => 60,
-        'error_rate_threshold' => 5,
-        'avg_duration_threshold_ms' => 2000,
-        'threshold_window_minutes' => 5,
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
     | Performance Thresholds
     |--------------------------------------------------------------------------
     |

@@ -344,7 +344,7 @@ class AgentFeaturesSystemTest extends TestCase
 
         // Exception record and issue also stored
         $this->assertGreaterThanOrEqual(1, self::rowCount('nightowl_exceptions', "execution_id = '{$traceId}'"));
-        $fp = md5($excClass.$file.$line);
+        $fp = md5($excClass.'|'.'0'.'|'.$file.'|'.$line);
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fp}'");
         $this->assertNotNull($issue);
     }
@@ -765,7 +765,7 @@ class AgentFeaturesSystemTest extends TestCase
         $this->assertNotEmpty($perfIssues, 'Slow request should create performance issue');
 
         // 4. EXCEPTION: issue also created
-        $fp = md5($excClass.$file.$line);
+        $fp = md5($excClass.'|'.'0'.'|'.$file.'|'.$line);
         $excIssue = self::fetch('nightowl_issues', "group_hash = '{$fp}' AND type = 'exception'");
         $this->assertNotNull($excIssue, 'Exception issue should exist alongside performance issue');
     }

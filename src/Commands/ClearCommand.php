@@ -23,7 +23,6 @@ class ClearCommand extends Command
         'nightowl_notifications',
         'nightowl_outgoing_requests',
         'nightowl_scheduled_tasks',
-        'nightowl_alerts',
     ];
 
     public function handle(): int

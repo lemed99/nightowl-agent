@@ -133,7 +133,7 @@ class RecordWriterTest extends TestCase
 
         $this->writer->write([$record]);
 
-        $fingerprint = md5('App\\Exceptions\\TestException'.'app/Test.php'.'42');
+        $fingerprint = md5('App\\Exceptions\\TestException'.'|'.'0'.'|'.'app/Test.php'.'|'.'42');
         $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetch(PDO::FETCH_ASSOC);
         $this->assertNotFalse($issue);
         $this->assertSame('exception', $issue['type']);
@@ -154,7 +154,7 @@ class RecordWriterTest extends TestCase
         $this->writer->write([$this->sim->makeException(array_merge($baseRecord, ['trace_id' => 'dup-2']))]);
         $this->writer->write([$this->sim->makeException(array_merge($baseRecord, ['trace_id' => 'dup-3']))]);
 
-        $fingerprint = md5('App\\Exceptions\\DuplicateTest'.'app/Dup.php'.'10');
+        $fingerprint = md5('App\\Exceptions\\DuplicateTest'.'|'.'0'.'|'.'app/Dup.php'.'|'.'10');
         $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetch(PDO::FETCH_ASSOC);
         $this->assertSame(3, (int) $issue['occurrences_count']);
     }
@@ -380,7 +380,7 @@ class RecordWriterTest extends TestCase
             'file' => 'app/UserCount.php',
             'line' => 99,
         ];
-        $fingerprint = md5('App\\Exceptions\\UserCountTest'.'app/UserCount.php'.'99');
+        $fingerprint = md5('App\\Exceptions\\UserCountTest'.'|'.'0'.'|'.'app/UserCount.php'.'|'.'99');
 
         // Batch 1: user_A and user_B
         $this->writer->write([
@@ -419,7 +419,7 @@ class RecordWriterTest extends TestCase
             'file' => 'app/NullUser.php',
             'line' => 50,
         ];
-        $fingerprint = md5('App\\Exceptions\\NullUserTest'.'app/NullUser.php'.'50');
+        $fingerprint = md5('App\\Exceptions\\NullUserTest'.'|'.'0'.'|'.'app/NullUser.php'.'|'.'50');
 
         // Exceptions with null user_id
         $this->writer->write([

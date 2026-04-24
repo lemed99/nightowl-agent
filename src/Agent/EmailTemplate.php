@@ -6,7 +6,7 @@ namespace NightOwl\Agent;
  * Fork-safe HTML email template builder.
  *
  * Produces branded NightOwl emails via string concatenation (no Blade).
- * Used by AlertNotifier (forked drain worker) and ThresholdExceeded (Laravel notification).
+ * Used by AlertNotifier (forked drain worker) for issue alerts.
  *
  * Renders are tested against Gmail (strips SVG + position:absolute), Outlook desktop
  * (drops rgba + span padding), Apple Mail, and mobile clients. The output matches
@@ -192,42 +192,6 @@ final class EmailTemplate
             'cache' => 'Cache',
             default => ucwords(str_replace('_', ' ', $subtype ?? 'route')),
         };
-    }
-
-    /**
-     * Render a threshold alert email (high error rate or slow response).
-     */
-    public static function renderThreshold(string $appName, string $type, string $title, string $message, string $frontendUrl = ''): string
-    {
-        $e = fn (string $s): string => htmlspecialchars($s, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-
-        $typeLabel = match ($type) {
-            'high_error_rate' => 'High Error Rate',
-            'slow_response' => 'Slow Response',
-            default => ucwords(str_replace('_', ' ', $type)),
-        };
-
-        $badgeCell = '<td style="background-color:#392c16;color:#fbbf24;font-size:11px;font-weight:600;'
-            . 'text-transform:uppercase;letter-spacing:0.5px;padding:4px 12px;border-radius:2px;'
-            . 'border-left:3px solid #f59e0b;">Alert</td>';
-
-        $header = '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px;">'
-            . '<tr><td align="center" style="padding-bottom:14px;">' . self::pillTable($badgeCell) . '</td></tr>'
-            . '<tr><td align="center" style="font-size:18px;font-weight:700;color:#fafafa;line-height:1.4;padding-bottom:12px;word-break:break-word;">'
-            . $e($title)
-            . '</td></tr>'
-            . '</table>';
-
-        $details = self::section('Details', self::kvTable([
-            'Application' => $e($appName),
-            'Type' => $typeLabel,
-        ]), '18px');
-
-        $messageSection = self::textSection('Message', $e($message), '20px');
-
-        $preheader = $typeLabel . ' — ' . $title;
-
-        return self::layout($e($title), $preheader, $header . $details . $messageSection, $e($appName), $frontendUrl);
     }
 
     // ─── Building blocks ─────────────────────────────────────────────

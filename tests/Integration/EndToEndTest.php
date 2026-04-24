@@ -219,7 +219,7 @@ class EndToEndTest extends TestCase
         $this->assertSame('App\\Exceptions\\PaymentFailed', $exception['class']);
 
         // Issue auto-created
-        $fingerprint = md5('App\\Exceptions\\PaymentFailed'.'app/Services/Payment.php'.'42');
+        $fingerprint = md5('App\\Exceptions\\PaymentFailed'.'|'.'0'.'|'.'app/Services/Payment.php'.'|'.'42');
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fingerprint}'");
         $this->assertNotNull($issue);
         $this->assertSame('open', $issue['status']);
@@ -249,7 +249,7 @@ class EndToEndTest extends TestCase
             $this->assertSame('2:OK', $response);
         }
 
-        $fingerprint = md5('App\\Exceptions\\DupE2E'.'app/Dup.php'.'10');
+        $fingerprint = md5('App\\Exceptions\\DupE2E'.'|'.'0'.'|'.'app/Dup.php'.'|'.'10');
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fingerprint}'");
 
         $this->assertSame(3, (int) $issue['occurrences_count']);
@@ -327,7 +327,7 @@ class EndToEndTest extends TestCase
         $job = self::fetch('nightowl_jobs', "trace_id = 'e2e-fail-001'");
         $this->assertSame('failed', $job['status']);
 
-        $fingerprint = md5('App\\Exceptions\\PaymentTimeout'.'app/Jobs/ProcessPayment.php'.'88');
+        $fingerprint = md5('App\\Exceptions\\PaymentTimeout'.'|'.'0'.'|'.'app/Jobs/ProcessPayment.php'.'|'.'88');
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fingerprint}'");
         $this->assertNotNull($issue);
     }

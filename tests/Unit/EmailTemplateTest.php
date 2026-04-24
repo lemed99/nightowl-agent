@@ -119,10 +119,10 @@ class EmailTemplateTest extends TestCase
             'message' => 'm',
             'count' => 1,
             'users_count' => 0,
-            'view_url' => 'https://app.usenightowl.com/dashboard',
+            'view_url' => 'https://usenightowl.com/dashboard',
         ], 'exception');
 
-        $this->assertStringContainsString('https://app.usenightowl.com/dashboard', $html);
+        $this->assertStringContainsString('https://usenightowl.com/dashboard', $html);
         $this->assertStringContainsString('View issue', $html);
     }
 
@@ -136,22 +136,5 @@ class EmailTemplateTest extends TestCase
         ], 'exception');
 
         $this->assertStringNotContainsString('View issue', $html);
-    }
-
-    public function test_render_threshold_includes_type_label(): void
-    {
-        $html = EmailTemplate::renderThreshold('App', 'high_error_rate', 'Errors spiked', 'detail message');
-
-        $this->assertStringContainsString('High Error Rate', $html);
-        $this->assertStringContainsString('Errors spiked', $html);
-        $this->assertStringContainsString('detail message', $html);
-    }
-
-    public function test_render_threshold_escapes_title_and_message(): void
-    {
-        $html = EmailTemplate::renderThreshold('App', 'slow_response', '<b>oops</b>', '<i>bad</i>');
-
-        $this->assertStringNotContainsString('<b>oops</b>', $html);
-        $this->assertStringContainsString('&lt;b&gt;oops&lt;/b&gt;', $html);
     }
 }

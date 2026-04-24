@@ -24,7 +24,6 @@ class PruneCommand extends Command
         'nightowl_outgoing_requests',
         'nightowl_scheduled_tasks',
         'nightowl_logs',
-        'nightowl_alerts',
     ];
 
     public function handle(): int

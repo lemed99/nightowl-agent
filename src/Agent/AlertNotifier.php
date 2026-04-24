@@ -43,7 +43,7 @@ final class AlertNotifier
 
         return new self(
             (int) config('nightowl.threshold_cache_ttl', 86400),
-            (string) config('app.frontend_url', ''),
+            'https://usenightowl.com',
             is_string($appId) && $appId !== '' ? $appId : null,
         );
     }
@@ -484,6 +484,21 @@ final class AlertNotifier
             $blocks[] = ['type' => 'context', 'elements' => $contextElements];
         }
 
+        $viewUrl = $this->buildViewUrl($issueId);
+        if ($viewUrl !== null) {
+            $blocks[] = [
+                'type' => 'actions',
+                'elements' => [
+                    [
+                        'type' => 'button',
+                        'text' => ['type' => 'plain_text', 'text' => 'View issue'],
+                        'url' => $viewUrl,
+                        'style' => 'primary',
+                    ],
+                ],
+            ];
+        }
+
         $blocks[] = [
             'type' => 'context',
             'elements' => [['type' => 'mrkdwn', 'text' => 'NightOwl']],
@@ -582,20 +597,25 @@ final class AlertNotifier
         $discordTitle = $isException ? "\xF0\x9F\x9A\xA8  New Issue" : "\xE2\x9A\xA1  Performance Alert";
         $discordColor = $isException ? 0xDC2626 : 0xF59E0B;
 
+        $embed = [
+            'author' => ['name' => 'NightOwl', 'icon_url' => $logoUrl],
+            'title' => $discordTitle,
+            'description' => $description,
+            'color' => $discordColor,
+            'fields' => array_slice($fields, 0, 25),
+            'footer' => ['text' => 'NightOwl', 'icon_url' => $logoUrl],
+            'timestamp' => date('c'),
+        ];
+
+        $viewUrl = $this->buildViewUrl($issueId);
+        if ($viewUrl !== null) {
+            $embed['url'] = $viewUrl;
+        }
+
         $payload = [
             'username' => 'NightOwl',
             'avatar_url' => $logoUrl,
-            'embeds' => [
-                [
-                    'author' => ['name' => 'NightOwl', 'icon_url' => $logoUrl],
-                    'title' => $discordTitle,
-                    'description' => $description,
-                    'color' => $discordColor,
-                    'fields' => array_slice($fields, 0, 25),
-                    'footer' => ['text' => 'NightOwl', 'icon_url' => $logoUrl],
-                    'timestamp' => date('c'),
-                ],
-            ],
+            'embeds' => [$embed],
         ];
 
         $this->httpPost($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));

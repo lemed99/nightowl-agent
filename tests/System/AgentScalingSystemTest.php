@@ -361,7 +361,7 @@ class AgentScalingSystemTest extends TestCase
         $this->assertSame(5, self::rowCount('nightowl_exceptions', "trace_id LIKE '{$tag}-exc-%'"));
 
         // Issue upsert should work correctly even when two workers race
-        $fp = md5('App\\Exceptions\\MultiWorkerTest'.'app/MultiWorker.php'.'1');
+        $fp = md5('App\\Exceptions\\MultiWorkerTest'.'|'.'0'.'|'.'app/MultiWorker.php'.'|'.'1');
         $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fp}'")->fetch(PDO::FETCH_ASSOC);
         $this->assertNotFalse($issue);
         $this->assertSame(5, (int) $issue['occurrences_count']);

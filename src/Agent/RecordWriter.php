@@ -350,7 +350,14 @@ final class RecordWriter
         $issueGroups = [];
 
         foreach ($records as $r) {
-            $fingerprint = md5(($r['class'] ?? '').($r['file'] ?? '').($r['line'] ?? ''));
+            // Prefer the Nightwatch SDK's `_group` (xxh128 of class,code,file,line).
+            // It includes `code` — which for QueryException is the SQLSTATE — so
+            // "Duplicate table" (42P07) and "Undefined table" (42P01) thrown from
+            // the same PDO throw site don't collapse into one issue. Fall back to
+            // a local hash only if `_group` is missing (older SDKs or raw UDP).
+            $fingerprint = ! empty($r['_group'])
+                ? (string) $r['_group']
+                : md5(($r['class'] ?? '').'|'.($r['code'] ?? '').'|'.($r['file'] ?? '').'|'.($r['line'] ?? ''));
             $deploy = $r['deploy'] ?? null;
             $groupKey = $fingerprint.'|'.$this->environment;
 
