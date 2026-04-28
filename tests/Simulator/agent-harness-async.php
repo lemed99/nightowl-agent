@@ -25,8 +25,6 @@ require_once __DIR__.'/../../vendor/autoload.php';
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
-use NightOwl\Agent\Redactor;
-use NightOwl\Agent\Sampler;
 use NightOwl\Tests\Integration\MigrationRunner;
 
 if (! function_exists('pcntl_fork') || ! function_exists('posix_kill')) {
@@ -34,7 +32,7 @@ if (! function_exists('pcntl_fork') || ! function_exists('posix_kill')) {
     exit(1);
 }
 
-$options = getopt('', ['token:', 'host:', 'port:', 'db-host:', 'db-port:', 'db-name:', 'db-user:', 'db-pass:', 'drain-workers:', 'sample-rate:', 'redact-keys:', 'threshold-cache-ttl:', 'max-pending-rows:', 'drain-interval:']);
+$options = getopt('', ['token:', 'host:', 'port:', 'db-host:', 'db-port:', 'db-name:', 'db-user:', 'db-pass:', 'drain-workers:', 'threshold-cache-ttl:', 'max-pending-rows:', 'drain-interval:']);
 
 $token = $options['token'] ?? null;
 if (! $token) {
@@ -70,9 +68,6 @@ fwrite(STDOUT, "Tables ready.\n");
 $sqlitePath = sys_get_temp_dir().'/nightowl-harness-'.getmypid().'.sqlite';
 
 $drainWorkers = (int) ($options['drain-workers'] ?? 1);
-$sampleRate = (float) ($options['sample-rate'] ?? 1.0);
-$redactKeysRaw = $options['redact-keys'] ?? '';
-$redactKeys = $redactKeysRaw !== '' ? explode(',', $redactKeysRaw) : [];
 $thresholdCacheTtl = (int) ($options['threshold-cache-ttl'] ?? 86400);
 $maxPendingRows = (int) ($options['max-pending-rows'] ?? 100_000);
 $drainIntervalMs = (int) ($options['drain-interval'] ?? 50);
@@ -92,8 +87,6 @@ $server = new AsyncServer(
         intervalMs: $drainIntervalMs,
         thresholdCacheTtl: $thresholdCacheTtl,
     ),
-    sampler: new Sampler(sampleRate: $sampleRate),
-    redactor: new Redactor(keys: $redactKeys, enabled: ! empty($redactKeys)),
     token: $token,
     maxPendingRows: $maxPendingRows,
     maxBufferMemory: 256 * 1024 * 1024,

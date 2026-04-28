@@ -17,8 +17,6 @@ require_once __DIR__ . '/../../vendor/autoload.php';
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
-use NightOwl\Agent\Redactor;
-use NightOwl\Agent\Sampler;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 
 if (! function_exists('pcntl_fork')) {
@@ -108,8 +106,6 @@ for ($i = 0; $i < $instanceCount; $i++) {
                 pgHost: '127.0.0.1', pgPort: 1, pgDatabase: 'x', pgUsername: 'x', pgPassword: 'x',
                 batchSize: 1000, intervalMs: 2000,
             ),
-            sampler: new Sampler(1.0),
-            redactor: new Redactor([], false),
             token: $token,
             maxPendingRows: 10_000_000,
             maxBufferMemory: 1024 * 1024 * 1024,

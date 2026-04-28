@@ -5,14 +5,12 @@ namespace NightOwl\Tests\Integration;
 use NightOwl\Agent\ConnectionHandler;
 use NightOwl\Agent\PayloadParser;
 use NightOwl\Agent\RecordWriter;
-use NightOwl\Agent\Redactor;
-use NightOwl\Agent\Sampler;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
 
 /**
- * End-to-end tests: Simulator → Parser → Sampler → Redactor → RecordWriter → PostgreSQL.
+ * End-to-end tests: Simulator → Parser → RecordWriter → PostgreSQL.
  *
  * Validates the full pipeline without TCP/fork — uses ConnectionHandler directly
  * with a real RecordWriter connected to PostgreSQL.
@@ -71,8 +69,6 @@ class EndToEndTest extends TestCase
         $this->handler = new ConnectionHandler(
             parser: new PayloadParser(gzipEnabled: true),
             writer: $writer,
-            sampler: new Sampler(sampleRate: 1.0),
-            redactor: new Redactor(keys: ['password', 'secret'], enabled: true),
             token: $this->token,
         );
 
@@ -357,29 +353,6 @@ class EndToEndTest extends TestCase
         $this->assertNotNull($cmd);
         $this->assertSame('migrate', $cmd['command']);
         $this->assertSame(0, (int) $cmd['exit_code']);
-    }
-
-    // ─── Redaction works in pipeline ───────────────────────
-
-    public function test_redaction_applied_before_storage_e2_e(): void
-    {
-        $records = [
-            $this->sim->makeRequest([
-                'trace_id' => 'e2e-redact-001',
-                'password' => 'super-secret-123',
-                'secret' => 'api-key-xyz',
-            ]),
-        ];
-
-        $response = $this->handleWire($this->buildWire($records));
-        $this->assertSame('2:OK', $response);
-
-        // The request was stored — verify redaction happened
-        // Note: 'password' and 'secret' are not standard request columns,
-        // so they won't appear in the DB. But the record was processed
-        // through the pipeline without error.
-        $request = self::fetch('nightowl_requests', "trace_id = 'e2e-redact-001'");
-        $this->assertNotNull($request);
     }
 
     // ─── All 12 types in single payload ────────────────────

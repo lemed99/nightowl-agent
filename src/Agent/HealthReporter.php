@@ -6,7 +6,7 @@ use React\EventLoop\LoopInterface;
 use React\Http\Browser;
 
 /**
- * Non-blocking health reporter that POSTs agent status to the dashboard
+ * Non-blocking health reporter that POSTs agent status to the api
  * with adaptive intervals based on health status.
  *
  * Uses react/http Browser for async HTTP — never blocks the event loop.
@@ -22,7 +22,7 @@ final class HealthReporter
     private array $intervals;
 
     public function __construct(
-        private string $dashboardUrl,
+        private string $apiUrl,
         private string $token,
         private string $tenantId = '',
         array $intervals = [],
@@ -37,7 +37,7 @@ final class HealthReporter
     public function start(LoopInterface $loop, AsyncServer $agent): void
     {
         $browser = new Browser();
-        $url = rtrim($this->dashboardUrl, '/') . '/agent/health';
+        $url = rtrim($this->apiUrl, '/') . '/agent/health';
         $instanceId = gethostname() . ':' . getmypid();
 
         $scheduleNext = function () use (&$scheduleNext, $browser, $url, $instanceId, $agent, $loop) {

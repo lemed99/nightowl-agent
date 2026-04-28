@@ -4,9 +4,7 @@ namespace NightOwl\Tests\Unit;
 
 use NightOwl\Agent\ConnectionHandler;
 use NightOwl\Agent\PayloadParser;
-use NightOwl\Agent\Redactor;
 use NightOwl\Agent\RecordWriter;
-use NightOwl\Agent\Sampler;
 use PHPUnit\Framework\TestCase;
 
 class ConnectionHandlerTest extends TestCase
@@ -20,8 +18,6 @@ class ConnectionHandlerTest extends TestCase
      * For tests where write() should NOT be called, we expect no exception.
      */
     private function makeHandler(
-        ?Sampler $sampler = null,
-        ?Redactor $redactor = null,
         ?string $token = 'USE_DEFAULT',
     ): ConnectionHandler {
         // RecordWriter with impossible DSN — write() will throw PDOException
@@ -30,8 +26,6 @@ class ConnectionHandlerTest extends TestCase
         return new ConnectionHandler(
             parser: new PayloadParser(),
             writer: $writer,
-            sampler: $sampler ?? new Sampler(1.0),
-            redactor: $redactor ?? new Redactor([], false),
             token: $token === 'USE_DEFAULT' ? $this->token : $token,
         );
     }
@@ -166,54 +160,5 @@ class ConnectionHandlerTest extends TestCase
         $handler->handle($stream, $this->buildPayload('{not json}'));
 
         $this->assertSame('5:ERROR', $this->readResponse($stream));
-    }
-
-    // ─── Sampling integration ──────────────────────────────
-
-    public function testSamplerDroppedPayloadDoesNotWrite(): void
-    {
-        // Zero sample rate + normal request = dropped BEFORE write
-        $handler = $this->makeHandler(sampler: new Sampler(0.0));
-        $stream = $this->createStream();
-
-        $handler->handle($stream, $this->buildPayload(json_encode([['t' => 'request', 'status_code' => 200]])));
-
-        // No PDOException → write was never called
-        $this->assertSame('2:OK', $this->readResponse($stream));
-    }
-
-    public function testSamplerKeepsExceptionPayloadAndAttempsWrite(): void
-    {
-        // Zero sample rate BUT exception record = bypass → try write → PDOException
-        $handler = $this->makeHandler(sampler: new Sampler(0.0));
-        $stream = $this->createStream();
-
-        $this->expectException(\PDOException::class);
-        $handler->handle($stream, $this->buildPayload(json_encode([['t' => 'exception', 'class' => 'Error']])));
-    }
-
-    public function testSamplerKeeps5xxPayloadAndAttemptsWrite(): void
-    {
-        $handler = $this->makeHandler(sampler: new Sampler(0.0));
-        $stream = $this->createStream();
-
-        $this->expectException(\PDOException::class);
-        $handler->handle($stream, $this->buildPayload(json_encode([['t' => 'request', 'status_code' => 500]])));
-    }
-
-    // ─── Pipeline order verification ───────────────────────
-
-    public function testFullPipelineOrder(): void
-    {
-        // Redaction happens BEFORE write. If redaction is enabled and write throws,
-        // we know the pipeline ran parse → sample → redact → write.
-        $handler = $this->makeHandler(redactor: new Redactor(['password'], true));
-        $stream = $this->createStream();
-
-        $records = [['t' => 'request', 'password' => 'secret']];
-
-        // Should throw PDOException (write attempted after redaction)
-        $this->expectException(\PDOException::class);
-        $handler->handle($stream, $this->buildPayload(json_encode($records)));
     }
 }

@@ -17,8 +17,6 @@ require_once __DIR__.'/../../vendor/autoload.php';
 use NightOwl\Agent\ConnectionHandler;
 use NightOwl\Agent\PayloadParser;
 use NightOwl\Agent\RecordWriter;
-use NightOwl\Agent\Redactor;
-use NightOwl\Agent\Sampler;
 use NightOwl\Agent\Server;
 use NightOwl\Tests\Integration\MigrationRunner;
 
@@ -60,14 +58,10 @@ fwrite(STDOUT, "Tables ready.\n");
 // Wire up the agent pipeline
 $writer = new RecordWriter($dbHost, $dbPort, $dbName, $dbUser, $dbPass);
 $parser = new PayloadParser(gzipEnabled: true);
-$sampler = new Sampler(sampleRate: 1.0);
-$redactor = new Redactor(keys: [], enabled: false);
 
 $handler = new ConnectionHandler(
     parser: $parser,
     writer: $writer,
-    sampler: $sampler,
-    redactor: $redactor,
     token: $token,
 );
 

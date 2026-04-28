@@ -9,8 +9,6 @@ final class ConnectionHandler
     public function __construct(
         private PayloadParser $parser,
         private RecordWriter $writer,
-        private Sampler $sampler,
-        private Redactor $redactor,
         ?string $token = null,
     ) {
         $this->expectedTokenHash = $token !== null
@@ -69,19 +67,8 @@ final class ConnectionHandler
             }
         }
 
-        // Write records to database
         if ($result['type'] === 'json') {
-            // Sampling — drop non-critical payloads transparently
-            if (! $this->sampler->shouldKeep($result['records'])) {
-                fwrite($stream, '2:OK');
-
-                return;
-            }
-
-            // Redaction — strip sensitive keys before storage
-            [$records] = $this->redactor->redact($result['records']);
-
-            $this->writer->write($records);
+            $this->writer->write($result['records']);
         }
 
         // Acknowledge

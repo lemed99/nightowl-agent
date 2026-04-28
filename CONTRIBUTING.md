@@ -56,7 +56,7 @@ Full run:
 NIGHTOWL_TEST_DB_PORT=5433 vendor/bin/phpunit
 ```
 
-Target a single test file with `vendor/bin/phpunit tests/Unit/Agent/SamplerTest.php`.
+Target a single test file with `vendor/bin/phpunit tests/Unit/PayloadParserTest.php`.
 
 ### Simulator
 

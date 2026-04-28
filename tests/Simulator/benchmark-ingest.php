@@ -17,8 +17,6 @@ require_once __DIR__ . '/../../vendor/autoload.php';
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
-use NightOwl\Agent\Redactor;
-use NightOwl\Agent\Sampler;
 use NightOwl\Agent\SqliteBuffer;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 
@@ -123,8 +121,6 @@ for ($i = 0; $i < $instances; $i++) {
                 batchSize: 1000,
                 intervalMs: 1000, // slow retry so it doesn't spam errors
             ),
-            sampler: new Sampler(sampleRate: 1.0),
-            redactor: new Redactor(keys: [], enabled: false),
             token: $token,
             maxPendingRows: 10_000_000, // 10M — effectively unlimited for this benchmark
             maxBufferMemory: 1024 * 1024 * 1024, // 1GB — won't trigger

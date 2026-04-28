@@ -21,8 +21,6 @@ require_once __DIR__.'/../../vendor/autoload.php';
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
-use NightOwl\Agent\Redactor;
-use NightOwl\Agent\Sampler;
 use NightOwl\Tests\Integration\MigrationRunner;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 
@@ -131,8 +129,6 @@ for ($i = 0; $i < $instances; $i++) {
                 batchSize: 1000,
                 intervalMs: 50,
             ),
-            sampler: new Sampler(sampleRate: 1.0),
-            redactor: new Redactor(keys: [], enabled: false),
             token: $token,
             maxPendingRows: 100_000,
             maxBufferMemory: 256 * 1024 * 1024,

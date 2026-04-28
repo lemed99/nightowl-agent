@@ -12,8 +12,6 @@ use NightOwl\Agent\ConnectionHandler;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
 use NightOwl\Agent\RecordWriter;
-use NightOwl\Agent\Redactor;
-use NightOwl\Agent\Sampler;
 use NightOwl\Agent\Server;
 use NightOwl\Commands\AgentCommand;
 use NightOwl\Commands\ClearCommand;
@@ -43,26 +41,6 @@ class NightOwlAgentServiceProvider extends ServiceProvider
             );
         });
 
-        $this->app->singleton(Sampler::class, function ($app) {
-            $requestRate = config('nightowl.agent.request_sample_rate');
-            $commandRate = config('nightowl.agent.command_sample_rate');
-            $scheduledRate = config('nightowl.agent.scheduled_task_sample_rate');
-
-            return new Sampler(
-                (float) config('nightowl.agent.sample_rate', 1.0),
-                $requestRate !== null ? (float) $requestRate : null,
-                $commandRate !== null ? (float) $commandRate : null,
-                $scheduledRate !== null ? (float) $scheduledRate : null,
-            );
-        });
-
-        $this->app->singleton(Redactor::class, function ($app) {
-            return new Redactor(
-                config('nightowl.agent.redact_keys', ['password', 'token', 'authorization', 'cookie', 'secret', 'api_key']),
-                (bool) config('nightowl.agent.redact_enabled', true),
-            );
-        });
-
         $this->app->singleton(RecordWriter::class, function ($app) {
             return RecordWriter::fromConfig();
         });
@@ -71,8 +49,6 @@ class NightOwlAgentServiceProvider extends ServiceProvider
             return new ConnectionHandler(
                 $app->make(PayloadParser::class),
                 $app->make(RecordWriter::class),
-                $app->make(Sampler::class),
-                $app->make(Redactor::class),
                 config('nightowl.agent.token'),
             );
         });
@@ -131,8 +107,6 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 $app->make(PayloadParser::class),
                 config('nightowl.agent.sqlite_path', storage_path('nightowl/agent-buffer.sqlite')),
                 $app->make(DrainWorker::class),
-                $app->make(Sampler::class),
-                $app->make(Redactor::class),
                 config('nightowl.agent.token'),
                 (int) config('nightowl.agent.max_pending_rows', 100_000),
                 (int) config('nightowl.agent.max_buffer_memory', 256 * 1024 * 1024),

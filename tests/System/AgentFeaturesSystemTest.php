@@ -8,11 +8,10 @@ use PDO;
 use PHPUnit\Framework\TestCase;
 
 /**
- * System tests for agent features: sampling, redaction, and performance thresholds.
+ * System tests for agent features: sampling and performance thresholds.
  *
  * Boots the real AsyncServer + DrainWorker pipeline with feature-specific config:
  * - Sample rate 0.0 (drop all non-critical)
- * - Redaction enabled for 'password', 'secret', 'authorization'
  * - Threshold cache TTL 0 (always re-read from DB)
  *
  * Requirements: PostgreSQL + pcntl + posix + port 2413 available.
@@ -121,11 +120,9 @@ class AgentFeaturesSystemTest extends TestCase
         }
 
         // Key config differences from AgentSystemTest:
-        //   --sample-rate=0.0        → drops all non-exception/non-5xx payloads
-        //   --redact-keys=...        → strips sensitive keys before PG storage
         //   --threshold-cache-ttl=0  → always re-reads thresholds from nightowl_settings
         $cmd = sprintf(
-            'exec php %s --token=%s --host=%s --port=%d --db-host=%s --db-port=%d --db-name=%s --db-user=%s --db-pass=%s --sample-rate=0.0 --redact-keys=password,secret,authorization,cookie --threshold-cache-ttl=0 2>&1',
+            'exec php %s --token=%s --host=%s --port=%d --db-host=%s --db-port=%d --db-name=%s --db-user=%s --db-pass=%s --threshold-cache-ttl=0 2>&1',
             escapeshellarg($harness),
             escapeshellarg(self::TOKEN),
             escapeshellarg(self::AGENT_HOST),
@@ -289,279 +286,6 @@ class AgentFeaturesSystemTest extends TestCase
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  SAMPLING TESTS (sample_rate = 0.0)
-    // ═══════════════════════════════════════════════════════════
-
-    public function test_sampling_drops_normal_requests(): void
-    {
-        $traceId = 'feat-sample-drop-'.uniqid();
-
-        // Normal 200 request — should be dropped (sample_rate=0.0)
-        $response = $this->sim->send([
-            $this->sim->makeRequest(['trace_id' => $traceId, 'status_code' => 200]),
-        ]);
-
-        // Agent accepts (2:OK) — the client doesn't know it was sampled out
-        $this->assertSame('2:OK', $response);
-
-        // Wait briefly, then verify nothing was stored
-        usleep(2_000_000); // 2s for drain to have run at least once
-        $this->assertSame(0, self::rowCount('nightowl_requests', "trace_id = '{$traceId}'"));
-    }
-
-    public function test_sampling_keeps_exception_payloads(): void
-    {
-        $traceId = 'feat-sample-exc-'.uniqid();
-        $excClass = 'App\\Exceptions\\SamplingTestException';
-        $file = 'app/Sampling.php';
-        $line = 99;
-
-        // Payload containing an exception — must be kept despite sample_rate=0.0
-        $response = $this->sim->send([
-            $this->sim->makeRequest([
-                'trace_id' => $traceId,
-                'status_code' => 500,
-                'exceptions' => 1,
-            ]),
-            $this->sim->makeException([
-                'trace_id' => 'feat-exc-detail-'.uniqid(),
-                'execution_id' => $traceId,
-                'class' => $excClass,
-                'message' => 'Sampling bypass test',
-                'file' => $file,
-                'line' => $line,
-            ]),
-        ]);
-
-        $this->assertSame('2:OK', $response);
-
-        // Exception bypasses sampling — MUST arrive in PG
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
-
-        $request = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
-        $this->assertNotNull($request, 'Exception payload must bypass sampling');
-        $this->assertSame(500, (int) $request['status_code']);
-
-        // Exception record and issue also stored
-        $this->assertGreaterThanOrEqual(1, self::rowCount('nightowl_exceptions', "execution_id = '{$traceId}'"));
-        $fp = md5($excClass.'|'.'0'.'|'.$file.'|'.$line);
-        $issue = self::fetch('nightowl_issues', "group_hash = '{$fp}'");
-        $this->assertNotNull($issue);
-    }
-
-    public function test_sampling_keeps5xx_requests(): void
-    {
-        $traceId = 'feat-sample-5xx-'.uniqid();
-
-        // 502 request without explicit exception record — still kept (5xx bypass)
-        $response = $this->sim->send([
-            $this->sim->makeRequest([
-                'trace_id' => $traceId,
-                'status_code' => 502,
-            ]),
-        ]);
-
-        $this->assertSame('2:OK', $response);
-
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
-
-        $request = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
-        $this->assertNotNull($request, '5xx requests must bypass sampling');
-        $this->assertSame(502, (int) $request['status_code']);
-    }
-
-    public function test_sampling_drops_normal_jobs_and_commands(): void
-    {
-        $jobTrace = 'feat-sample-job-'.uniqid();
-        $cmdTrace = 'feat-sample-cmd-'.uniqid();
-
-        // Normal job and command — both should be dropped
-        $this->sim->send([
-            $this->sim->makeJob(['trace_id' => $jobTrace, 'status' => 'processed']),
-        ]);
-        $this->sim->send([
-            $this->sim->makeCommand(['trace_id' => $cmdTrace, 'exit_code' => 0]),
-        ]);
-
-        usleep(2_000_000);
-        $this->assertSame(0, self::rowCount('nightowl_jobs', "trace_id = '{$jobTrace}'"));
-        $this->assertSame(0, self::rowCount('nightowl_commands', "trace_id = '{$cmdTrace}'"));
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  REDACTION TESTS (redact_keys = password,secret,authorization,cookie)
-    //
-    //  The redactor walks the PHP array structure of each record and
-    //  replaces matching keys with [REDACTED]. It does NOT parse
-    //  pre-encoded JSON strings (e.g. headers stored as a JSON string).
-    //
-    //  To test redaction, we pass context/headers as arrays (not pre-encoded
-    //  strings). RecordWriter's COPY path then json_encodes the redacted
-    //  arrays for storage.
-    // ═══════════════════════════════════════════════════════════
-
-    public function test_redaction_strips_password_from_context(): void
-    {
-        $traceId = 'feat-redact-ctx-'.uniqid();
-
-        // Send context as a nested array (not pre-encoded JSON string)
-        // so the redactor can walk into it and find the 'password' key.
-        // Exception in payload bypasses sample_rate=0.0.
-        $response = $this->sim->send([
-            $this->sim->makeRequest([
-                'trace_id' => $traceId,
-                'status_code' => 500,
-                'exceptions' => 1,
-                'context' => [
-                    'user' => 'admin',
-                    'password' => 'super-secret-p@ss!',
-                    'action' => 'login',
-                ],
-            ]),
-            $this->sim->makeException([
-                'trace_id' => 'feat-redact-exc-'.uniqid(),
-                'execution_id' => $traceId,
-                'class' => 'RuntimeException',
-                'file' => 'app/Redact.php',
-                'line' => 1,
-            ]),
-        ]);
-
-        $this->assertSame('2:OK', $response);
-
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
-
-        $request = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
-        $this->assertNotNull($request);
-
-        $context = $request['context'];
-        $this->assertStringNotContainsString('super-secret-p@ss!', $context, 'Password should be redacted from context');
-        $this->assertStringContainsString('[REDACTED]', $context, 'Redacted marker should be present');
-        $this->assertStringContainsString('admin', $context, 'Non-sensitive fields should be preserved');
-    }
-
-    public function test_redaction_strips_headers_passed_as_array(): void
-    {
-        $traceId = 'feat-redact-hdr-'.uniqid();
-
-        // Pass headers as a nested array so the redactor can walk it.
-        // In production, Nightwatch may pre-encode headers as a JSON string,
-        // in which case redaction doesn't apply (string values are leaf nodes).
-        // This test verifies the redactor works when headers ARE arrays.
-        $response = $this->sim->send([
-            $this->sim->makeRequest([
-                'trace_id' => $traceId,
-                'status_code' => 500,
-                'exceptions' => 1,
-                'headers' => [
-                    'host' => 'app.example.com',
-                    'authorization' => 'Bearer eyJhbGciOi...',
-                    'cookie' => 'session_id=abc123; csrf=xyz789',
-                    'accept' => 'application/json',
-                ],
-            ]),
-            $this->sim->makeException([
-                'trace_id' => 'feat-redact-exc2-'.uniqid(),
-                'execution_id' => $traceId,
-                'class' => 'RuntimeException',
-                'file' => 'app/Redact.php',
-                'line' => 2,
-            ]),
-        ]);
-
-        $this->assertSame('2:OK', $response);
-
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
-
-        $request = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
-        $headers = $request['headers'];
-
-        $this->assertStringNotContainsString('Bearer eyJhbGciOi', $headers, 'Authorization header should be redacted');
-        $this->assertStringNotContainsString('session_id=abc123', $headers, 'Cookie header should be redacted');
-        $this->assertStringContainsString('app.example.com', $headers, 'Host header should be preserved');
-        // JSON encoding escapes "/" to "\/" — check for the decoded value
-        $decoded = json_decode($headers, true);
-        $this->assertSame('application/json', $decoded['accept'], 'Accept header should be preserved');
-    }
-
-    public function test_redaction_handles_nested_sensitive_keys(): void
-    {
-        $traceId = 'feat-redact-nest-'.uniqid();
-
-        // Nested array context with deep sensitive keys
-        $response = $this->sim->send([
-            $this->sim->makeException([
-                'trace_id' => $traceId,
-                'class' => 'RuntimeException',
-                'file' => 'app/Redact.php',
-                'line' => 3,
-            ]),
-            $this->sim->makeLog([
-                'trace_id' => 'feat-redact-log-'.uniqid(),
-                'execution_id' => $traceId,
-                'level' => 'error',
-                'message' => 'Auth failed',
-                'context' => [
-                    'user' => 'admin',
-                    'credentials' => [
-                        'username' => 'admin',
-                        'password' => 'hunter2',
-                        'secret' => 'api-key-xyz',
-                    ],
-                ],
-            ]),
-        ]);
-
-        $this->assertSame('2:OK', $response);
-
-        $this->waitForDrain('nightowl_exceptions', "trace_id = '{$traceId}'", 1);
-        usleep(500_000);
-
-        $logs = self::$pdo->query("SELECT * FROM nightowl_logs WHERE execution_id = '{$traceId}'")->fetchAll(PDO::FETCH_ASSOC);
-        if (! empty($logs)) {
-            $context = $logs[0]['context'];
-            $this->assertStringNotContainsString('hunter2', $context, 'Nested password should be redacted');
-            $this->assertStringNotContainsString('api-key-xyz', $context, 'Nested secret should be redacted');
-            $this->assertStringContainsString('admin', $context, 'Non-sensitive username should be preserved');
-        }
-    }
-
-    public function test_redaction_strips_record_level_sensitive_keys(): void
-    {
-        $traceId = 'feat-redact-toplvl-'.uniqid();
-
-        // Test that top-level record keys matching redact list are stripped.
-        // 'password' and 'secret' at record level → [REDACTED]
-        $response = $this->sim->send([
-            array_merge($this->sim->makeRequest([
-                'trace_id' => $traceId,
-                'status_code' => 500,
-                'exceptions' => 1,
-            ]), [
-                'password' => 'top-level-secret',
-                'secret' => 'top-level-api-key',
-            ]),
-            $this->sim->makeException([
-                'trace_id' => 'feat-redact-exc3-'.uniqid(),
-                'execution_id' => $traceId,
-                'class' => 'RuntimeException',
-                'file' => 'app/Redact.php',
-                'line' => 4,
-            ]),
-        ]);
-
-        $this->assertSame('2:OK', $response);
-
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
-
-        // Request stored — the password/secret keys are not standard columns,
-        // so they won't appear in PG. But the payload was processed through
-        // the redactor without crashing (functional test of key stripping).
-        $request = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
-        $this->assertNotNull($request, 'Record with redacted keys should still be stored');
-    }
-
-    // ═══════════════════════════════════════════════════════════
     //  THRESHOLD TESTS (cache_ttl = 0, always re-reads)
     // ═══════════════════════════════════════════════════════════
 
@@ -710,9 +434,8 @@ class AgentFeaturesSystemTest extends TestCase
         $file = 'app/Combined.php';
         $line = 42;
 
-        // Payload combining all three features:
-        // - Exception (bypasses sample_rate=0.0)
-        // - Sensitive data as arrays (redactor walks and strips)
+        // Payload combining exception + slow request:
+        // - Exception → exception/issue rows
         // - Slow duration (triggers threshold → performance issue)
         $response = $this->sim->send([
             $this->sim->makeRequest([
@@ -723,16 +446,6 @@ class AgentFeaturesSystemTest extends TestCase
                 'route_path' => '/api/combined-test',
                 'method' => 'POST',
                 'route_methods' => json_encode(['POST']),
-                'context' => [
-                    'user' => 'admin',
-                    'password' => 'should-be-redacted',
-                    'action' => 'create_order',
-                ],
-                'headers' => [
-                    'host' => 'app.example.com',
-                    'authorization' => 'Bearer secret-token-123',
-                    'content-type' => 'application/json',
-                ],
             ]),
             $this->sim->makeException([
                 'trace_id' => 'feat-combined-exc-'.uniqid(),
@@ -753,18 +466,13 @@ class AgentFeaturesSystemTest extends TestCase
         $request = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
         $this->assertNotNull($request, 'Exception payload must bypass sampling');
 
-        // 2. REDACTION: sensitive data stripped
-        $this->assertStringNotContainsString('should-be-redacted', $request['context'], 'Password must be redacted');
-        $this->assertStringNotContainsString('secret-token-123', $request['headers'], 'Authorization must be redacted');
-        $this->assertStringContainsString('app.example.com', $request['headers'], 'Non-sensitive data preserved');
-
-        // 3. THRESHOLDS: performance issue created
+        // 2. THRESHOLDS: performance issue created
         $perfIssues = self::$pdo->query(
             "SELECT * FROM nightowl_issues WHERE type = 'performance'"
         )->fetchAll(PDO::FETCH_ASSOC);
         $this->assertNotEmpty($perfIssues, 'Slow request should create performance issue');
 
-        // 4. EXCEPTION: issue also created
+        // 3. EXCEPTION: issue also created
         $fp = md5($excClass.'|'.'0'.'|'.$file.'|'.$line);
         $excIssue = self::fetch('nightowl_issues', "group_hash = '{$fp}' AND type = 'exception'");
         $this->assertNotNull($excIssue, 'Exception issue should exist alongside performance issue');

@@ -24,7 +24,7 @@ Laravel package installed in customer apps. Receives telemetry from `laravel/nig
 
 ### SQLite (Buffer Layer)
 - PDO + WAL mode, NORMAL sync, 64MB cache, 256MB mmap
-- `appendRaw($json)` zero-copy insert (skip `json_encode` when no redaction)
+- `appendRaw($json)` zero-copy insert (raw wire JSON straight into SQLite, no re-encode)
 - Checkpoints: PASSIVE (non-blocking) → TRUNCATE (blocking, >200MB)
 - Multi-worker claiming: `claimBatch()` atomically sets `synced=100+workerId`
 
@@ -78,8 +78,6 @@ src/Agent/
   SqliteBuffer.php       — WAL buffer: append/fetch/claim/mark/release/cleanup/checkpoint
   RecordWriter.php       — PG writer: COPY (10 tables) + INSERT (2 upsert), sync_commit=off
   PayloadParser.php      — Wire protocol, gzip, token extraction
-  Sampler.php            — RNG-based drop; exception/5xx bypass
-  Redactor.php           — Recursive PII key redaction, O(1) lookup
   AlertNotifier.php      — Issue alerts: rich Slack blocks, Discord embeds, branded HTML email
   HealthAlertNotifier.php — Agent health alerts (DRAIN_STOPPED, PG_LATENCY_CRITICAL, etc.)
   EmailTemplate.php      — Branded email rendering (fallback logo if FRONTEND_URL unset)
@@ -123,7 +121,7 @@ src/Commands/
 - Raw HTTP dispatchers (AlertNotifier, HealthAlertNotifier `httpPost`) reject non-http(s) schemes before `file_get_contents` — PHP's URL wrappers otherwise allow `file://`/`phar://` etc.
 - SMTP header builders must pass user-controllable fields (from/to/subject) through `sanitizeHeader()` to strip CR/LF (email-header injection).
 - `json_decode` in drain/runtime paths uses `(..., true, N, JSON_THROW_ON_ERROR)` — never no-args decode. Depth N: 512 for payload re-parse, 32 for channel config, 16 for metrics/thresholds.
-- Redactor enabled by default; scrubs keys + URL query-string params under url/uri/endpoint/href fields.
+- PII redaction is delegated upstream to `laravel/nightwatch` via `NIGHTWATCH_REDACT_HEADERS` / `NIGHTWATCH_REDACT_PAYLOAD_FIELDS`. The agent itself does not redact — payloads are buffered and drained as received.
 
 ## Performance
 - **Ingest**: 13,400 payloads/s single instance (ReactPHP + SQLite WAL)
@@ -137,9 +135,9 @@ src/Commands/
 
 | Suite | Count | Dependencies | Focus |
 |-------|-------|--------------|-------|
-| **Unit** | ~118 | None | PayloadParser, Sampler, Redactor, MetricsCollector, ConnectionHandler, AlertNotifier, DrainWorker |
+| **Unit** | ~110 | None | PayloadParser, MetricsCollector, ConnectionHandler, AlertNotifier, DrainWorker |
 | **Integration** | ~80 | SQLite always, PG skips if unavailable | SqliteBuffer (multi-worker claiming, WAL), RecordWriter (COPY/upsert/users_count), SimulatorPayload, EndToEnd |
-| **System** | ~35 | PG + pcntl + posix | Real AsyncServer + fork + drain over TCP; sampling, redaction, thresholds, back-pressure, multi-worker, error storms, scaling |
+| **System** | ~30 | PG + pcntl + posix | Real AsyncServer + fork + drain over TCP; thresholds, back-pressure, multi-worker, error storms, scaling |
 
 **Total**: 233 test methods.
 
@@ -168,7 +166,6 @@ NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=false  # Run alongside Nightwatch (fan-out via
 NIGHTOWL_DRAIN_BATCH_SIZE=5000           # Rows per COPY batch
 NIGHTOWL_DRAIN_WORKERS=1                 # Parallel drain workers
 NIGHTOWL_DRAIN_INTERVAL_MS=100           # Drain loop idle interval
-NIGHTOWL_SAMPLE_RATE=1.0                 # 1.0 = keep all (exceptions always kept)
 NIGHTOWL_MAX_PENDING_ROWS=100000         # Back-pressure threshold
 NIGHTOWL_MAX_BUFFER_MEMORY=268435456     # 256MB RSS limit
 ```

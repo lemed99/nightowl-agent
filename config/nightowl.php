@@ -36,10 +36,9 @@ return [
         'token' => env('NIGHTOWL_TOKEN', env('NIGHTWATCH_TOKEN')),
 
         // Platform app ID for this connected app — shown in the NightOwl
-        // dashboard under Settings. When set, the agent embeds it in webhook
-        // payloads (alongside view_url) so receivers can round-trip back to
-        // the dashboard. Without it, alert webhooks still fire but ship
-        // app_id=null and omit the direct-link view_url.
+        // dashboard under Settings. When set, alert emails and webhooks
+        // include a direct-link `view_url` pointing at the issue. Without
+        // it, links fall back to the generic dashboard root.
         'app_id' => env('NIGHTOWL_APP_ID'),
         'driver' => env('NIGHTOWL_AGENT_DRIVER', 'async'),
         'sqlite_path' => env('NIGHTOWL_AGENT_SQLITE_PATH', storage_path('nightowl/agent-buffer.sqlite')),
@@ -53,26 +52,8 @@ return [
         'enable_udp' => env('NIGHTOWL_ENABLE_UDP', false),
         'udp_port' => env('NIGHTOWL_UDP_PORT', 2408),
 
-        // Intelligent sampling (1.0 = keep all, 0.5 = ~50% drop, exceptions always kept)
-        // Per-type rates override the global rate for their entry point type.
-        // If not set, the global sample_rate applies to all types.
-        'sample_rate' => env('NIGHTOWL_SAMPLE_RATE', 1.0),
-        'request_sample_rate' => env('NIGHTOWL_REQUEST_SAMPLE_RATE'),
-        'command_sample_rate' => env('NIGHTOWL_COMMAND_SAMPLE_RATE'),
-        'scheduled_task_sample_rate' => env('NIGHTOWL_SCHEDULED_TASK_SAMPLE_RATE'),
-
         // Time-based flush (max ms between drains during low traffic)
         'drain_max_wait_ms' => env('NIGHTOWL_DRAIN_MAX_WAIT_MS', 5000),
-
-        // PII redaction — scrubs sensitive keys from payloads before they
-        // land in SQLite. Also redacts query-string parameters matching
-        // these names inside any `url`/`uri`/`endpoint`/`href` field.
-        // Enabled by default: if you have a legitimate reason to capture
-        // credentials in telemetry (unlikely), set NIGHTOWL_REDACT_ENABLED=false.
-        'redact_enabled' => env('NIGHTOWL_REDACT_ENABLED', true),
-        'redact_keys' => array_filter(
-            explode(',', env('NIGHTOWL_REDACT_KEYS', 'password,token,authorization,cookie,secret,api_key'))
-        ),
 
         // Gzip decompression for compressed payloads
         'gzip_enabled' => env('NIGHTOWL_GZIP_ENABLED', true),
@@ -92,7 +73,7 @@ return [
         'health_enabled' => env('NIGHTOWL_HEALTH_ENABLED', true),
         'health_port' => env('NIGHTOWL_HEALTH_PORT', 2409),
 
-        // Remote health reporting to dashboard
+        // Remote health reporting to api
         'health_report_enabled' => env('NIGHTOWL_HEALTH_REPORT_ENABLED', true),
         'health_report_interval' => env('NIGHTOWL_HEALTH_REPORT_INTERVAL', 30),
 

@@ -3,14 +3,12 @@
 namespace NightOwl\Tests\Integration;
 
 use NightOwl\Agent\PayloadParser;
-use NightOwl\Agent\Redactor;
-use NightOwl\Agent\Sampler;
 use NightOwl\Tests\Simulator\NightwatchSimulator;
 use PHPUnit\Framework\TestCase;
 
 /**
  * Tests that the simulator produces payloads the agent can actually parse.
- * Validates the full pipeline: simulator → wire format → parser → sampler → redactor.
+ * Validates the full pipeline: simulator → wire format → parser.
  */
 class SimulatorPayloadTest extends TestCase
 {
@@ -230,60 +228,6 @@ class SimulatorPayloadTest extends TestCase
         $this->assertContains('outgoing-request', $types);
         $this->assertContains('log', $types);
         $this->assertContains('user', $types);
-    }
-
-    // ─── Sampler integration ───────────────────────────────
-
-    public function testSamplerKeepsExceptionPayloads(): void
-    {
-        $sampler = new Sampler(sampleRate: 0.0);
-
-        $records = [
-            $this->sim->makeRequest(['status_code' => 200]),
-            $this->sim->makeException(),
-        ];
-
-        $this->assertTrue($sampler->shouldKeep($records));
-    }
-
-    public function testSamplerKeeps5xxPayloads(): void
-    {
-        $sampler = new Sampler(sampleRate: 0.0);
-
-        $records = [
-            $this->sim->makeRequest(['status_code' => 500]),
-        ];
-
-        $this->assertTrue($sampler->shouldKeep($records));
-    }
-
-    public function testSamplerDropsNormalPayloadsAtZeroRate(): void
-    {
-        $sampler = new Sampler(sampleRate: 0.0);
-
-        $records = [
-            $this->sim->makeRequest(['status_code' => 200]),
-            $this->sim->makeQuery(),
-        ];
-
-        $this->assertFalse($sampler->shouldKeep($records));
-    }
-
-    // ─── Redactor integration ──────────────────────────────
-
-    public function testRedactorRedactsSimulatorPayloads(): void
-    {
-        $redactor = new Redactor(keys: ['ip', 'headers', 'context'], enabled: true);
-
-        $records = [
-            $this->sim->makeRequest(['ip' => '10.0.0.1']),
-        ];
-
-        [$result, $modified] = $redactor->redact($records);
-
-        $this->assertTrue($modified);
-        $this->assertSame('[REDACTED]', $result[0]['ip']);
-        $this->assertSame('[REDACTED]', $result[0]['headers']);
     }
 
     // ─── Large payload stress test ─────────────────────────

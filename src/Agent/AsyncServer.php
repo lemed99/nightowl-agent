@@ -46,8 +46,6 @@ final class AsyncServer
         private PayloadParser $parser,
         private string $sqlitePath,
         private DrainWorker $drainWorker,
-        private Sampler $sampler,
-        private Redactor $redactor,
         ?string $token = null,
         private int $maxPendingRows = 100_000,
         private int $maxBufferMemory = 256 * 1024 * 1024, // 256 MB
@@ -55,7 +53,7 @@ final class AsyncServer
         private int $udpPort = 2408,
         private bool $healthEnabled = true,
         private int $healthPort = 2409,
-        private string $dashboardUrl = '',
+        private string $apiUrl = '',
         private string $healthReportToken = '',
         private bool $healthReportEnabled = true,
         private int $healthReportInterval = 30,
@@ -263,8 +261,8 @@ final class AsyncServer
             $this->healthServer->listen($host, $this->healthPort, $this);
         }
 
-        // Remote health reporting to dashboard
-        if ($this->healthReportEnabled && $this->dashboardUrl !== '' && $this->healthReportToken !== '') {
+        // Remote health reporting to api
+        if ($this->healthReportEnabled && $this->apiUrl !== '' && $this->healthReportToken !== '') {
             // Build adaptive intervals — use legacy single interval as fallback
             $intervals = $this->healthReportIntervals;
             if (empty($intervals)) {
@@ -276,7 +274,7 @@ final class AsyncServer
             }
 
             $reporter = new HealthReporter(
-                $this->dashboardUrl,
+                $this->apiUrl,
                 $this->healthReportToken,
                 $this->tenantId,
                 $intervals,
@@ -383,26 +381,9 @@ final class AsyncServer
             }
         }
 
-        // Sampling — drop non-critical payloads transparently
         if ($result['type'] === 'json') {
-            if (! $this->sampler->shouldKeep($result['records'])) {
-                $conn->write('2:OK');
-                $conn->end();
-                return;
-            }
-
-            // Redaction — strip sensitive keys before storage
-            [$records, $wasRedacted] = $this->redactor->redact($result['records']);
-
-            // Buffer to SQLite (crash-safe) then ACK.
-            // When redaction modifies data, we must re-encode (losing the
-            // appendRaw optimization). Otherwise store the raw wire JSON.
             try {
-                if ($wasRedacted) {
-                    $this->buffer->append($records);
-                } else {
-                    $this->buffer->appendRaw($result['rawPayload']);
-                }
+                $this->buffer->appendRaw($result['rawPayload']);
                 $this->metrics->recordIngest();
                 $conn->write('2:OK');
             } catch (\Throwable $e) {
@@ -495,20 +476,8 @@ final class AsyncServer
                         }
                     }
 
-                    // Sampling
-                    if (! $this->sampler->shouldKeep($result['records'])) {
-                        return;
-                    }
-
-                    // Redaction
-                    [$records, $wasRedacted] = $this->redactor->redact($result['records']);
-
                     try {
-                        if ($wasRedacted) {
-                            $this->buffer->append($records);
-                        } else {
-                            $this->buffer->appendRaw($result['rawPayload']);
-                        }
+                        $this->buffer->appendRaw($result['rawPayload']);
                         $this->metrics->recordIngest();
                     } catch (\Throwable $e) {
                         error_log("[NightOwl Agent] UDP buffer error: {$e->getMessage()}");
