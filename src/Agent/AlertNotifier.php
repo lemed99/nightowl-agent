@@ -39,7 +39,10 @@ final class AlertNotifier
 
     public static function fromConfig(): self
     {
-        $appId = config('nightowl.agent.app_id');
+        // Fall back to env() when the config key is absent — keeps NIGHTOWL_APP_ID
+        // working for customers whose published config/nightowl.php predates the
+        // app_id key, so they don't have to re-run vendor:publish on upgrade.
+        $appId = config('nightowl.agent.app_id') ?? env('NIGHTOWL_APP_ID');
 
         return new self(
             (int) config('nightowl.threshold_cache_ttl', 86400),
