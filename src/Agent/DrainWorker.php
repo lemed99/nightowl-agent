@@ -72,6 +72,7 @@ final class DrainWorker
             username: $this->pgUsername,
             password: $this->pgPassword,
             thresholdCacheTtl: $this->thresholdCacheTtl,
+            notifier: AlertNotifier::fromConfig(),
             appName: $this->appName,
             environment: $this->environment,
         );
