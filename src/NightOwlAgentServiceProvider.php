@@ -80,6 +80,15 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 return;
             }
 
+            // Idempotent: this hook can fire more than once (provider re-registered,
+            // Octane reset, etc). Re-wrapping $core->ingest with MultiIngest each time
+            // multiplies outbound writes — N wraps = each record sent to the NightOwl
+            // agent N times.
+            if ($this->app->bound('nightowl.ingest_wired')) {
+                return;
+            }
+            $this->app->instance('nightowl.ingest_wired', true);
+
             $core = $this->app->make(Core::class);
 
             $nightowlPort = (int) config('nightowl.agent.port', 2407);

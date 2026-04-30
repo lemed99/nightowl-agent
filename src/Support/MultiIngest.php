@@ -3,6 +3,9 @@
 namespace NightOwl\Support;
 
 use Laravel\Nightwatch\Contracts\Ingest;
+use Laravel\Nightwatch\Ingest as NightwatchIngest;
+use ReflectionClass;
+use Throwable;
 
 final class MultiIngest implements Ingest
 {
@@ -11,7 +14,54 @@ final class MultiIngest implements Ingest
 
     public function __construct(Ingest ...$ingests)
     {
-        $this->ingests = $ingests;
+        // Flatten + dedupe so re-wrapping can't multiply outbound writes.
+        // Without this, NightOwlAgentServiceProvider::booted() firing more than
+        // once with parallel_with_nightwatch=true compounds the chain (each
+        // wrap adds another path to the agent), producing N copies of every
+        // event in the customer's DB.
+        $flat = [];
+        foreach ($ingests as $ingest) {
+            if ($ingest instanceof self) {
+                foreach ($ingest->ingests as $inner) {
+                    $flat[] = $inner;
+                }
+            } else {
+                $flat[] = $ingest;
+            }
+        }
+
+        $seen = [];
+        $deduped = [];
+        foreach ($flat as $ingest) {
+            $sig = self::signatureFor($ingest);
+            if (isset($seen[$sig])) {
+                continue;
+            }
+            $seen[$sig] = true;
+            $deduped[] = $ingest;
+        }
+
+        $this->ingests = $deduped;
+    }
+
+    private static function signatureFor(Ingest $ingest): string
+    {
+        // For Nightwatch's Ingest, two instances pointing at the same socket
+        // with the same token hash are functionally identical — collapse them
+        // even when they're freshly constructed (different object IDs).
+        if ($ingest instanceof NightwatchIngest) {
+            try {
+                $r = new ReflectionClass($ingest);
+                $transmitTo = $r->getProperty('transmitTo')->getValue($ingest);
+                $tokenHash = $r->getProperty('tokenHash')->getValue($ingest);
+
+                return 'nw:'.$transmitTo.'|'.$tokenHash;
+            } catch (Throwable) {
+                // Nightwatch internals changed — fall through to identity.
+            }
+        }
+
+        return 'oid:'.spl_object_id($ingest);
     }
 
     public function write(array $record): void
