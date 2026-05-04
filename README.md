@@ -53,7 +53,7 @@ Tables fill up. Run any SQL you want against them.
 
 ## Optional: the hosted dashboard
 
-If you don't want to build and maintain a UI, [usenightowl.com](https://usenightowl.com) is a managed service that connects to your Postgres with credentials you supply (and can rotate or revoke at any time). It adds issue management, multi-channel alerts (Email/Webhook/Slack/Discord), teams, and an MCP server for AI tools. Same data, rendered for you. The agent stays open-source and works exactly the same with or without it.
+If you don't want to build and maintain a UI, [usenightowl.com](https://usenightowl.com) is a managed service that connects to your Postgres with credentials you supply (and can rotate or revoke at any time). It adds an issue lifecycle UI (resolve / ignore / reopen, assignees, comments, activity timeline), alerts for those state transitions, teams, and an MCP server for AI tools. Same data, rendered for you. The agent stays open-source and works exactly the same with or without it — exception fingerprinting, threshold issues, and new-issue alerts (Email / Webhook / Slack / Discord) all run inside the agent process on their own.
 
 Full guide: [docs.usenightowl.com](https://docs.usenightowl.com)
 
