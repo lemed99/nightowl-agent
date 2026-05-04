@@ -5,7 +5,7 @@
 <h1 align="center">NightOwl Agent</h1>
 
 <p align="center">
-  <strong>Open-source Laravel monitoring agent. Captures telemetry from <a href="https://github.com/laravel/nightwatch"><code>laravel/nightwatch</code></a> and drains it into <em>your own</em> PostgreSQL — you keep 100% of the data.</strong>
+  <strong>Open-source Laravel monitoring agent. Captures telemetry from <a href="https://github.com/laravel/nightwatch"><code>laravel/nightwatch</code></a> and drains it into a PostgreSQL database you control.</strong>
 </p>
 
 <p align="center">
@@ -23,9 +23,9 @@ NightOwl Agent is an MIT-licensed Laravel package that:
 
 1. **Sits in front of [`laravel/nightwatch`](https://github.com/laravel/nightwatch)** — Laravel's official observability SDK. Nightwatch already does the hard part: instrumenting all 12 record types — requests, queries, jobs, exceptions, commands, cache events, mail, notifications, outgoing HTTP, scheduled tasks, logs, users. The agent receives those payloads over a local TCP socket.
 2. **Buffers them in a local SQLite WAL** — non-blocking ReactPHP ingest, ~13,400 payloads/s on a single instance.
-3. **Drains them into _your own_ PostgreSQL** via the COPY protocol. The agent writes to a database you provision, on infrastructure you control. **No telemetry ever leaves your network.**
+3. **Drains them into a PostgreSQL database you provision** via the COPY protocol. Telemetry never leaves your network.
 
-You own the database. You own the schema (all tables prefixed `nightowl_`). You own the data forever. Query it with `psql`, point Metabase at it, build a Livewire UI in an afternoon, vibe-code a Next.js dashboard — whatever you want.
+All tables are prefixed `nightowl_` and the schema is documented. You're free to query the data with `psql`, point Metabase at it, or build your own UI on top — Livewire, Next.js, whatever.
 
 ## Run it standalone
 
@@ -51,11 +51,15 @@ You don't need to wire up Nightwatch's transport — the service provider automa
 
 Tables fill up. Run any SQL you want against them.
 
-## Optional: the hosted dashboard
+## What you get out of the box
 
-If you don't want to build and maintain a UI, [usenightowl.com](https://usenightowl.com) is a managed service that connects to your Postgres with credentials you supply (and can rotate or revoke at any time). It adds an issue lifecycle UI (resolve / ignore / reopen, assignees, comments, activity timeline), alerts for those state transitions, teams, and an MCP server for AI tools. Same data, rendered for you. The agent stays open-source and works exactly the same with or without it — exception fingerprinting, threshold issues, and new-issue alerts (Email / Webhook / Slack / Discord) all run inside the agent process on their own.
+These features run in the agent process. Postgres is the only thing it talks to.
 
-Full guide: [docs.usenightowl.com](https://docs.usenightowl.com)
+- **Exception fingerprinting** — `nightowl_exceptions` upserts into `nightowl_issues` keyed on `(group_hash, type, environment)`, so repeats roll up into one grouped issue.
+- **New-issue alerts** — when an issue is seen for the first time the drain worker fans it out to whatever you've configured in `nightowl_alert_channels`: Email (BYO SMTP), Webhook (HMAC-signed), Slack, Discord.
+- **Threshold-based performance issues** — set a threshold per record type (slow request, slow query, slow job, and so on), and durations above it get turned into issues.
+- **Agent + host health diagnosis** — ring buffers and EWMA feed a rule engine that produces a health score and surfaces stalls (drain lag, buffer depth, CPU, memory, load average).
+- **Raw rows for every Nightwatch record type** — all 12 sit in your Postgres. `psql`, Metabase, or your own UI on top.
 
 ## Architecture
 
@@ -71,14 +75,12 @@ Full guide: [docs.usenightowl.com](https://docs.usenightowl.com)
                                 │   PostgreSQL (yours)         │
                                 └────────────┬─────────────────┘
                                              │
-                  ┌──────────────────────────┴──────────────────────────┐
-                  │                                                     │
-                  ▼                                                     ▼
-    ┌─────────────────────────┐                       ┌──────────────────────────────┐
-    │ Your own UI / scripts   │                       │ NightOwl hosted dashboard    │
-    │ (psql, Metabase, vibe-  │            OR         │ (optional — issue mgmt,      │
-    │  coded Next.js, etc.)   │                       │  alerts, teams, MCP)         │
-    └─────────────────────────┘                       └──────────────────────────────┘
+                                             ▼
+                              ┌─────────────────────────┐
+                              │ Your own UI / scripts   │
+                              │ (psql, Metabase, vibe-  │
+                              │  coded Next.js, etc.)   │
+                              └─────────────────────────┘
 ```
 
 > **13,400 payloads/s** on a single instance — ReactPHP non-blocking TCP ingest, SQLite WAL buffering, PostgreSQL `COPY` drain with `synchronous_commit = off`.
@@ -97,18 +99,7 @@ Whatever Nightwatch emits, the agent persists. Each row carries duration (micros
 - **Host metrics** — CPU, memory, load average (Linux `/proc`)
 - **Agent self-health** — ingest/drain rates, buffer depth, back-pressure, diagnosis rules
 
-P95s, N+1 detection, slow-query rankings, request timelines, etc. are queries you write (or the dashboard does for you) — the agent just stores the underlying rows.
-
-## What the agent does on its own
-
-A few things run inside the agent process without needing the hosted dashboard:
-
-- **Issue dedup** — `nightowl_exceptions` upserts into `nightowl_issues` keyed on `(group_hash, type, environment)`
-- **New-issue alerts** — first occurrence of an issue can fan out to channels configured in `nightowl_alert_channels` (Email/SMTP, Webhook+HMAC, Slack, Discord) directly from the drain worker
-- **Threshold issues** — durations over configured thresholds (per record type) become performance issues
-- **Health diagnosis** — ring buffers + EWMA + a rule engine produce a health score and surface stalls
-
-> Issue lifecycle (resolve / ignore / reopen / assignment / comments / activity timeline) and alerts for those transitions are driven by the hosted backend. In standalone mode you only get new-issue alerts; the columns exist in `nightowl_issues` for you to drive yourself if you wire up your own UI.
+P95s, N+1 detection, slow-query rankings, request timelines, etc. are queries you write against these tables.
 
 ## Requirements
 
@@ -118,11 +109,17 @@ A few things run inside the agent process without needing the hosted dashboard:
 
 ## Data ownership & privacy
 
-The agent writes telemetry **directly to your PostgreSQL database**, never to ours. Zero request, query, or exception data leaves your infrastructure.
+The agent writes telemetry **directly to your PostgreSQL database**. Zero request, query, or exception data leaves your infrastructure.
 
-The only thing the agent _can_ send outbound — and only if you opt in by registering an app on the hosted dashboard — is **agent/host health metadata** (ingest rates, buffer depth, drain lag, CPU/memory) so the dashboard can warn you when your agent is unhealthy. Run the agent without registering and nothing is reported anywhere.
+The only thing the agent _can_ send outbound, and only if you opt in to remote health reporting, is **agent/host health metadata** (ingest rates, buffer depth, drain lag, CPU/memory), so a remote backend can warn you when the agent is unhealthy.
 
-The schema is documented and stable. If you ever stop using the hosted dashboard, the data is still yours — read it, export it, migrate it, archive it.
+The schema is documented and stable, so your data stays usable even if you stop running the agent.
+
+## Optional: the hosted dashboard
+
+If you'd rather not build and maintain a UI, [usenightowl.com](https://usenightowl.com) is a managed service that connects to your Postgres with credentials you supply (and can rotate or revoke at any time). It adds an issue lifecycle UI (resolve / ignore / reopen, assignees, comments, activity timeline), alerts for those state transitions, teams, and an MCP server for AI tools. The agent itself stays MIT and works the same with or without it.
+
+Full guide: [docs.usenightowl.com](https://docs.usenightowl.com)
 
 ## Contributing
 
@@ -130,9 +127,8 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tes
 
 ## License
 
-[MIT](LICENSE) — use it, fork it, ship it.
+[MIT](LICENSE).
 
 ## Related
 
 - **Docs** — [docs.usenightowl.com](https://docs.usenightowl.com)
-- **Hosted dashboard (optional)** — [usenightowl.com](https://usenightowl.com)
