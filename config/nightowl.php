@@ -33,6 +33,8 @@ return [
     'agent' => [
         'host' => env('NIGHTOWL_AGENT_HOST', '127.0.0.1'),
         'port' => env('NIGHTOWL_AGENT_PORT', 2407),
+        // NIGHTWATCH_TOKEN is a deprecated fallback for installs that pre-date
+        // the rename — new installs should use NIGHTOWL_TOKEN.
         'token' => env('NIGHTOWL_TOKEN', env('NIGHTWATCH_TOKEN')),
 
         // Platform app ID for this connected app — shown in the NightOwl
