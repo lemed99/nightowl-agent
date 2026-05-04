@@ -53,20 +53,7 @@ Tables fill up. Run any SQL you want against them.
 
 ## Optional: the hosted dashboard
 
-<p align="center">
-  <img src=".github/assets/dashboard.png" alt="NightOwl hosted dashboard — Requests view" width="900">
-</p>
-
-If you don't want to build and maintain a UI, [usenightowl.com](https://usenightowl.com) is a production-ready dashboard that connects to your Postgres with credentials you supply (and can rotate or revoke at any time). It adds the things that take real engineering time:
-
-- Optimized, fast monitoring UI (requests / jobs / queries / exceptions / logs / users / host metrics) with charts, P95s, and slow-query timelines
-- **Issue management** — fingerprinted exception groups, assignees, comments, activity timeline, resolve / ignore / reopen, bulk actions
-- **Multi-channel alerts** — Email (BYO SMTP), Webhook (HMAC), Slack, Discord
-- **Teams** — multiple users per app, role-based access
-- **MCP server** — let Claude / other AI tools query and triage your issues
-- Auto-resolve, threshold rules, environment scoping, deploy tracking
-
-It's the same data, just rendered for you. $15 Solo / $49 Agency, flat. The agent stays open-source and works exactly the same with or without it.
+If you don't want to build and maintain a UI, [usenightowl.com](https://usenightowl.com) is a managed service that connects to your Postgres with credentials you supply (and can rotate or revoke at any time). It adds issue management, multi-channel alerts (Email/Webhook/Slack/Discord), teams, and an MCP server for AI tools. Same data, rendered for you. The agent stays open-source and works exactly the same with or without it.
 
 Full guide: [docs.usenightowl.com](https://docs.usenightowl.com)
 
@@ -89,7 +76,7 @@ Full guide: [docs.usenightowl.com](https://docs.usenightowl.com)
                   ▼                                                     ▼
     ┌─────────────────────────┐                       ┌──────────────────────────────┐
     │ Your own UI / scripts   │                       │ NightOwl hosted dashboard    │
-    │ (psql, Metabase, vibe-  │            OR         │ (optional, paid — issue mgmt,│
+    │ (psql, Metabase, vibe-  │            OR         │ (optional — issue mgmt,      │
     │  coded Next.js, etc.)   │                       │  alerts, teams, MCP)         │
     └─────────────────────────┘                       └──────────────────────────────┘
 ```
