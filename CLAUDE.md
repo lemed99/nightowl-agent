@@ -168,7 +168,14 @@ NIGHTOWL_DRAIN_WORKERS=1                 # Parallel drain workers
 NIGHTOWL_DRAIN_INTERVAL_MS=100           # Drain loop idle interval
 NIGHTOWL_MAX_PENDING_ROWS=100000         # Back-pressure threshold
 NIGHTOWL_MAX_BUFFER_MEMORY=268435456     # 256MB RSS limit
+NIGHTOWL_REOPEN_COOLDOWN_HOURS=0         # Hours to wait before flipping resolved → open on recurrence (0 = always reopen, Sentry-style)
 ```
+
+### Auto-reopen on recurrence
+
+When a fingerprint with `status='resolved'` recurs in a drain batch, the agent flips it back to `open`, fires an `issue.reopened` alert (Slack/Discord/Webhook/Email), and appends a `nightowl_issue_activity` row with `actor_type='agent'`. `status='ignored'` is never auto-reopened — "ignored" means the user explicitly silenced the fingerprint.
+
+`NIGHTOWL_REOPEN_COOLDOWN_HOURS` suppresses the flip when the most recent `status_changed → resolved` activity is younger than the cooldown — useful for flapping issues. The cooldown is read via `config/nightowl.php` so `php artisan config:cache` is safe.
 
 ### `environment` vs `deploy` columns
 

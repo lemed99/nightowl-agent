@@ -431,6 +431,81 @@ class RecordWriterTest extends TestCase
         $this->assertSame(0, (int) $issue['users_count'], 'Null users should not be counted');
     }
 
+    // ─── Auto-reopen on recurrence ─────────────────────────
+
+    public function test_resolved_issue_auto_reopens_on_recurrence(): void
+    {
+        $base = ['class' => 'App\\Exceptions\\ReopenTest', 'file' => 'app/Reopen.php', 'line' => 7];
+        $fingerprint = md5('App\\Exceptions\\ReopenTest|0|app/Reopen.php|7');
+
+        // First occurrence creates the issue (status=open)
+        $this->writer->write([$this->sim->makeException(array_merge($base, ['trace_id' => 'r1']))]);
+
+        $issueId = (int) self::$pdo->query("SELECT id FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetchColumn();
+        $this->assertGreaterThan(0, $issueId);
+
+        // User resolves it (simulate the IssueController/MCP path)
+        self::$pdo->exec("UPDATE nightowl_issues SET status = 'resolved', updated_at = NOW() - INTERVAL '1 hour' WHERE id = {$issueId}");
+        self::$pdo->exec("INSERT INTO nightowl_issue_activity (issue_id, user_id, user_name, actor_type, action, old_value, new_value, created_at) VALUES ({$issueId}, NULL, 'tester', 'user', 'status_changed', 'open', 'resolved', NOW() - INTERVAL '1 hour')");
+
+        // Recurrence — should flip back to open and append a status_changed activity row
+        $this->writer->write([$this->sim->makeException(array_merge($base, ['trace_id' => 'r2']))]);
+
+        $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE id = {$issueId}")->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame('open', $issue['status'], 'Resolved issue should auto-reopen on recurrence');
+        $this->assertSame(2, (int) $issue['occurrences_count']);
+
+        $reopenLog = self::$pdo->query("SELECT * FROM nightowl_issue_activity WHERE issue_id = {$issueId} AND actor_type = 'agent' AND action = 'status_changed' AND old_value = 'resolved' AND new_value = 'open'")->fetch(PDO::FETCH_ASSOC);
+        $this->assertNotFalse($reopenLog, 'Agent should log the auto-reopen in nightowl_issue_activity');
+    }
+
+    public function test_ignored_issue_stays_ignored_on_recurrence(): void
+    {
+        $base = ['class' => 'App\\Exceptions\\IgnoredTest', 'file' => 'app/Ignored.php', 'line' => 9];
+        $fingerprint = md5('App\\Exceptions\\IgnoredTest|0|app/Ignored.php|9');
+
+        $this->writer->write([$this->sim->makeException(array_merge($base, ['trace_id' => 'i1']))]);
+
+        $issueId = (int) self::$pdo->query("SELECT id FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetchColumn();
+        self::$pdo->exec("UPDATE nightowl_issues SET status = 'ignored' WHERE id = {$issueId}");
+
+        $this->writer->write([$this->sim->makeException(array_merge($base, ['trace_id' => 'i2']))]);
+
+        $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE id = {$issueId}")->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame('ignored', $issue['status'], 'Ignored issues must never auto-reopen');
+        $this->assertSame(2, (int) $issue['occurrences_count']);
+    }
+
+    public function test_resolved_issue_within_cooldown_stays_resolved(): void
+    {
+        $base = ['class' => 'App\\Exceptions\\CooldownTest', 'file' => 'app/Cooldown.php', 'line' => 11];
+        $fingerprint = md5('App\\Exceptions\\CooldownTest|0|app/Cooldown.php|11');
+
+        // 24-hour cooldown
+        $writer = new RecordWriter(
+            self::$host, self::$port, self::$database, self::$username, self::$password,
+            86400,
+            new \NightOwl\Agent\AlertNotifier(86400, '', null, 24),
+        );
+
+        $writer->write([$this->sim->makeException(array_merge($base, ['trace_id' => 'c1']))]);
+
+        $issueId = (int) self::$pdo->query("SELECT id FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetchColumn();
+
+        // Resolved 5 minutes ago — well inside the 24h cooldown
+        self::$pdo->exec("UPDATE nightowl_issues SET status = 'resolved' WHERE id = {$issueId}");
+        self::$pdo->exec("INSERT INTO nightowl_issue_activity (issue_id, user_id, user_name, actor_type, action, old_value, new_value, created_at) VALUES ({$issueId}, NULL, 'tester', 'user', 'status_changed', 'open', 'resolved', NOW() - INTERVAL '5 minutes')");
+
+        $writer->write([$this->sim->makeException(array_merge($base, ['trace_id' => 'c2']))]);
+
+        $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE id = {$issueId}")->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame('resolved', $issue['status'], 'Cooldown should suppress the reopen');
+        $this->assertSame(2, (int) $issue['occurrences_count'], 'Occurrences still accumulate');
+
+        $reopenLog = self::$pdo->query("SELECT 1 FROM nightowl_issue_activity WHERE issue_id = {$issueId} AND actor_type = 'agent'")->fetchColumn();
+        $this->assertFalse($reopenLog, 'No activity row should be written when cooldown suppresses the flip');
+    }
+
     // ─── Batch stress ──────────────────────────────────────
 
     public function test_large_batch_write(): void

@@ -407,12 +407,16 @@ final class RecordWriter
             }
         }
 
-        $existingBefore = $this->notifier->snapshotExistingIssues($this->pdo(), $issueGroups, 'exception');
-        $this->syncIssuesToExceptions($issueGroups);
-        $this->notifier->queueNewIssueNotifications($this->appName, $issueGroups, 'exception', $existingBefore);
+        $snapshot = $this->notifier->snapshotExistingIssues($this->pdo(), $issueGroups, 'exception');
+        $this->syncIssuesToExceptions($issueGroups, $snapshot['reopen'] ?? []);
+        $this->notifier->queueIssueNotifications($this->appName, $issueGroups, 'exception', $snapshot);
     }
 
-    private function syncIssuesToExceptions(array $issueGroups): void
+    /**
+     * @param  array<string, int>  $reopenIds  Composite key → issue id for fingerprints
+     *                                         transitioning resolved → open in this batch.
+     */
+    private function syncIssuesToExceptions(array $issueGroups, array $reopenIds = []): void
     {
         // users_count uses a subquery on nightowl_exceptions to compute the
         // actual distinct user count, instead of blindly accumulating per batch
@@ -437,12 +441,17 @@ final class RecordWriter
                       AND environment IS NOT DISTINCT FROM EXCLUDED.environment
                       AND user_id IS NOT NULL
                 ),
+                status = CASE
+                    WHEN :should_reopen::boolean AND nightowl_issues.status = \'resolved\'
+                        THEN \'open\'
+                    ELSE nightowl_issues.status
+                END,
                 updated_at = EXCLUDED.updated_at
         ');
 
         $now = date('Y-m-d H:i:s');
 
-        foreach ($issueGroups as $group) {
+        foreach ($issueGroups as $key => $group) {
             $timestamps = $group['timestamps'];
             sort($timestamps);
             $firstSeen = ! empty($timestamps) ? date('Y-m-d H:i:s', (int) $timestamps[0]) : $now;
@@ -463,8 +472,11 @@ final class RecordWriter
                 'users_count' => $userCount,
                 'created_at' => $now,
                 'updated_at' => $now,
+                'should_reopen' => isset($reopenIds[$key]) ? 'true' : 'false',
             ]);
         }
+
+        $this->logReopenActivity($reopenIds, $now);
     }
 
     private function writeCommands(array $records): void
@@ -930,15 +942,19 @@ final class RecordWriter
             return;
         }
 
-        $existingBefore = $this->notifier->snapshotExistingIssues($this->pdo(), $issueGroups, 'performance');
-        $this->upsertPerformanceIssues($issueGroups);
-        $this->notifier->queueNewIssueNotifications($this->appName, $issueGroups, 'performance', $existingBefore);
+        $snapshot = $this->notifier->snapshotExistingIssues($this->pdo(), $issueGroups, 'performance');
+        $this->upsertPerformanceIssues($issueGroups, $snapshot['reopen'] ?? []);
+        $this->notifier->queueIssueNotifications($this->appName, $issueGroups, 'performance', $snapshot);
     }
 
     /**
      * Upsert performance issues — same pattern as syncIssuesToExceptions.
      */
-    private function upsertPerformanceIssues(array $issueGroups): void
+    /**
+     * @param  array<string, int>  $reopenIds  Composite key → issue id for fingerprints
+     *                                         transitioning resolved → open in this batch.
+     */
+    private function upsertPerformanceIssues(array $issueGroups, array $reopenIds = []): void
     {
         // Performance issues use GREATEST for users_count instead of addition.
         // Unlike exceptions (which have a dedicated table for accurate counting),
@@ -966,12 +982,17 @@ final class RecordWriter
                     COALESCE(nightowl_issues.triggered_duration_ms, 0),
                     COALESCE(EXCLUDED.triggered_duration_ms, 0)
                 ),
+                status = CASE
+                    WHEN :should_reopen::boolean AND nightowl_issues.status = \'resolved\'
+                        THEN \'open\'
+                    ELSE nightowl_issues.status
+                END,
                 updated_at = EXCLUDED.updated_at
         ');
 
         $now = date('Y-m-d H:i:s');
 
-        foreach ($issueGroups as $group) {
+        foreach ($issueGroups as $key => $group) {
             $timestamps = $group['timestamps'];
             sort($timestamps);
             $firstSeen = ! empty($timestamps) ? date('Y-m-d H:i:s', (int) $timestamps[0]) : $now;
@@ -1000,7 +1021,50 @@ final class RecordWriter
                 'triggered_duration_ms' => $triggeredMs,
                 'created_at' => $now,
                 'updated_at' => $now,
+                'should_reopen' => isset($reopenIds[$key]) ? 'true' : 'false',
             ]);
+        }
+
+        $this->logReopenActivity($reopenIds, $now);
+    }
+
+    /**
+     * Append a status_changed activity row for each issue auto-reopened by the agent.
+     * Only inserts rows whose nightowl_issues.status actually flipped resolved → open
+     * (the upsert may have skipped the flip if a concurrent writer changed status
+     * between snapshot and upsert), keeping the activity log honest.
+     *
+     * @param  array<string, int>  $reopenIds  Composite key → issue id
+     */
+    private function logReopenActivity(array $reopenIds, string $now): void
+    {
+        if (empty($reopenIds)) {
+            return;
+        }
+
+        try {
+            $insert = $this->pdo()->prepare('
+                INSERT INTO nightowl_issue_activity
+                    (issue_id, user_id, user_name, actor_type, actor_meta,
+                     action, old_value, new_value, created_at)
+                SELECT :issue_id, NULL, NULL, \'agent\', NULL,
+                       \'status_changed\', \'resolved\', \'open\', :created_at
+                WHERE EXISTS (
+                    SELECT 1 FROM nightowl_issues
+                    WHERE id = :id_check AND status = \'open\'
+                )
+            ');
+
+            foreach ($reopenIds as $issueId) {
+                $insert->execute([
+                    'issue_id' => $issueId,
+                    'id_check' => $issueId,
+                    'created_at' => $now,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            // Activity log is best-effort — don't fail the whole drain over it
+            error_log('[NightOwl Agent] Failed to log reopen activity: '.$e->getMessage());
         }
     }
 }

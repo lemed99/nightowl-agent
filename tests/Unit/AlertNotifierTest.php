@@ -9,7 +9,7 @@ class AlertNotifierTest extends TestCase
 {
     // ─── Queue / Flush Lifecycle ─────────────────────────────────────
 
-    public function testQueueNewIssueNotificationsDetectsNewHashes(): void
+    public function testQueueDetectsNewHashes(): void
     {
         $notifier = new AlertNotifier;
 
@@ -20,13 +20,14 @@ class AlertNotifierTest extends TestCase
         ];
 
         // hash_a and hash_b existed before; hash_c is new
-        $existingBefore = ['hash_a', 'hash_b'];
+        $snapshot = ['existing' => ['hash_a', 'hash_b'], 'reopen' => []];
 
-        $notifier->queueNewIssueNotifications('TestApp', $issueGroups, 'exception', $existingBefore);
+        $notifier->queueIssueNotifications('TestApp', $issueGroups, 'exception', $snapshot);
 
         $pending = $this->getPending($notifier);
         $this->assertCount(1, $pending);
         $this->assertSame(['hash_c'], $pending[0]['newHashes']);
+        $this->assertSame([], $pending[0]['reopenedHashes']);
         $this->assertSame('TestApp', $pending[0]['appName']);
         $this->assertSame('exception', $pending[0]['issueType']);
     }
@@ -39,7 +40,10 @@ class AlertNotifierTest extends TestCase
             'hash_a' => ['class' => 'A', 'message' => '', 'count' => 1, 'users' => [], 'timestamps' => []],
         ];
 
-        $notifier->queueNewIssueNotifications('TestApp', $issueGroups, 'exception', ['hash_a']);
+        $notifier->queueIssueNotifications('TestApp', $issueGroups, 'exception', [
+            'existing' => ['hash_a'],
+            'reopen' => [],
+        ]);
 
         $this->assertEmpty($this->getPending($notifier));
     }
@@ -53,7 +57,10 @@ class AlertNotifierTest extends TestCase
             'hash_y' => ['class' => 'Y', 'message' => '', 'count' => 3, 'users' => [], 'timestamps' => []],
         ];
 
-        $notifier->queueNewIssueNotifications('TestApp', $issueGroups, 'performance', []);
+        $notifier->queueIssueNotifications('TestApp', $issueGroups, 'performance', [
+            'existing' => [],
+            'reopen' => [],
+        ]);
 
         $pending = $this->getPending($notifier);
         $this->assertCount(1, $pending);
@@ -62,13 +69,53 @@ class AlertNotifierTest extends TestCase
         $this->assertContains('hash_y', $pending[0]['newHashes']);
     }
 
+    public function testQueueRoutesResolvedHashesToReopenedBucket(): void
+    {
+        $notifier = new AlertNotifier;
+
+        $issueGroups = [
+            'hash_a' => ['class' => 'A', 'message' => '', 'count' => 1, 'users' => [], 'timestamps' => []],
+            'hash_b' => ['class' => 'B', 'message' => '', 'count' => 1, 'users' => [], 'timestamps' => []],
+            'hash_c' => ['class' => 'C', 'message' => '', 'count' => 1, 'users' => [], 'timestamps' => []],
+        ];
+
+        // hash_a is open (existing/silent), hash_b is resolved-and-reopening, hash_c is new
+        $snapshot = [
+            'existing' => ['hash_a'],
+            'reopen' => ['hash_b' => 42],
+        ];
+
+        $notifier->queueIssueNotifications('TestApp', $issueGroups, 'exception', $snapshot);
+
+        $pending = $this->getPending($notifier);
+        $this->assertCount(1, $pending);
+        $this->assertSame(['hash_c'], $pending[0]['newHashes']);
+        $this->assertSame(['hash_b'], $pending[0]['reopenedHashes']);
+    }
+
+    public function testQueueDoesNothingWhenAllSilent(): void
+    {
+        $notifier = new AlertNotifier;
+
+        $issueGroups = [
+            'hash_a' => ['class' => 'A', 'message' => '', 'count' => 1, 'users' => [], 'timestamps' => []],
+        ];
+
+        $notifier->queueIssueNotifications('TestApp', $issueGroups, 'exception', [
+            'existing' => ['hash_a'],
+            'reopen' => [],
+        ]);
+
+        $this->assertEmpty($this->getPending($notifier));
+    }
+
     public function testClearPendingDiscardsAll(): void
     {
         $notifier = new AlertNotifier;
 
-        $notifier->queueNewIssueNotifications('App', [
+        $notifier->queueIssueNotifications('App', [
             'h1' => ['class' => 'A', 'message' => '', 'count' => 1, 'users' => [], 'timestamps' => []],
-        ], 'exception', []);
+        ], 'exception', ['existing' => [], 'reopen' => []]);
 
         $this->assertNotEmpty($this->getPending($notifier));
 
@@ -81,13 +128,13 @@ class AlertNotifierTest extends TestCase
     {
         $notifier = new AlertNotifier;
 
-        $notifier->queueNewIssueNotifications('App', [
+        $notifier->queueIssueNotifications('App', [
             'h1' => ['class' => 'A', 'message' => '', 'count' => 1, 'users' => [], 'timestamps' => []],
-        ], 'exception', []);
+        ], 'exception', ['existing' => [], 'reopen' => []]);
 
-        $notifier->queueNewIssueNotifications('App', [
+        $notifier->queueIssueNotifications('App', [
             'h2' => ['name' => '/api/slow', 'message' => '', 'count' => 1, 'users' => [], 'timestamps' => []],
-        ], 'performance', []);
+        ], 'performance', ['existing' => [], 'reopen' => []]);
 
         $pending = $this->getPending($notifier);
         $this->assertCount(2, $pending);
@@ -190,11 +237,11 @@ class AlertNotifierTest extends TestCase
 
     // ─── Notify Event Filtering ──────────────────────────────────────
 
-    public function testQueueNewIssueNotificationsEmptyGroupsNoOp(): void
+    public function testQueueEmptyGroupsNoOp(): void
     {
         $notifier = new AlertNotifier;
 
-        $notifier->queueNewIssueNotifications('App', [], 'exception', []);
+        $notifier->queueIssueNotifications('App', [], 'exception', ['existing' => [], 'reopen' => []]);
 
         $this->assertEmpty($this->getPending($notifier));
     }
@@ -278,9 +325,9 @@ class AlertNotifierTest extends TestCase
     {
         $notifier = new AlertNotifier;
 
-        $notifier->queueNewIssueNotifications('App', [
+        $notifier->queueIssueNotifications('App', [
             'h1' => ['class' => 'A', 'message' => '', 'count' => 1, 'users' => [], 'timestamps' => []],
-        ], 'exception', []);
+        ], 'exception', ['existing' => [], 'reopen' => []]);
 
         $this->assertNotEmpty($this->getPending($notifier));
 
@@ -291,6 +338,48 @@ class AlertNotifierTest extends TestCase
         $notifier->flushNotifications($pdo);
 
         $this->assertEmpty($this->getPending($notifier));
+    }
+
+    // ─── Header Style (new vs reopened) ──────────────────────────────
+
+    public function testHeaderStyleProducesIssueNewForNewIssuePrefix(): void
+    {
+        $notifier = new AlertNotifier;
+        $style = $this->callPrivate($notifier, 'headerStyle', ['New Issue', 'exception']);
+
+        $this->assertSame('issue.new', $style['event']);
+        $this->assertSame('New Issue', $style['label']);
+        $this->assertSame('#DC2626', $style['color_hex']);
+    }
+
+    public function testHeaderStyleProducesIssueReopenedForReopenedPrefix(): void
+    {
+        $notifier = new AlertNotifier;
+        $style = $this->callPrivate($notifier, 'headerStyle', ['Reopened Issue', 'exception']);
+
+        $this->assertSame('issue.reopened', $style['event']);
+        $this->assertSame('Reopened Issue', $style['label']);
+        $this->assertSame('#D97706', $style['color_hex']);
+        $this->assertSame(0xD97706, $style['color_int']);
+    }
+
+    public function testHeaderStylePerformanceLabelsForReopened(): void
+    {
+        $notifier = new AlertNotifier;
+        $style = $this->callPrivate($notifier, 'headerStyle', ['Reopened Issue', 'performance']);
+
+        $this->assertSame('issue.reopened', $style['event']);
+        $this->assertSame('Reopened Performance Alert', $style['label']);
+    }
+
+    public function testHeaderStylePerformanceLabelsForNew(): void
+    {
+        $notifier = new AlertNotifier;
+        $style = $this->callPrivate($notifier, 'headerStyle', ['New Issue', 'performance']);
+
+        $this->assertSame('issue.new', $style['event']);
+        $this->assertSame('Performance Alert', $style['label']);
+        $this->assertSame('#F59E0B', $style['color_hex']);
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────

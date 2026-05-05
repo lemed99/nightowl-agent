@@ -134,4 +134,21 @@ return [
     */
     'threshold_cache_ttl' => env('NIGHTOWL_THRESHOLD_CACHE_TTL', 86400),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Auto-Reopen Cooldown (hours)
+    |--------------------------------------------------------------------------
+    |
+    | When a fingerprint with status='resolved' recurs in a drain batch, the
+    | agent flips it back to 'open' and fires an `issue.reopened` alert. Use
+    | this cooldown to suppress that flip when a recurrence arrives within N
+    | hours of the resolve action (anti-flapping). 0 = always reopen on first
+    | recurrence (Sentry-style).
+    |
+    | Issues with status='ignored' are never auto-reopened, regardless of this
+    | setting — "ignored" means the user explicitly asked to silence them.
+    |
+    */
+    'reopen_cooldown_hours' => (int) env('NIGHTOWL_REOPEN_COOLDOWN_HOURS', 0),
+
 ];

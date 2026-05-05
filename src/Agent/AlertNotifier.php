@@ -28,13 +28,14 @@ final class AlertNotifier
     /** Maximum total time for notification dispatch per flush (seconds) */
     private const MAX_NOTIFICATION_SECONDS = 5.0;
 
-    /** @var list<array{appName: string, issueGroups: array, issueType: string, newHashes: string[]}> */
+    /** @var list<array{appName: string, issueGroups: array, issueType: string, newHashes: string[], reopenedHashes: string[]}> */
     private array $pendingNotifications = [];
 
     public function __construct(
         private int $cacheTtl = 86400,
         private string $frontendUrl = '',
         private ?string $appId = null,
+        private int $reopenCooldownHours = 0,
     ) {}
 
     public static function fromConfig(): self
@@ -48,46 +49,100 @@ final class AlertNotifier
             (int) config('nightowl.threshold_cache_ttl', 86400),
             'https://usenightowl.com',
             is_string($appId) && $appId !== '' ? $appId : null,
+            (int) config('nightowl.reopen_cooldown_hours', 0),
         );
     }
 
+    public function reopenCooldownHours(): int
+    {
+        return $this->reopenCooldownHours;
+    }
+
     /**
-     * Stage 1: Call BEFORE the issue upsert to snapshot existing composite keys.
-     * Returns the set of (group_hash|environment) keys that already exist, for diffing after upsert.
+     * Stage 1: Call BEFORE the issue upsert to classify existing fingerprints.
+     *
+     * Returns three buckets:
+     *   - 'existing':     keys whose row exists with status open/ignored, OR status=resolved
+     *                     but within the reopen cooldown — no alert, status stays put.
+     *   - 'reopen':       keys whose row exists with status=resolved AND the most recent
+     *                     status_changed→resolved activity is older than the cooldown.
+     *                     Maps composite key → issue id, used to flip status + log activity
+     *                     + dispatch an issue.reopened alert.
+     *   - (anything not in either bucket) is treated as new by queueIssueNotifications.
      *
      * @param  array  $issueGroups  Groups keyed by "fingerprint|environment", each carrying 'fingerprint' and 'environment'
      * @param  string  $issueType  'exception' or 'performance'
-     * @return string[] Composite keys that already exist
+     * @return array{existing: string[], reopen: array<string, int>}
      */
     public function snapshotExistingIssues(PDO $pdo, array $issueGroups, string $issueType): array
     {
         if (empty($issueGroups)) {
-            return [];
-        }
-
-        $channels = $this->loadChannels($pdo);
-        if (empty($channels)) {
-            return [];
+            return ['existing' => [], 'reopen' => []];
         }
 
         try {
             $existing = [];
+            $reopen = [];
+
+            // Pull id + status + most recent resolve-activity timestamp in one shot.
+            // The resolve_at subquery looks up nightowl_issue_activity for the most
+            // recent transition into 'resolved'; if none exists (e.g., issue was
+            // created already-resolved by some custom path), we fall back to
+            // updated_at as a best-effort proxy so cooldown still works.
             $stmt = $pdo->prepare("
-                SELECT 1 FROM nightowl_issues
-                WHERE group_hash = ? AND type = ? AND environment IS NOT DISTINCT FROM ? AND status != 'resolved'
+                SELECT
+                    i.id,
+                    i.status,
+                    COALESCE(
+                        (SELECT MAX(a.created_at)
+                           FROM nightowl_issue_activity a
+                          WHERE a.issue_id = i.id
+                            AND a.action = 'status_changed'
+                            AND a.new_value = 'resolved'),
+                        i.updated_at
+                    ) AS resolved_at
+                FROM nightowl_issues i
+                WHERE i.group_hash = ?
+                  AND i.type = ?
+                  AND i.environment IS NOT DISTINCT FROM ?
                 LIMIT 1
             ");
 
+            $cooldownSeconds = $this->reopenCooldownHours * 3600;
+            $now = time();
+
             foreach ($issueGroups as $key => $group) {
                 $stmt->execute([$group['fingerprint'], $issueType, $group['environment'] ?? null]);
-                if ($stmt->fetchColumn() !== false) {
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                if ($row === false) {
+                    continue; // truly new — falls through to issue.new
+                }
+
+                $status = $row['status'] ?? 'open';
+
+                if ($status !== 'resolved') {
+                    // open / ignored — suppress, status untouched
+                    $existing[] = $key;
+
+                    continue;
+                }
+
+                // status === 'resolved' — apply cooldown
+                $resolvedAt = $row['resolved_at'] ?? null;
+                $resolvedTs = $resolvedAt !== null ? strtotime((string) $resolvedAt) : false;
+                $elapsed = $resolvedTs !== false ? ($now - $resolvedTs) : PHP_INT_MAX;
+
+                if ($elapsed >= $cooldownSeconds) {
+                    $reopen[$key] = (int) $row['id'];
+                } else {
+                    // Within cooldown — keep silent, leave row resolved
                     $existing[] = $key;
                 }
             }
 
-            return $existing;
+            return ['existing' => $existing, 'reopen' => $reopen];
         } catch (\Throwable) {
-            return [];
+            return ['existing' => [], 'reopen' => []];
         }
     }
 
@@ -98,13 +153,18 @@ final class AlertNotifier
      * @param  string  $appName  Application name
      * @param  array  $issueGroups  Groups keyed by group_hash
      * @param  string  $issueType  'exception' or 'performance'
-     * @param  string[]  $existingBefore  Hashes that existed before the upsert (from snapshotExistingIssues)
+     * @param  array{existing: string[], reopen: array<string, int>}  $snapshot  From snapshotExistingIssues
      */
-    public function queueNewIssueNotifications(string $appName, array $issueGroups, string $issueType, array $existingBefore): void
+    public function queueIssueNotifications(string $appName, array $issueGroups, string $issueType, array $snapshot): void
     {
-        $newHashes = array_diff(array_keys($issueGroups), $existingBefore);
+        $existing = $snapshot['existing'] ?? [];
+        $reopen = $snapshot['reopen'] ?? [];
 
-        if (empty($newHashes)) {
+        $allKeys = array_keys($issueGroups);
+        $reopenedHashes = array_keys($reopen);
+        $newHashes = array_values(array_diff($allKeys, $existing, $reopenedHashes));
+
+        if (empty($newHashes) && empty($reopenedHashes)) {
             return;
         }
 
@@ -112,7 +172,8 @@ final class AlertNotifier
             'appName' => $appName,
             'issueGroups' => $issueGroups,
             'issueType' => $issueType,
-            'newHashes' => array_values($newHashes),
+            'newHashes' => $newHashes,
+            'reopenedHashes' => $reopenedHashes,
         ];
     }
 
@@ -148,14 +209,23 @@ final class AlertNotifier
         $deadline = microtime(true) + self::MAX_NOTIFICATION_SECONDS;
 
         foreach ($pending as $batch) {
-            // Enrich groups from DB once per batch (not per channel)
-            $enrichedGroups = [];
+            // Enrich both buckets from the now-committed DB rows
+            $enrichedNew = [];
             foreach ($batch['newHashes'] as $hash) {
                 $group = $batch['issueGroups'][$hash] ?? null;
                 if ($group === null) {
                     continue;
                 }
-                $enrichedGroups[$hash] = $this->enrichFromDb($pdo, $group, $hash, $batch['issueType']);
+                $enrichedNew[$hash] = $this->enrichFromDb($pdo, $group, $hash, $batch['issueType']);
+            }
+
+            $enrichedReopened = [];
+            foreach ($batch['reopenedHashes'] ?? [] as $hash) {
+                $group = $batch['issueGroups'][$hash] ?? null;
+                if ($group === null) {
+                    continue;
+                }
+                $enrichedReopened[$hash] = $this->enrichFromDb($pdo, $group, $hash, $batch['issueType']);
             }
 
             foreach ($channels as $channel) {
@@ -168,18 +238,29 @@ final class AlertNotifier
                 $config = $channel['config'];
                 $notifyEvents = $config['notify_events'] ?? null;
 
-                if ($notifyEvents !== null && ! in_array('issue.new', $notifyEvents)) {
-                    continue;
+                $sendNew = $notifyEvents === null || in_array('issue.new', $notifyEvents);
+                $sendReopened = $notifyEvents === null || in_array('issue.reopened', $notifyEvents);
+
+                if ($sendNew) {
+                    foreach ($enrichedNew as $group) {
+                        if (microtime(true) > $deadline) {
+                            error_log('[NightOwl Agent] Notification dispatch budget exceeded ('.self::MAX_NOTIFICATION_SECONDS.'s), skipping remaining');
+
+                            return;
+                        }
+                        $this->dispatchToChannel($channel, $batch['appName'], 'New Issue', $group, $batch['issueType']);
+                    }
                 }
 
-                foreach ($enrichedGroups as $group) {
-                    if (microtime(true) > $deadline) {
-                        error_log('[NightOwl Agent] Notification dispatch budget exceeded ('.self::MAX_NOTIFICATION_SECONDS.'s), skipping remaining');
+                if ($sendReopened) {
+                    foreach ($enrichedReopened as $group) {
+                        if (microtime(true) > $deadline) {
+                            error_log('[NightOwl Agent] Notification dispatch budget exceeded ('.self::MAX_NOTIFICATION_SECONDS.'s), skipping remaining');
 
-                        return;
+                            return;
+                        }
+                        $this->dispatchToChannel($channel, $batch['appName'], 'Reopened Issue', $group, $batch['issueType']);
                     }
-
-                    $this->dispatchToChannel($channel, $batch['appName'], 'New Issue', $group, $batch['issueType']);
                 }
             }
         }
@@ -346,6 +427,37 @@ final class AlertNotifier
     }
 
     /**
+     * Per-channel header style derived from the prefix + issue type.
+     *
+     * Prefixes are 'New Issue' / 'Reopened Issue' (set in flushNotifications).
+     * Returns: ['event' => 'issue.new'|'issue.reopened', 'label' => string,
+     *           'emoji' => utf8 string, 'color_hex' => string, 'color_int' => int]
+     */
+    private function headerStyle(string $prefix, string $issueType): array
+    {
+        $isReopened = str_contains($prefix, 'Reopened');
+        $isException = $issueType === 'exception';
+
+        if ($isReopened) {
+            return [
+                'event' => 'issue.reopened',
+                'label' => $isException ? 'Reopened Issue' : 'Reopened Performance Alert',
+                'emoji' => "\xF0\x9F\x94\x84", // counterclockwise arrows
+                'color_hex' => '#D97706',
+                'color_int' => 0xD97706,
+            ];
+        }
+
+        return [
+            'event' => 'issue.new',
+            'label' => $isException ? 'New Issue' : 'Performance Alert',
+            'emoji' => $isException ? "\xF0\x9F\x9A\xA8" : "\xE2\x9A\xA1",
+            'color_hex' => $isException ? '#DC2626' : '#F59E0B',
+            'color_int' => $isException ? 0xDC2626 : 0xF59E0B,
+        ];
+    }
+
+    /**
      * Resolve the display name for an issue group.
      * Exception groups have 'class', performance groups have 'name'.
      */
@@ -410,8 +522,9 @@ final class AlertNotifier
         $handled = $group['handled'] ?? null;
         $isException = $issueType === 'exception';
 
-        $headerEmoji = $isException ? "\xF0\x9F\x9A\xA8" : "\xE2\x9A\xA1"; // siren vs high-voltage bolt
-        $headerLabel = $isException ? 'New Issue' : 'Performance Alert';
+        $style = $this->headerStyle($prefix, $issueType);
+        $headerEmoji = $style['emoji'];
+        $headerLabel = $style['label'];
 
         $blocks = [];
 
@@ -507,7 +620,7 @@ final class AlertNotifier
             'elements' => [['type' => 'mrkdwn', 'text' => 'NightOwl']],
         ];
 
-        $attachmentColor = $isException ? '#DC2626' : '#F59E0B';
+        $attachmentColor = $style['color_hex'];
 
         $payload = [
             'username' => 'NightOwl',
@@ -597,8 +710,9 @@ final class AlertNotifier
 
         $logoUrl = $this->logoUrl();
 
-        $discordTitle = $isException ? "\xF0\x9F\x9A\xA8  New Issue" : "\xE2\x9A\xA1  Performance Alert";
-        $discordColor = $isException ? 0xDC2626 : 0xF59E0B;
+        $style = $this->headerStyle($prefix, $issueType);
+        $discordTitle = $style['emoji'].'  '.$style['label'];
+        $discordColor = $style['color_int'];
 
         $embed = [
             'author' => ['name' => 'NightOwl', 'icon_url' => $logoUrl],
@@ -664,7 +778,7 @@ final class AlertNotifier
         ];
 
         $payload = json_encode([
-            'event' => 'issue.new',
+            'event' => $this->headerStyle($prefix, $issueType)['event'],
             'app' => $appName,
             'app_id' => $this->appId,
             'view_url' => $this->buildViewUrl($issueId),
@@ -698,7 +812,7 @@ final class AlertNotifier
         $name = $this->issueName($group);
         $group['view_url'] = $this->buildViewUrl($group['issue_id'] ?? null);
 
-        $subjectPrefix = $issueType === 'performance' ? 'Performance Alert' : 'New Issue';
+        $subjectPrefix = $this->headerStyle($prefix, $issueType)['label'];
         $subject = $this->sanitizeHeader("[{$appName}] {$subjectPrefix}: {$name}");
         $fromName = $this->sanitizeHeader($fromName);
 
