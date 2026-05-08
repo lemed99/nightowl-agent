@@ -47,7 +47,7 @@ final class AlertNotifier
 
         return new self(
             (int) config('nightowl.threshold_cache_ttl', 86400),
-            'https://usenightowl.com',
+            (string) config('nightowl.agent.dashboard_url', 'https://usenightowl.com'),
             is_string($appId) && $appId !== '' ? $appId : null,
             (int) config('nightowl.reopen_cooldown_hours', 0),
         );

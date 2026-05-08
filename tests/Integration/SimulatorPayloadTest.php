@@ -78,7 +78,8 @@ class SimulatorPayloadTest extends TestCase
         $this->assertArrayHasKey('class', $result['records'][0]);
         $this->assertArrayHasKey('message', $result['records'][0]);
         $this->assertArrayHasKey('trace', $result['records'][0]);
-        $this->assertArrayHasKey('fingerprint', $result['records'][0]);
+        // Real Nightwatch wire format uses `_group` (xxh128 dedup key), not `fingerprint`.
+        $this->assertArrayHasKey('_group', $result['records'][0]);
     }
 
     public function testJobRecordParsesCorrectly(): void
@@ -88,10 +89,26 @@ class SimulatorPayloadTest extends TestCase
 
         $result = $this->parser->parse($wire);
 
+        // queued-job is the dispatch event — no execution stats (status, duration, etc.)
         $this->assertSame('queued-job', $result['records'][0]['t']);
         $this->assertArrayHasKey('name', $result['records'][0]);
         $this->assertArrayHasKey('queue', $result['records'][0]);
+        $this->assertArrayHasKey('job_id', $result['records'][0]);
+    }
+
+    public function testJobAttemptRecordParsesCorrectly(): void
+    {
+        $record = $this->sim->makeJobAttempt();
+        $wire = $this->buildWirePayload([$record]);
+
+        $result = $this->parser->parse($wire);
+
+        // job-attempt is the execution event — carries status + duration + exceptions/etc.
+        $this->assertSame('job-attempt', $result['records'][0]['t']);
+        $this->assertArrayHasKey('job_id', $result['records'][0]);
+        $this->assertArrayHasKey('attempt_id', $result['records'][0]);
         $this->assertArrayHasKey('status', $result['records'][0]);
+        $this->assertArrayHasKey('duration', $result['records'][0]);
     }
 
     public function testCommandRecordParsesCorrectly(): void
@@ -199,6 +216,7 @@ class SimulatorPayloadTest extends TestCase
             $this->sim->makeQuery(),
             $this->sim->makeException(),
             $this->sim->makeJob(),
+            $this->sim->makeJobAttempt(),
             $this->sim->makeCommand(),
             $this->sim->makeScheduledTask(),
             $this->sim->makeCacheEvent(),
@@ -213,13 +231,14 @@ class SimulatorPayloadTest extends TestCase
         $result = $this->parser->parse($wire);
 
         $this->assertSame('json', $result['type']);
-        $this->assertCount(12, $result['records']);
+        $this->assertCount(13, $result['records']);
 
         $types = array_column($result['records'], 't');
         $this->assertContains('request', $types);
         $this->assertContains('query', $types);
         $this->assertContains('exception', $types);
         $this->assertContains('queued-job', $types);
+        $this->assertContains('job-attempt', $types);
         $this->assertContains('command', $types);
         $this->assertContains('scheduled-task', $types);
         $this->assertContains('cache-event', $types);

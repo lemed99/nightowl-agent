@@ -123,7 +123,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 (int) config('nightowl.agent.udp_port', 2408),
                 (bool) config('nightowl.agent.health_enabled', true),
                 (int) config('nightowl.agent.health_port', 2409),
-                'https://api.usenightowl.com',
+                (string) config('nightowl.agent.api_url', 'https://api.usenightowl.com'),
                 (string) config('nightowl.agent.token', ''),
                 (bool) config('nightowl.agent.health_report_enabled', true),
                 (int) config('nightowl.agent.health_report_interval', 30),

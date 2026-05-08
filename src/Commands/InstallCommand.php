@@ -29,9 +29,8 @@ class InstallCommand extends Command
         $this->newLine();
         $this->info('NightOwl installed successfully!');
         $this->newLine();
-        $this->line('Next steps:');
-        $this->line('  1. Start the agent: <comment>php artisan nightowl:agent</comment>');
-        $this->line('  2. View the dashboard: <comment>' . 'https://usenightowl.com' . '</comment>');
+        $this->line('Next step:');
+        $this->line('  - Start the agent: <comment>php artisan nightowl:agent</comment>');
 
         return self::SUCCESS;
     }

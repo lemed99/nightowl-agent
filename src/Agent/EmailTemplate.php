@@ -278,7 +278,14 @@ final class EmailTemplate
     {
         $base = rtrim($frontendUrl, '/');
         if ($base === '') {
-            $base = 'https://usenightowl.com';
+            // Resolve via container only when one is bound (agent boot path); otherwise
+            // fall back to the literal — keeps EmailTemplate testable without Laravel.
+            try {
+                $configured = (string) config('nightowl.agent.dashboard_url', 'https://usenightowl.com');
+            } catch (\Throwable) {
+                $configured = 'https://usenightowl.com';
+            }
+            $base = rtrim($configured, '/');
         }
         $src = htmlspecialchars($base . '/full-logo.png', ENT_QUOTES | ENT_HTML5, 'UTF-8');
 

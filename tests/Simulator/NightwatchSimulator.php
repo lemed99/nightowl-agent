@@ -5,8 +5,13 @@ namespace NightOwl\Tests\Simulator;
 /**
  * Simulates a laravel/nightwatch collector sending telemetry over TCP.
  *
- * Generates realistic payloads for all 12 record types and sends them
- * using the exact wire format: [length]:[version]:[tokenHash]:[payload]
+ * Record bodies are loaded from captured fixtures under tests/Simulator/fixtures/
+ * (one JSONL file per Nightwatch record type). The simulator picks a random
+ * fixture row, refreshes mutable fields (trace_id/timestamp), then merges any
+ * caller overrides. This keeps the wire-shape locked to what the real
+ * laravel/nightwatch SDK emits — the fixtures are the source of truth.
+ *
+ * Wire format: [length]:[version]:[tokenHash]:[payload]
  *
  * Usage:
  *   php tests/Simulator/run.php --token=your-token --host=127.0.0.1 --port=2407
@@ -25,6 +30,9 @@ final class NightwatchSimulator
 
     /** @var array<string, int> */
     private array $stats = ['sent' => 0, 'failed' => 0, 'bytes' => 0];
+
+    /** @var array<string, array<int, array<string, mixed>>> Fixture cache keyed by record type */
+    private array $fixtures = [];
 
     public function __construct(
         string $token,
@@ -196,22 +204,36 @@ final class NightwatchSimulator
     }
 
     /**
-     * Simulate a queued job lifecycle.
+     * Simulate a queued job lifecycle: a queued-job dispatch event followed by a
+     * job-attempt execution event with the given status.
      */
     public function simulateJob(string $status = 'processed', array $overrides = []): ?string
     {
         $traceId = $this->uuid();
         $now = microtime(true);
         $userId = 'user_'.mt_rand(1, 50);
+        $jobId = $this->uuid();
 
         $records = [];
 
+        // Dispatch event (queued-job) — no execution stats
         $records[] = $this->makeJob(array_merge([
             'trace_id' => $traceId,
             'timestamp' => $now,
             'user' => $userId,
-            'status' => $status,
+            'job_id' => $jobId,
         ], $overrides));
+
+        // Execution event (job-attempt) — carries status, duration, exceptions
+        $records[] = $this->makeJobAttempt([
+            'trace_id' => $this->uuid(),
+            'timestamp' => $now + 0.01,
+            'user' => $userId,
+            'job_id' => $jobId,
+            'attempt_id' => $this->uuid(),
+            'attempt' => 1,
+            'status' => $status,
+        ]);
 
         // Jobs do queries too
         for ($i = 0; $i < mt_rand(1, 5); $i++) {
@@ -318,14 +340,6 @@ final class NightwatchSimulator
 
     private function scenarioErrorStorm(int $count): void
     {
-        $classes = [
-            'App\\Exceptions\\PaymentFailedException',
-            'Illuminate\\Database\\QueryException',
-            'RuntimeException',
-            'Symfony\\Component\\HttpKernel\\Exception\\NotFoundHttpException',
-            'App\\Exceptions\\RateLimitExceededException',
-        ];
-
         for ($i = 0; $i < $count; $i++) {
             $this->simulateErrorRequest([
                 'url' => '/api/checkout',
@@ -400,395 +414,122 @@ final class NightwatchSimulator
     }
 
     // ─── Record Builders ───────────────────────────────────────
+    //
+    // Each make*() returns a captured Nightwatch payload (random row from the
+    // matching fixture file) with a fresh trace_id + timestamp, then merges
+    // any caller overrides. The fixtures are the source of truth for which
+    // fields exist — do not add hand-rolled defaults here.
 
     public function makeRequest(array $overrides = []): array
     {
-        $routes = [
-            ['GET', '/api/users', '/api/users'],
-            ['POST', '/api/auth/login', '/api/auth/{uuid}/login'],
-            ['GET', '/api/products', '/api/products'],
-            ['GET', '/api/dashboard', '/api/dashboard'],
-            ['PUT', '/api/users/1', '/api/users/{id}'],
-            ['DELETE', '/api/sessions/abc', '/api/sessions/{id}'],
-            ['GET', '/api/orders', '/api/orders'],
-            ['POST', '/api/checkout', '/api/checkout'],
-            ['GET', '/api/notifications', '/api/notifications'],
-            ['PATCH', '/api/settings', '/api/settings'],
-        ];
-
-        $route = $routes[array_rand($routes)];
-        $statusCodes = [200, 200, 200, 200, 200, 201, 204, 301, 404, 422, 500];
-        $status = $overrides['status_code'] ?? $statusCodes[array_rand($statusCodes)];
-
-        return array_merge([
-            't' => 'request',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            '_group' => md5($route[1]),
-            'user' => null,
-            'method' => $route[0],
-            'url' => "https://app.example.com{$route[1]}",
-            'route_name' => null,
-            'route_methods' => json_encode([$route[0]]),
-            'route_domain' => null,
-            'route_path' => $route[2],
-            'route_action' => 'App\\Http\\Controllers\\ApiController@handle',
-            'ip' => '192.168.1.'.mt_rand(1, 254),
-            'duration' => mt_rand(5_000, 800_000),
-            'status_code' => $status,
-            'request_size' => mt_rand(200, 5000),
-            'response_size' => mt_rand(500, 50_000),
-            'bootstrap' => mt_rand(1000, 5000),
-            'before_middleware' => mt_rand(500, 3000),
-            'action' => mt_rand(5000, 200_000),
-            'render' => mt_rand(100, 2000),
-            'after_middleware' => mt_rand(100, 1000),
-            'sending' => mt_rand(50, 500),
-            'terminating' => mt_rand(100, 3000),
-            'exceptions' => 0,
-            'logs' => mt_rand(0, 3),
-            'queries' => mt_rand(2, 15),
-            'jobs_queued' => 0,
-            'mail' => 0,
-            'notifications' => 0,
-            'outgoing_requests' => 0,
-            'cache_events' => mt_rand(0, 5),
-            'peak_memory_usage' => mt_rand(8_000_000, 64_000_000),
-            'context' => null,
-            'headers' => json_encode([
-                'host' => 'app.example.com',
-                'user-agent' => 'Mozilla/5.0',
-                'accept' => 'application/json',
-                'x-request-id' => $this->uuid(),
-            ]),
-            'payload' => null,
-        ], $overrides);
+        return array_merge($this->fromFixture('request'), $overrides);
     }
 
     public function makeQuery(array $overrides = []): array
     {
-        $queries = [
-            ['SELECT * FROM "users" WHERE "id" = ?', 'read'],
-            ['SELECT * FROM "products" WHERE "active" = ? ORDER BY "created_at" DESC LIMIT ?', 'read'],
-            ['INSERT INTO "orders" ("user_id", "total", "created_at") VALUES (?, ?, ?)', 'write'],
-            ['UPDATE "users" SET "last_login_at" = ? WHERE "id" = ?', 'write'],
-            ['SELECT COUNT(*) FROM "notifications" WHERE "read_at" IS NULL AND "user_id" = ?', 'read'],
-            ['DELETE FROM "sessions" WHERE "expires_at" < ?', 'write'],
-            ['SELECT "u"."id", "u"."email", "o"."total" FROM "users" "u" JOIN "orders" "o" ON "o"."user_id" = "u"."id" WHERE "o"."created_at" > ?', 'read'],
-        ];
-
-        $q = $queries[array_rand($queries)];
-
-        return array_merge([
-            't' => 'query',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            '_group' => md5($q[0]),
-            'execution_source' => 'request',
-            'execution_id' => null,
-            'execution_stage' => 'action',
-            'user' => null,
-            'sql' => $q[0],
-            'file' => 'app/Http/Controllers/ApiController.php',
-            'line' => mt_rand(20, 200),
-            'duration' => mt_rand(50, 50_000),
-            'connection' => 'pgsql',
-            'connection_type' => $q[1],
-        ], $overrides);
+        return array_merge($this->fromFixture('query'), $overrides);
     }
 
     public function makeException(array $overrides = []): array
     {
-        $exceptions = [
-            ['RuntimeException', 'Something went wrong', 'app/Services/PaymentService.php', 42],
-            ['Illuminate\\Database\\QueryException', 'SQLSTATE[23505]: Unique violation', 'vendor/laravel/framework/src/Database/Connection.php', 760],
-            ['App\\Exceptions\\ValidationException', 'The given data was invalid.', 'app/Http/Requests/StoreOrderRequest.php', 15],
-            ['TypeError', 'Argument #1 must be of type string, null given', 'app/Models/User.php', 88],
-            ['Symfony\\Component\\HttpKernel\\Exception\\NotFoundHttpException', 'The route could not be found.', 'vendor/laravel/framework/src/Routing/Router.php', 432],
-        ];
-
-        $e = $exceptions[array_rand($exceptions)];
-
-        return array_merge([
-            't' => 'exception',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            'execution_source' => 'request',
-            'execution_id' => null,
-            'execution_stage' => 'action',
-            'user' => null,
-            'class' => $e[0],
-            'message' => $e[1],
-            'code' => '0',
-            'file' => $e[2],
-            'line' => $e[3],
-            'trace' => $this->fakeStackTrace($e[0], $e[2], $e[3]),
-            'php_version' => '8.4.15',
-            'laravel_version' => '12.43.1',
-            'handled' => false,
-            'fingerprint' => md5($e[0].$e[2].$e[3]),
-        ], $overrides);
+        return array_merge($this->fromFixture('exception'), $overrides);
     }
 
+    /**
+     * Job dispatch event — `t: queued-job`. No execution stats (status,
+     * exceptions, queries, etc.) — those belong to job-attempt records.
+     */
     public function makeJob(array $overrides = []): array
     {
-        $jobs = [
-            'App\\Jobs\\SendWelcomeEmail',
-            'App\\Jobs\\ProcessPayment',
-            'App\\Jobs\\GenerateReport',
-            'App\\Jobs\\SyncInventory',
-            'App\\Jobs\\SendNotification',
-        ];
+        return array_merge($this->fromFixture('queued-job'), $overrides);
+    }
 
-        return array_merge([
-            't' => 'queued-job',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'worker-01',
-            '_group' => md5($jobs[0]),
-            'execution_source' => 'request',
-            'execution_id' => null,
-            'user' => null,
-            'name' => $jobs[array_rand($jobs)],
-            'queue' => ['default', 'emails', 'reports'][array_rand(['default', 'emails', 'reports'])],
-            'connection' => 'database',
-            'status' => 'processed',
-            'duration' => mt_rand(10_000, 5_000_000),
-            'attempts' => 1,
-            'exceptions' => 0,
-            'logs' => 0,
-            'queries' => mt_rand(1, 10),
-            'jobs_queued' => 0,
-            'mail' => 0,
-            'notifications' => 0,
-            'outgoing_requests' => 0,
-            'cache_events' => 0,
-            'peak_memory_usage' => mt_rand(16_000_000, 64_000_000),
-        ], $overrides);
+    /**
+     * Job execution event — `t: job-attempt`. Carries status/duration/exceptions/etc.
+     * Pair with a queued-job record (same job_id) to model the full lifecycle.
+     */
+    public function makeJobAttempt(array $overrides = []): array
+    {
+        return array_merge($this->fromFixture('job-attempt'), $overrides);
     }
 
     public function makeCommand(array $overrides = []): array
     {
-        $commands = ['migrate', 'db:seed', 'cache:clear', 'queue:restart', 'config:cache', 'route:cache'];
-
-        return array_merge([
-            't' => 'command',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            '_group' => md5($commands[0]),
-            'user' => null,
-            'command' => $commands[array_rand($commands)],
-            'exit_code' => 0,
-            'duration' => mt_rand(50_000, 10_000_000),
-            'exceptions' => 0,
-            'logs' => mt_rand(0, 5),
-            'queries' => mt_rand(0, 50),
-            'jobs_queued' => 0,
-            'mail' => 0,
-            'notifications' => 0,
-            'outgoing_requests' => 0,
-            'cache_events' => 0,
-            'peak_memory_usage' => mt_rand(32_000_000, 128_000_000),
-        ], $overrides);
+        return array_merge($this->fromFixture('command'), $overrides);
     }
 
     public function makeScheduledTask(array $overrides = []): array
     {
-        $tasks = [
-            ['schedule:run', '* * * * *'],
-            ['horizon:snapshot', '*/5 * * * *'],
-            ['nightowl:prune', '0 3 * * *'],
-            ['queue:prune-batches', '0 * * * *'],
-        ];
-
-        $task = $tasks[array_rand($tasks)];
-
-        return array_merge([
-            't' => 'scheduled-task',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            '_group' => md5($task[0]),
-            'user' => null,
-            'name' => $task[0],
-            'cron' => $task[1],
-            'status' => 'processed',
-            'duration' => mt_rand(100_000, 30_000_000),
-            'exit_code' => 0,
-            'exceptions' => 0,
-            'logs' => 0,
-            'queries' => mt_rand(0, 20),
-            'jobs_queued' => 0,
-            'mail' => 0,
-            'notifications' => 0,
-            'outgoing_requests' => 0,
-            'cache_events' => 0,
-            'peak_memory_usage' => mt_rand(16_000_000, 64_000_000),
-        ], $overrides);
+        return array_merge($this->fromFixture('scheduled-task'), $overrides);
     }
 
     public function makeCacheEvent(array $overrides = []): array
     {
-        $keys = ['users:1', 'products:list', 'config:cache', 'route:cache', 'session:abc123'];
-        $types = ['hit', 'hit', 'hit', 'miss', 'write', 'delete'];
-
-        return array_merge([
-            't' => 'cache-event',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            'execution_source' => 'request',
-            'execution_id' => null,
-            'execution_stage' => 'action',
-            'user' => null,
-            'type' => $types[array_rand($types)],
-            'key' => $keys[array_rand($keys)],
-            'store' => 'redis',
-            'ttl' => mt_rand(60, 86400),
-            'duration' => mt_rand(50, 5000),
-        ], $overrides);
+        return array_merge($this->fromFixture('cache-event'), $overrides);
     }
 
     public function makeMail(array $overrides = []): array
     {
-        $mailables = [
-            'App\\Mail\\WelcomeMail',
-            'App\\Mail\\OrderConfirmation',
-            'App\\Mail\\PasswordReset',
-            'App\\Mail\\InvoiceMail',
-        ];
-
-        return array_merge([
-            't' => 'mail',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            'execution_source' => 'job',
-            'execution_id' => null,
-            'execution_stage' => null,
-            'user' => null,
-            'mailer' => 'smtp',
-            'to' => json_encode(['user@example.com']),
-            'subject' => 'Welcome to our platform!',
-            'class' => $mailables[array_rand($mailables)],
-            'duration' => mt_rand(50_000, 500_000),
-            'queued' => true,
-        ], $overrides);
+        return array_merge($this->fromFixture('mail'), $overrides);
     }
 
     public function makeNotification(array $overrides = []): array
     {
-        $notifications = [
-            'App\\Notifications\\OrderShipped',
-            'App\\Notifications\\PaymentReceived',
-            'App\\Notifications\\NewFollower',
-        ];
-
-        return array_merge([
-            't' => 'notification',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            'execution_source' => 'job',
-            'execution_id' => null,
-            'execution_stage' => null,
-            'user' => null,
-            'class' => $notifications[array_rand($notifications)],
-            'channel' => ['mail', 'database', 'slack'][array_rand(['mail', 'database', 'slack'])],
-            'notifiable_type' => 'App\\Models\\User',
-            'notifiable_id' => (string) mt_rand(1, 100),
-            'duration' => mt_rand(10_000, 200_000),
-            'queued' => true,
-        ], $overrides);
+        return array_merge($this->fromFixture('notification'), $overrides);
     }
 
     public function makeOutgoingRequest(array $overrides = []): array
     {
-        $apis = [
-            ['GET', 'https://api.stripe.com/v1/charges', 200],
-            ['POST', 'https://api.stripe.com/v1/payments', 201],
-            ['GET', 'https://api.github.com/repos/owner/repo', 200],
-            ['POST', 'https://hooks.slack.com/services/T00/B00/xxx', 200],
-            ['GET', 'https://maps.googleapis.com/maps/api/geocode/json', 200],
-        ];
-
-        $api = $apis[array_rand($apis)];
-
-        return array_merge([
-            't' => 'outgoing-request',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            'execution_source' => 'request',
-            'execution_id' => null,
-            'execution_stage' => 'action',
-            'user' => null,
-            'method' => $api[0],
-            'url' => $api[1],
-            'status_code' => $api[2],
-            'duration' => mt_rand(50_000, 2_000_000),
-            'request_size' => mt_rand(100, 2000),
-            'response_size' => mt_rand(200, 50_000),
-            'request_headers' => null,
-        ], $overrides);
+        return array_merge($this->fromFixture('outgoing-request'), $overrides);
     }
 
     public function makeLog(array $overrides = []): array
     {
-        $levels = ['debug', 'info', 'info', 'notice', 'warning', 'error'];
-        $messages = [
-            'User logged in successfully',
-            'Cache key expired, refreshing',
-            'Payment processed for order #1234',
-            'Slow query detected (> 500ms)',
-            'Rate limit approaching for API key',
-            'Failed to connect to external service',
-        ];
-
-        return array_merge([
-            't' => 'log',
-            'trace_id' => $this->uuid(),
-            'timestamp' => microtime(true),
-            'deploy' => 'production',
-            'server' => 'web-01',
-            'execution_source' => 'request',
-            'execution_id' => null,
-            'execution_stage' => 'action',
-            'user' => null,
-            'level' => $levels[array_rand($levels)],
-            'message' => $messages[array_rand($messages)],
-            'context' => json_encode(['key' => 'value', 'elapsed' => mt_rand(1, 500)]),
-            'channel' => 'stack',
-        ], $overrides);
+        return array_merge($this->fromFixture('log'), $overrides);
     }
 
     public function makeUser(string $userId): array
     {
-        $names = ['Alice Johnson', 'Bob Smith', 'Charlie Brown', 'Diana Prince', 'Eve Williams'];
-
-        return [
-            't' => 'user',
-            'id' => $userId,
-            'name' => $names[array_rand($names)],
-            'username' => strtolower(str_replace(' ', '.', $names[array_rand($names)])).'@example.com',
-        ];
+        return array_merge($this->fromFixture('user'), ['id' => $userId]);
     }
 
     // ─── Helpers ───────────────────────────────────────────────
+
+    /**
+     * Pull a random row from a fixture file, then refresh the mutable fields
+     * (trace_id, timestamp). Fixtures are loaded lazily and cached per type.
+     */
+    private function fromFixture(string $type): array
+    {
+        if (! isset($this->fixtures[$type])) {
+            $path = __DIR__."/fixtures/{$type}.jsonl";
+            if (! is_file($path)) {
+                throw new \RuntimeException("Missing fixture file: {$path}");
+            }
+
+            $rows = [];
+            foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+                $rows[] = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
+            }
+
+            if ($rows === []) {
+                throw new \RuntimeException("Empty fixture file: {$path}");
+            }
+
+            $this->fixtures[$type] = $rows;
+        }
+
+        $row = $this->fixtures[$type][array_rand($this->fixtures[$type])];
+
+        if (array_key_exists('trace_id', $row)) {
+            $row['trace_id'] = $this->uuid();
+        }
+        if (array_key_exists('timestamp', $row)) {
+            $row['timestamp'] = microtime(true);
+        }
+
+        return $row;
+    }
 
     private function uuid(): string
     {
@@ -800,21 +541,6 @@ final class NightwatchSimulator
             mt_rand(0, 0x3FFF) | 0x8000,
             mt_rand(0, 0xFFFF), mt_rand(0, 0xFFFF), mt_rand(0, 0xFFFF),
         );
-    }
-
-    private function fakeStackTrace(string $class, string $file, int $line): string
-    {
-        return <<<TRACE
-        {$class}: Error occurred
-        #0 {$file}({$line}): {$class}->handle()
-        #1 app/Http/Controllers/ApiController.php(45): App\\Services\\PaymentService->process()
-        #2 vendor/laravel/framework/src/Routing/Controller.php(54): App\\Http\\Controllers\\ApiController->store()
-        #3 vendor/laravel/framework/src/Routing/ControllerDispatcher.php(45): call_user_func_array()
-        #4 vendor/laravel/framework/src/Routing/Route.php(261): Illuminate\\Routing\\ControllerDispatcher->dispatch()
-        #5 vendor/laravel/framework/src/Routing/Router.php(837): Illuminate\\Routing\\Route->run()
-        #6 vendor/laravel/framework/src/Pipeline/Pipeline.php(144): Illuminate\\Routing\\Router->runRoute()
-        #7 {main}
-        TRACE;
     }
 
     private function printProgress(int $current, int $total): void

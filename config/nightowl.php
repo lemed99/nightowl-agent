@@ -33,6 +33,12 @@ return [
     'agent' => [
         'host' => env('NIGHTOWL_AGENT_HOST', '127.0.0.1'),
         'port' => env('NIGHTOWL_AGENT_PORT', 2407),
+        // NightOwl SaaS API base URL — destination for health reports. Override
+        // for self-hosted dashboards or staging environments.
+        'api_url' => env('NIGHTOWL_API_URL', 'https://api.usenightowl.com'),
+        // NightOwl dashboard / frontend base URL — used in alert links, email
+        // logos, and CLI output. Override for self-hosted dashboards.
+        'dashboard_url' => env('NIGHTOWL_DASHBOARD_URL', 'https://usenightowl.com'),
         // NIGHTWATCH_TOKEN is a deprecated fallback for installs that pre-date
         // the rename — new installs should use NIGHTOWL_TOKEN.
         'token' => env('NIGHTOWL_TOKEN', env('NIGHTWATCH_TOKEN')),
