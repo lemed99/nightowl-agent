@@ -432,7 +432,23 @@ final class NightwatchSimulator
 
     public function makeException(array $overrides = []): array
     {
-        return array_merge($this->fromFixture('exception'), $overrides);
+        $record = array_merge($this->fromFixture('exception'), $overrides);
+        // Force a deterministic `code` when the caller doesn't pin one — the
+        // fixture file carries multiple sample rows (some with SQLSTATE codes
+        // like "23505") and a random pick would produce a different `_group`
+        // each call, breaking tests that send N exceptions and expect them
+        // to dedupe into one issue.
+        if (! array_key_exists('code', $overrides)) {
+            $record['code'] = '0';
+        }
+        // Recompute _group to reflect the merged class/code/file/line — the
+        // baked fixture hash is stale once a test customizes those fields.
+        // Formula matches the test's expected md5(class|0|file|line).
+        $record['_group'] = md5(
+            ($record['class'] ?? '').'|'.($record['code'] ?? '').'|'.($record['file'] ?? '').'|'.($record['line'] ?? '')
+        );
+
+        return $record;
     }
 
     /**
