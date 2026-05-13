@@ -23,6 +23,15 @@ final class DrainWorker
 
     private float $pgLatencyEwma = 0.0; // EWMA in ms
 
+    // Checkpoint observability — answers "is TRUNCATE actually firing under load?"
+    private int $truncateAttempts = 0;
+
+    private int $truncateSuccesses = 0;
+
+    private int $truncateFailures = 0;
+
+    private int $walSizeBytes = 0;
+
     private const EWMA_ALPHA = 0.3;
 
     public function __construct(
@@ -40,6 +49,9 @@ final class DrainWorker
         private int $thresholdCacheTtl = 86400,
         private string $appName = 'NightOwl',
         private string $environment = 'production',
+        // Knobs the chaos test tunes; defaults match prior hardcoded behavior.
+        private int $checkpointIntervalSeconds = 60,
+        private int $checkpointTruncateBytes = 100 * 1024 * 1024,
     ) {}
 
     /**
@@ -93,8 +105,8 @@ final class DrainWorker
                 $lastFlushTime = microtime(true);
             }
 
-            // Cleanup + WAL checkpoint every 60s
-            if (time() - $lastCleanup >= 60) {
+            // Cleanup + WAL checkpoint on the configured cadence (default 60s)
+            if (time() - $lastCleanup >= $this->checkpointIntervalSeconds) {
                 try {
                     $buffer->cleanup(300);
                     $this->checkpointWithEscalation($buffer);
@@ -163,21 +175,27 @@ final class DrainWorker
         $buffer->checkpoint();
 
         $walSize = $buffer->walSize();
+        $this->walSizeBytes = $walSize;
 
-        // Escalate to TRUNCATE when WAL exceeds 100MB — smaller, more frequent
-        // checkpoints (50-200ms each) beat one rare 200-500ms stall.
-        if ($walSize > 100 * 1024 * 1024) {
+        // Escalate to TRUNCATE when WAL exceeds the configured threshold —
+        // smaller, more frequent checkpoints (50-200ms each) beat one rare
+        // 200-500ms stall.
+        if ($walSize > $this->checkpointTruncateBytes) {
             $walMb = round($walSize / 1024 / 1024);
             error_log("[NightOwl Drain] WAL is {$walMb}MB, running TRUNCATE checkpoint to reset...");
 
+            $this->truncateAttempts++;
             try {
                 $start = microtime(true);
                 $buffer->checkpointTruncate();
                 $elapsed = (int) round((microtime(true) - $start) * 1000);
+                $this->truncateSuccesses++;
+                $this->walSizeBytes = $buffer->walSize();
                 error_log("[NightOwl Drain] TRUNCATE checkpoint complete in {$elapsed}ms. WAL reset to zero.");
             } catch (\Throwable $e) {
                 // TRUNCATE can fail if a reader/writer can't be interrupted within busy_timeout.
                 // Not fatal — PASSIVE already made partial progress. We'll try again next cycle.
+                $this->truncateFailures++;
                 error_log("[NightOwl Drain] TRUNCATE checkpoint failed (will retry): {$e->getMessage()}");
             }
         }
@@ -256,6 +274,10 @@ final class DrainWorker
             'batches_failed' => $this->batchesFailed,
             'rows_drained' => $this->rowsDrained,
             'pg_latency_ms' => round($this->pgLatencyEwma, 2),
+            'wal_size_bytes' => $this->walSizeBytes,
+            'truncate_attempts' => $this->truncateAttempts,
+            'truncate_successes' => $this->truncateSuccesses,
+            'truncate_failures' => $this->truncateFailures,
             'updated_at' => microtime(true),
         ], JSON_THROW_ON_ERROR);
 

@@ -32,7 +32,7 @@ if (! function_exists('pcntl_fork') || ! function_exists('posix_kill')) {
     exit(1);
 }
 
-$options = getopt('', ['token:', 'host:', 'port:', 'db-host:', 'db-port:', 'db-name:', 'db-user:', 'db-pass:', 'drain-workers:', 'threshold-cache-ttl:', 'max-pending-rows:', 'drain-interval:']);
+$options = getopt('', ['token:', 'host:', 'port:', 'db-host:', 'db-port:', 'db-name:', 'db-user:', 'db-pass:', 'drain-workers:', 'threshold-cache-ttl:', 'max-pending-rows:', 'drain-interval:', 'checkpoint-interval:', 'checkpoint-truncate-bytes:', 'sqlite-path:']);
 
 $token = $options['token'] ?? null;
 if (! $token) {
@@ -64,13 +64,16 @@ unset($pdo);
 MigrationRunner::migrate($dbHost, $dbPort, $dbName, $dbUser, $dbPass);
 fwrite(STDOUT, "Tables ready.\n");
 
-// SQLite buffer path
-$sqlitePath = sys_get_temp_dir().'/nightowl-harness-'.getmypid().'.sqlite';
+// SQLite buffer path — caller can pin a known path so tests can read the
+// drain-metrics file by name without globbing for the harness PID.
+$sqlitePath = $options['sqlite-path'] ?? sys_get_temp_dir().'/nightowl-harness-'.getmypid().'.sqlite';
 
 $drainWorkers = (int) ($options['drain-workers'] ?? 1);
 $thresholdCacheTtl = (int) ($options['threshold-cache-ttl'] ?? 86400);
 $maxPendingRows = (int) ($options['max-pending-rows'] ?? 100_000);
 $drainIntervalMs = (int) ($options['drain-interval'] ?? 50);
+$checkpointInterval = (int) ($options['checkpoint-interval'] ?? 60);
+$checkpointTruncateBytes = (int) ($options['checkpoint-truncate-bytes'] ?? 100 * 1024 * 1024);
 
 // Wire up the async server
 $server = new AsyncServer(
@@ -86,6 +89,8 @@ $server = new AsyncServer(
         batchSize: 5000,
         intervalMs: $drainIntervalMs,
         thresholdCacheTtl: $thresholdCacheTtl,
+        checkpointIntervalSeconds: $checkpointInterval,
+        checkpointTruncateBytes: $checkpointTruncateBytes,
     ),
     token: $token,
     maxPendingRows: $maxPendingRows,
