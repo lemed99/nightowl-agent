@@ -7,6 +7,7 @@ use Illuminate\Database\Capsule\Manager as Capsule;
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Events\Dispatcher;
 use Illuminate\Support\Facades\Facade;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * Runs the agent's package migrations against a test PostgreSQL database.
@@ -29,6 +30,15 @@ final class MigrationRunner
         // Migrations are monotonic for a single PHPUnit run — running them
         // again across test classes would hit duplicate-table errors.
         if (self::$migrated) {
+            return;
+        }
+
+        // Cross-process guard: the harness subprocess re-enters this method
+        // with its own static state. If the parent test process already
+        // migrated, the canonical first table exists.
+        if (Schema::connection('nightowl')->hasTable('nightowl_requests')) {
+            self::$migrated = true;
+
             return;
         }
 
