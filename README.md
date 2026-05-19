@@ -105,7 +105,7 @@ P95s, N+1 detection, slow-query rankings, request timelines, etc. are queries yo
 
 - PHP **8.2+** with extensions: `pdo_pgsql`, `pdo_sqlite` (always), `pcntl` + `posix` (for the async driver), `zlib` (for gzipped payloads)
 - PostgreSQL **14+** (16 or 17 recommended)
-- Laravel **11 or 12**
+- Laravel **11, 12, 13**
 
 ## Data ownership & privacy
 
