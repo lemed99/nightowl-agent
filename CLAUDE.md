@@ -10,9 +10,8 @@ Laravel package installed in customer apps. Receives telemetry from `laravel/nig
 
 ### ReactPHP (Critical — Core Runtime)
 - `react/event-loop` — Single-threaded loop (`Loop::get()`, timers, signals)
-- `react/socket` — Non-blocking TCP (`TcpServer` with `SO_REUSEPORT`)
+- `react/socket` — Non-blocking TCP (`TcpServer` with `SO_REUSEPORT`); also drives the health HTTP server and outgoing health reports via raw socket HTTP (no `react/http` dependency — avoids `psr/http-message ^1.0` conflict)
 - `react/datagram` — UDP socket server (fire-and-forget)
-- `react/http` — HTTP server (health API) + async client (`Browser`)
 - Promise-based callbacks; recursive timer scheduling for adaptive intervals
 
 ### Process Management (Fork Safety)
@@ -185,7 +184,7 @@ Every telemetry row carries both:
 
 ## composer.json
 - **Package**: `nightowl/agent`, PHP `^8.2`
-- **Hard requires**: `laravel/framework ^11|^12`, `laravel/nightwatch ^1.26`, `react/{socket,datagram,event-loop,http}`
+- **Hard requires**: `laravel/framework ^11|^12`, `laravel/nightwatch ^1.26`, `react/{socket,datagram,event-loop}` — `react/http` intentionally excluded (its `psr/http-message ^1.0` pin conflicts with modern Laravel packages)
 - **PHP extensions**: `pdo_pgsql`, `pdo_sqlite`
 
 ## Development

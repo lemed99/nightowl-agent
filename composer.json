@@ -12,7 +12,6 @@
         "laravel/nightwatch": "^1.26",
         "react/datagram": "^1.10",
         "react/event-loop": "^1.5",
-        "react/http": "^1.9",
         "react/socket": "^1.15"
     },
     "suggest": {
