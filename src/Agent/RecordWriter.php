@@ -36,8 +36,16 @@ final class RecordWriter
 
     private function connect(): void
     {
+        // connect_timeout caps the libpq handshake. Without it, a half-open
+        // socket (TCP accepts but the auth/SSL handshake never completes — RDS
+        // under connection pressure, a NAT/pgbouncer dropping the stream, a
+        // firewall black-holing after SYN) blocks the drain worker forever with
+        // no error to log. The worker then never reaches its metrics write, so
+        // the only outward symptom is stale drain metrics — invisible until you
+        // know to look. Capping it turns a silent hang into a catchable
+        // exception that reconnect()/the drain loop logs and retries.
         $this->pdo = new PDO(
-            "pgsql:host={$this->host};port={$this->port};dbname={$this->database}",
+            "pgsql:host={$this->host};port={$this->port};dbname={$this->database};connect_timeout=5",
             $this->username,
             $this->password,
         );
@@ -227,7 +235,21 @@ final class RecordWriter
         // escaped string there, so any `\N` in the TSV is treated as the
         // literal string "N" for non-text columns. The text COPY default
         // null marker is already `\N`.
-        $this->pdo()->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
+        //
+        // pgsqlCopyFromArray returns false (rather than throwing, even under
+        // ERRMODE_EXCEPTION) on some libpq-level failures. Unchecked, the batch
+        // would commit and be marked synced with zero rows written — silent
+        // data loss. Convert it to an exception so the drain loop rolls back,
+        // counts the failure, and retries instead of dropping the batch.
+        $ok = $this->pdo()->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
+        if ($ok === false) {
+            $error = $this->pdo()->errorInfo();
+            throw new \RuntimeException(sprintf(
+                'COPY into %s failed: %s',
+                $table,
+                $error[2] ?? 'unknown libpq error (pgsqlCopyFromArray returned false)'
+            ));
+        }
     }
 
     private function writeRequests(array $records): void
