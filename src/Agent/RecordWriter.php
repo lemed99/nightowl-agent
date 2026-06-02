@@ -242,12 +242,22 @@ final class RecordWriter
         // data loss. Convert it to an exception so the drain loop rolls back,
         // counts the failure, and retries instead of dropping the batch.
         $ok = $this->pdo()->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
-        if ($ok === false) {
+        if ($ok !== true) {
+            // Capture the error before discarding the connection — errorInfo()
+            // is only meaningful while the failing handle is still around.
             $error = $this->pdo()->errorInfo();
+
+            // A failed COPY can leave libpq stuck in COPY_IN state, where every
+            // later command on the same connection fails with "another command
+            // is already in progress". Drop the handle so the next batch opens a
+            // clean one instead of inheriting a poisoned connection. doWrite()
+            // still holds its own reference for the rollback in its catch block.
+            $this->pdo = null;
+
             throw new \RuntimeException(sprintf(
                 'COPY into %s failed: %s',
                 $table,
-                $error[2] ?? 'unknown libpq error (pgsqlCopyFromArray returned false)'
+                $error[2] ?? 'unknown libpq error (pgsqlCopyFromArray returned '.var_export($ok, true).')'
             ));
         }
     }
