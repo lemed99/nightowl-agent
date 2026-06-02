@@ -72,6 +72,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 maxWaitMs: (int) config('nightowl.agent.drain_max_wait_ms', 5000),
                 appName: config('app.name', 'NightOwl'),
                 environment: config('nightowl.environment') ?: config('app.env', 'production'),
+                copyDriver: config('nightowl.agent.copy_driver', 'pdo'),
             );
         });
 

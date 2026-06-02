@@ -12,7 +12,8 @@ class AgentCommand extends Command
         {--host= : The host to listen on}
         {--port= : The port to listen on}
         {--driver= : Server driver (async or sync)}
-        {--sqlite-path= : SQLite buffer file path (required for multi-instance, overrides config)}';
+        {--sqlite-path= : SQLite buffer file path (required for multi-instance, overrides config)}
+        {--copy-driver= : COPY implementation: pdo (default) or pgsql (workaround for PHP 8.4 pdo_pgsql busy-spin bug)}';
 
     protected $description = 'Start the NightOwl monitoring agent';
 
@@ -34,6 +35,10 @@ class AgentCommand extends Command
         // (php artisan config:cache), but CLI options always work.
         if ($this->option('sqlite-path')) {
             config()->set('nightowl.agent.sqlite_path', $this->option('sqlite-path'));
+        }
+
+        if ($this->option('copy-driver')) {
+            config()->set('nightowl.agent.copy_driver', $this->option('copy-driver'));
         }
 
         if ($driver === 'async') {

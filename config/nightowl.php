@@ -50,6 +50,15 @@ return [
         'app_id' => env('NIGHTOWL_APP_ID'),
         'driver' => env('NIGHTOWL_AGENT_DRIVER', 'async'),
         'sqlite_path' => env('NIGHTOWL_AGENT_SQLITE_PATH', storage_path('nightowl/agent-buffer.sqlite')),
+        // COPY implementation used by the drain worker.
+        // 'pdo'   — uses PDO::pgsqlCopyFromArray() (default)
+        // 'pgsql' — uses pg_copy_from() via the pgsql extension; workaround for
+        //           a PHP 8.4 pdo_pgsql busy-spin bug triggered when PostgreSQL
+        //           returns an error during COPY (e.g. NOT NULL violations).
+        //           Requires ext-pgsql. Set NIGHTOWL_COPY_DRIVER=pgsql or pass
+        //           --copy-driver=pgsql to nightowl:agent to enable.
+        'copy_driver' => env('NIGHTOWL_COPY_DRIVER', 'pdo'),
+
         'drain_interval_ms' => env('NIGHTOWL_DRAIN_INTERVAL_MS', 100),
         'drain_batch_size' => env('NIGHTOWL_DRAIN_BATCH_SIZE', 5000),
         'drain_workers' => env('NIGHTOWL_DRAIN_WORKERS', 1),

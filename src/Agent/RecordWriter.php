@@ -8,6 +8,9 @@ final class RecordWriter
 {
     private ?PDO $pdo = null;
 
+    /** @var resource|null pgsql extension connection, used when copyDriver='pgsql' */
+    private mixed $pgConn = null;
+
     /** @var array<string, list<array{target?: string, duration_ms: int}>> Thresholds grouped by type */
     private array $thresholdCache = [];
 
@@ -30,6 +33,7 @@ final class RecordWriter
         ?AlertNotifier $notifier = null,
         private string $appName = 'NightOwl',
         private string $environment = 'production',
+        private string $copyDriver = 'pdo',
     ) {
         $this->notifier = $notifier ?? new AlertNotifier;
     }
@@ -86,6 +90,7 @@ final class RecordWriter
             // customers want an explicit label like "prod-us-east". Read via
             // the config key so `php artisan config:cache` doesn't nuke it.
             config('nightowl.environment') ?: config('app.env', 'production'),
+            config('nightowl.agent.copy_driver', 'pdo'),
         );
     }
 
@@ -129,6 +134,40 @@ final class RecordWriter
         }
 
         $this->pdo = null;
+
+        if ($this->pgConn !== null) {
+            @pg_close($this->pgConn);
+            $this->pgConn = null;
+        }
+    }
+
+    /**
+     * Return (or lazily open) a pgsql extension connection.
+     * Used only when copyDriver='pgsql'.
+     *
+     * @return resource
+     */
+    private function pgConn(): mixed
+    {
+        if ($this->pgConn !== null && pg_connection_status($this->pgConn) === PGSQL_CONNECTION_OK) {
+            return $this->pgConn;
+        }
+
+        // pg_connect with connect_timeout; PGSQL_CONNECT_FORCE_NEW ensures we
+        // don't accidentally reuse a connection that was closed by a prior error.
+        $dsn = "host={$this->host} port={$this->port} dbname={$this->database}"
+            ." user={$this->username} password={$this->password} connect_timeout=5";
+
+        $conn = pg_connect($dsn, PGSQL_CONNECT_FORCE_NEW);
+        if ($conn === false) {
+            throw new \RuntimeException('pg_connect failed for COPY driver');
+        }
+
+        pg_query($conn, 'SET synchronous_commit = off');
+
+        $this->pgConn = $conn;
+
+        return $this->pgConn;
     }
 
     private function doWrite(array $records): void
@@ -231,6 +270,13 @@ final class RecordWriter
             $tsvRows[] = implode("\t", $escaped);
         }
 
+        if ($this->copyDriver === 'pgsql') {
+            $this->copyBatchViaPgsql($table, $colList, $tsvRows);
+
+            return;
+        }
+
+        // pdo driver (default) —————————————————————————————————————————————
         // Note: do NOT pass the 4th NULL-marker arg. libpq mis-parses the
         // escaped string there, so any `\N` in the TSV is treated as the
         // literal string "N" for non-text columns. The text COPY default
@@ -249,6 +295,31 @@ final class RecordWriter
                 $table,
                 $error[2] ?? 'unknown libpq error (pgsqlCopyFromArray returned false)'
             ));
+        }
+    }
+
+    /**
+     * COPY via the pgsql extension (pg_copy_from) instead of PDO.
+     *
+     * Workaround for a PHP 8.4 pdo_pgsql busy-spin: when PostgreSQL returns
+     * an error during a COPY operation, pgsqlCopyFromArray() loops at 100% CPU
+     * indefinitely instead of returning false. pg_copy_from() surfaces the
+     * error correctly. Requires ext-pgsql (php8.x-pgsql).
+     *
+     * pg_copy_from expects each row to end with "\n" — we add it here rather
+     * than in the main TSV builder to keep the pdo path unchanged.
+     */
+    private function copyBatchViaPgsql(string $table, string $colList, array $tsvRows): void
+    {
+        $rows = array_map(fn (string $row) => $row."\n", $tsvRows);
+
+        $ok = pg_copy_from($this->pgConn(), $table.' ('.$colList.')', $rows);
+        if ($ok === false) {
+            $error = pg_last_error($this->pgConn());
+            // Mark connection dead so pgConn() reconnects next batch
+            @pg_close($this->pgConn);
+            $this->pgConn = null;
+            throw new \RuntimeException(sprintf('pg_copy_from into %s failed: %s', $table, $error));
         }
     }
 

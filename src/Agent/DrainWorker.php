@@ -52,6 +52,7 @@ final class DrainWorker
         // Knobs the chaos test tunes; defaults match prior hardcoded behavior.
         private int $checkpointIntervalSeconds = 60,
         private int $checkpointTruncateBytes = 100 * 1024 * 1024,
+        private string $copyDriver = 'pdo',
     ) {}
 
     /**
@@ -87,6 +88,7 @@ final class DrainWorker
             notifier: AlertNotifier::fromConfig(),
             appName: $this->appName,
             environment: $this->environment,
+            copyDriver: $this->copyDriver,
         );
 
         $workerLabel = $this->totalWorkers > 1
