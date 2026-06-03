@@ -15,6 +15,7 @@ use NightOwl\Agent\RecordWriter;
 use NightOwl\Agent\Server;
 use NightOwl\Commands\AgentCommand;
 use NightOwl\Commands\ClearCommand;
+use NightOwl\Commands\DrainWorkerCommand;
 use NightOwl\Commands\InstallCommand;
 use NightOwl\Commands\PruneCommand;
 use NightOwl\Support\MultiIngest;
@@ -72,6 +73,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 maxWaitMs: (int) config('nightowl.agent.drain_max_wait_ms', 5000),
                 appName: config('app.name', 'NightOwl'),
                 environment: config('nightowl.environment') ?: config('app.env', 'production'),
+                sslmode: config('nightowl.database.sslmode', 'prefer'),
             );
         });
 
@@ -129,6 +131,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 (int) config('nightowl.agent.health_report_interval', 30),
                 (array) config('nightowl.agent.health_report_intervals', []),
                 (string) config('nightowl.database.database', 'nightowl'),
+                drainSpawner: $this->makeDrainSpawner($app),
             );
         });
     }
@@ -148,11 +151,49 @@ class NightOwlAgentServiceProvider extends ServiceProvider
         ], 'nightowl-config');
     }
 
+    /**
+     * Build the drain-worker respawn strategy for the async server.
+     *
+     * Returns a closure that pcntl_exec()s a fresh `php artisan nightowl:drain-worker`
+     * so the drain worker runs in a clean interpreter that never inherited the
+     * parent's OpenSSL/libpq state — the fix for the TLS handshake deadlock against
+     * managed Postgres (PlanetScale/Supabase/RDS) seen with fork-only workers.
+     *
+     * Returns null when exec can't be used (missing pcntl_exec, or no artisan
+     * entrypoint — e.g. some embedded/Octane contexts), so AsyncServer falls back
+     * to the in-process fork. Inherited env vars carry NIGHTOWL_DB_* to the new
+     * process; the sqlite path is passed explicitly because AgentCommand may set
+     * it via a runtime config() mutation that exec would not inherit.
+     */
+    protected function makeDrainSpawner($app): ?\Closure
+    {
+        if (! function_exists('pcntl_exec')) {
+            return null;
+        }
+
+        $artisan = $app->basePath('artisan');
+        if (! is_file($artisan)) {
+            return null;
+        }
+
+        return function (int $workerId, int $totalWorkers, string $sqlitePath) use ($artisan): void {
+            pcntl_exec(PHP_BINARY, [
+                $artisan,
+                'nightowl:drain-worker',
+                '--worker-id='.$workerId,
+                '--total-workers='.$totalWorkers,
+                '--sqlite-path='.$sqlitePath,
+            ]);
+            // Only returns on failure; AsyncServer logs and falls back in-process.
+        };
+    }
+
     protected function registerCommands(): void
     {
         if ($this->app->runningInConsole()) {
             $this->commands([
                 AgentCommand::class,
+                DrainWorkerCommand::class,
                 InstallCommand::class,
                 PruneCommand::class,
                 ClearCommand::class,

@@ -60,6 +60,16 @@ final class AsyncServer
         private array $healthReportIntervals = [],
         private string $tenantId = '',
         private int $drainWorkerCount = 1,
+        // Optional respawn strategy for drain workers. When set, the forked child
+        // calls this instead of running the drain loop in-process — it is expected
+        // to pcntl_exec() a fresh PHP interpreter and therefore never return.
+        // Execing a clean process avoids inheriting the parent's already-initialized
+        // OpenSSL/libpq state, which can deadlock the TLS handshake to managed
+        // Postgres (PlanetScale/Supabase/RDS) in a fork-only child on some Linux
+        // builds. When null (standalone harness, tests, non-SSL local setups) the
+        // child runs the drain loop in-process — the original fork-only behavior.
+        // Signature: fn (int $workerId, int $totalWorkers, string $sqlitePath): void
+        private ?\Closure $drainSpawner = null,
     ) {
         $this->expectedTokenHash = $token !== null
             ? substr(hash('xxh128', $token), 0, 7)
@@ -308,30 +318,27 @@ final class AsyncServer
 
         if ($pid === 0) {
             // === Child process ===
-            // Close the TCP server — child must not accept connections
-            if ($this->server !== null) {
-                $this->server->close();
-                $this->server = null;
+            // Close inherited sockets so neither the exec'd process nor the
+            // in-process drain loop holds the parent's listeners open. The event
+            // loop's internal FDs (epoll/kqueue) are also inherited but harmless
+            // in a child that never runs the loop.
+            $this->server?->close();
+            $this->udpSocket?->close();
+            $this->healthServer?->close();
+
+            // Preferred path: exec a fresh interpreter via the injected spawner so
+            // the drain worker doesn't inherit the parent's OpenSSL/libpq state
+            // (see $drainSpawner docblock). The spawner pcntl_exec()s and never
+            // returns; if it returns, exec failed — fall through to in-process.
+            if ($this->drainSpawner !== null) {
+                ($this->drainSpawner)($workerId, $this->drainWorkerCount, $this->sqlitePath);
+                error_log('[NightOwl Agent] drain spawner exec failed ('.(error_get_last()['message'] ?? 'unknown').') — falling back to in-process drain');
             }
 
-            // Close UDP socket in child
-            if ($this->udpSocket !== null) {
-                $this->udpSocket->close();
-                $this->udpSocket = null;
-            }
-
-            // Close health server in child
-            if ($this->healthServer !== null) {
-                $this->healthServer->close();
-                $this->healthServer = null;
-            }
-
-            // Stop the parent's event loop in this process so it doesn't
-            // interfere — we won't call run(), but this cleans up fds/signals
+            // In-process drain (standalone harness, tests, or exec fallback).
+            // Stop the parent's event loop in this process so it doesn't interfere
+            // — we won't call run(), but this cleans up fds/signals.
             $this->loop->stop();
-
-            // DrainWorker::run() creates its own DB connections and never returns.
-            // Clone the worker prototype and set the worker ID for multi-worker mode.
             $worker = clone $this->drainWorker;
             $worker->setWorkerConfig($workerId, $this->drainWorkerCount);
             $worker->run();

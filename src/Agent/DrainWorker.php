@@ -49,6 +49,7 @@ final class DrainWorker
         private int $thresholdCacheTtl = 86400,
         private string $appName = 'NightOwl',
         private string $environment = 'production',
+        private string $sslmode = 'prefer',
         // Knobs the chaos test tunes; defaults match prior hardcoded behavior.
         private int $checkpointIntervalSeconds = 60,
         private int $checkpointTruncateBytes = 100 * 1024 * 1024,
@@ -87,6 +88,7 @@ final class DrainWorker
             notifier: AlertNotifier::fromConfig(),
             appName: $this->appName,
             environment: $this->environment,
+            sslmode: $this->sslmode,
         );
 
         $workerLabel = $this->totalWorkers > 1
