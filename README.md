@@ -45,6 +45,7 @@ NIGHTOWL_DB_PORT=5432
 NIGHTOWL_DB_DATABASE=nightowl
 NIGHTOWL_DB_USERNAME=nightowl
 NIGHTOWL_DB_PASSWORD=nightowl
+NIGHTOWL_DB_SSLMODE=prefer
 ```
 
 You don't need to wire up Nightwatch's transport — the service provider automatically redirects its ingest to the local agent on `127.0.0.1:2407`. For a local-only setup you also don't need any token; the agent only enforces one if you set `NIGHTOWL_TOKEN` (useful when the agent listens on something other than loopback).
