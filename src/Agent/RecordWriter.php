@@ -37,6 +37,8 @@ final class RecordWriter
 
     private const CONNECT_TIMEOUT = 5;
 
+    private const COPY_TIMEOUT = 60;
+
     private function connect(): void
     {
         // connect_timeout in the DSN should cap the TCP+SSL handshake, but some
@@ -250,12 +252,34 @@ final class RecordWriter
         // literal string "N" for non-text columns. The text COPY default
         // null marker is already `\N`.
         //
-        // pgsqlCopyFromArray returns false (rather than throwing, even under
-        // ERRMODE_EXCEPTION) on some libpq-level failures. Unchecked, the batch
-        // would commit and be marked synced with zero rows written — silent
-        // data loss. Convert it to an exception so the drain loop rolls back,
-        // counts the failure, and retries instead of dropping the batch.
-        $ok = $this->pdo()->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
+        // pgsqlCopyFromArray can hang the PHP process entirely on certain libpq
+        // failures (mid-stream network stall, broken SSL renegotiation) — it
+        // never returns false, it just blocks forever. Wrap with the same
+        // SIGALRM backstop used in connect(): if the call doesn't return within
+        // COPY_TIMEOUT seconds the drain child exits so the parent SIGCHLD
+        // handler restarts it. pcntl_async_signals(true) is already set by
+        // DrainWorker before run().
+        //
+        // When pgsqlCopyFromArray does return, it returns false rather than
+        // throwing (even under ERRMODE_EXCEPTION) on some errors. Convert to
+        // an exception so the drain loop rolls back and retries the batch.
+        if (function_exists('pcntl_signal') && function_exists('pcntl_alarm')) {
+            pcntl_signal(SIGALRM, static function () use ($table) {
+                error_log('[NightOwl Drain] pgsqlCopyFromArray hung on '.$table.' (SIGALRM backstop) — exiting for parent restart');
+                exit(1);
+            });
+            pcntl_alarm(self::COPY_TIMEOUT);
+        }
+
+        try {
+            $ok = $this->pdo()->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
+        } finally {
+            if (function_exists('pcntl_alarm') && function_exists('pcntl_signal')) {
+                pcntl_alarm(0);
+                pcntl_signal(SIGALRM, SIG_DFL);
+            }
+        }
+
         if ($ok !== true) {
             // Capture the error before discarding the connection — errorInfo()
             // is only meaningful while the failing handle is still around.
