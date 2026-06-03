@@ -18,6 +18,7 @@ return [
         'database' => env('NIGHTOWL_DB_DATABASE', 'nightowl'),
         'username' => env('NIGHTOWL_DB_USERNAME', 'nightowl'),
         'password' => env('NIGHTOWL_DB_PASSWORD', 'nightowl'),
+        'sslmode' => env('NIGHTOWL_DB_SSLMODE', 'prefer'),
         'retention_days' => env('NIGHTOWL_RETENTION_DAYS', 14),
     ],
 

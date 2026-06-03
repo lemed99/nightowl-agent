@@ -30,6 +30,7 @@ final class RecordWriter
         ?AlertNotifier $notifier = null,
         private string $appName = 'NightOwl',
         private string $environment = 'production',
+        private string $sslmode = 'prefer',
     ) {
         $this->notifier = $notifier ?? new AlertNotifier;
     }
@@ -45,7 +46,7 @@ final class RecordWriter
         // know to look. Capping it turns a silent hang into a catchable
         // exception that reconnect()/the drain loop logs and retries.
         $this->pdo = new PDO(
-            "pgsql:host={$this->host};port={$this->port};dbname={$this->database};connect_timeout=5",
+            "pgsql:host={$this->host};port={$this->port};dbname={$this->database};connect_timeout=5;sslmode={$this->sslmode}",
             $this->username,
             $this->password,
         );
@@ -86,6 +87,7 @@ final class RecordWriter
             // customers want an explicit label like "prod-us-east". Read via
             // the config key so `php artisan config:cache` doesn't nuke it.
             config('nightowl.environment') ?: config('app.env', 'production'),
+            config('nightowl.database.sslmode', 'prefer'),
         );
     }
 
