@@ -35,22 +35,34 @@ final class RecordWriter
         $this->notifier = $notifier ?? new AlertNotifier;
     }
 
+    private const CONNECT_TIMEOUT = 5;
+
     private function connect(): void
     {
-        // connect_timeout caps the libpq handshake. Without it, a half-open
-        // socket (TCP accepts but the auth/SSL handshake never completes — RDS
-        // under connection pressure, a NAT/pgbouncer dropping the stream, a
-        // firewall black-holing after SYN) blocks the drain worker forever with
-        // no error to log. The worker then never reaches its metrics write, so
-        // the only outward symptom is stale drain metrics — invisible until you
-        // know to look. Capping it turns a silent hang into a catchable
-        // exception that reconnect()/the drain loop logs and retries.
-        $this->pdo = new PDO(
-            "pgsql:host={$this->host};port={$this->port};dbname={$this->database};connect_timeout=5;sslmode={$this->sslmode}",
-            $this->username,
-            $this->password,
-        );
-        $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        // connect_timeout in the DSN should cap the TCP+SSL handshake, but some
+        // libpq builds don't properly interrupt a hung SSL negotiation (the TCP
+        // connect() succeeds so the OS-level timer fires, but the SSL handshake
+        // stalls in userspace with no further timeout). SIGALRM + exit() is the
+        // guaranteed backstop: if the PDO constructor hasn't returned after 3×
+        // the DSN timeout, the child exits and the parent's SIGCHLD handler
+        // restarts it after the 2-second cooldown.
+        pcntl_signal(SIGALRM, static function () {
+            error_log('[NightOwl Drain] PostgreSQL connection timed out (SIGALRM backstop) — exiting for parent restart');
+            exit(1);
+        });
+        pcntl_alarm(self::CONNECT_TIMEOUT * 3);
+
+        try {
+            $this->pdo = new PDO(
+                "pgsql:host={$this->host};port={$this->port};dbname={$this->database};connect_timeout=".self::CONNECT_TIMEOUT.";sslmode={$this->sslmode}",
+                $this->username,
+                $this->password,
+            );
+            $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        } finally {
+            pcntl_alarm(0);
+            pcntl_signal(SIGALRM, SIG_DFL);
+        }
 
         // Disable synchronous commit — don't wait for WAL flush on each transaction.
         // Trades ~10ms of data durability for 2-5x write throughput. Acceptable for
