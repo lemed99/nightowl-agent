@@ -11,8 +11,8 @@ use ReflectionMethod;
  * Guard logic for the drain-worker respawn strategy.
  *
  * makeDrainSpawner() decides whether the async server execs a fresh
- * `php artisan nightowl:drain-worker` (clean interpreter — the fix for the TLS
- * handshake deadlock against managed Postgres) or falls back to the in-process
+ * `php artisan nightowl:drain-worker` (a clean interpreter isolated from the
+ * parent agent's long-lived ReactPHP state) or falls back to the in-process
  * fork. It must return a Closure only when exec is actually usable: pcntl_exec
  * present AND an artisan entrypoint on disk. Otherwise null, so AsyncServer
  * degrades to the in-process path instead of execing something that isn't there.

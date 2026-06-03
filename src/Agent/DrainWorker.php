@@ -71,6 +71,14 @@ final class DrainWorker
      */
     public function run(): never
     {
+        // If the host app runs Octane/Swoole, Swoole's coroutine runtime hooks are
+        // enabled process-wide and inherited here. The PDO-pgsql hook reimplements
+        // pgsqlCopyFromArray() — the COPY protocol this worker uses for 10 tables —
+        // and busy-loops (100% CPU, zero rows drained) instead of completing the
+        // COPY. The drain worker is plain synchronous code with no use for coroutine
+        // hooks, so turn them off here; PDO then uses the native COPY implementation.
+        $this->disableSwooleRuntimeHooks();
+
         // Own signal handlers (child process, independent of parent's ReactPHP loop)
         pcntl_async_signals(true);
         pcntl_signal(SIGTERM, fn () => $this->running = false);
@@ -158,6 +166,21 @@ final class DrainWorker
         }
 
         exit(0);
+    }
+
+    /**
+     * Disable Swoole's coroutine runtime hooks for this process.
+     *
+     * Swoole's PDO-pgsql hook busy-loops inside pgsqlCopyFromArray() when driven
+     * by the drain worker, pegging a core at 100% with no progress. Clearing the
+     * hook flags restores PHP's native PDO COPY implementation. No-op when Swoole
+     * isn't loaded (the common case).
+     */
+    private function disableSwooleRuntimeHooks(): void
+    {
+        if (class_exists(\Swoole\Runtime::class) && method_exists(\Swoole\Runtime::class, 'setHookFlags')) {
+            \Swoole\Runtime::setHookFlags(0);
+        }
     }
 
     /**

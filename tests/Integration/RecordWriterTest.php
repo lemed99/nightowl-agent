@@ -80,6 +80,42 @@ class RecordWriterTest extends TestCase
         self::$pdo = null;
     }
 
+    // ─── Swoole COPY-fallback (insertBatch) ────────────────
+
+    /**
+     * When Swoole is loaded its pgsqlCopyFromArray hook busy-loops, so copyBatch
+     * routes to insertBatch instead. This verifies that fallback writes rows
+     * correctly via multi-row INSERT — including values containing tabs/newlines,
+     * which would corrupt COPY's TSV but are preserved verbatim by INSERT.
+     */
+    public function test_insert_batch_fallback_writes_rows(): void
+    {
+        $pdoMethod = new \ReflectionMethod($this->writer, 'pdo');
+        /** @var PDO $wpdo */
+        $wpdo = $pdoMethod->invoke($this->writer);
+
+        $wpdo->exec('CREATE TABLE IF NOT EXISTS t_insert_batch_test (a int, b text, c text)');
+        $wpdo->exec('TRUNCATE t_insert_batch_test');
+
+        try {
+            $insert = new \ReflectionMethod($this->writer, 'insertBatch');
+            $insert->invoke($this->writer, 't_insert_batch_test', ['a', 'b', 'c'], [
+                [1, 'hello', null],
+                [2, "has\ttab\nand newline", 'z'],
+            ]);
+
+            $rows = $wpdo->query('SELECT a, b, c FROM t_insert_batch_test ORDER BY a')->fetchAll(PDO::FETCH_ASSOC);
+
+            $this->assertCount(2, $rows);
+            $this->assertSame('hello', $rows[0]['b']);
+            $this->assertNull($rows[0]['c']);
+            $this->assertSame("has\ttab\nand newline", $rows[1]['b']);
+            $this->assertSame('z', $rows[1]['c']);
+        } finally {
+            $wpdo->exec('DROP TABLE IF EXISTS t_insert_batch_test');
+        }
+    }
+
     // ─── Individual record type tests ──────────────────────
 
     public function test_write_request(): void

@@ -63,10 +63,11 @@ final class AsyncServer
         // Optional respawn strategy for drain workers. When set, the forked child
         // calls this instead of running the drain loop in-process — it is expected
         // to pcntl_exec() a fresh PHP interpreter and therefore never return.
-        // Execing a clean process avoids inheriting the parent's already-initialized
-        // OpenSSL/libpq state, which can deadlock the TLS handshake to managed
-        // Postgres (PlanetScale/Supabase/RDS) in a fork-only child on some Linux
-        // builds. When null (standalone harness, tests, non-SSL local setups) the
+        // Execing a clean process keeps the background drain isolated from the
+        // ingest server: the child doesn't inherit the parent agent's long-lived
+        // ReactPHP state (event-loop epoll/kqueue FDs, signal handlers, sockets
+        // and handles opened for health reporting), which is sound hygiene for a
+        // long-running forking process. When null (standalone harness, tests) the
         // child runs the drain loop in-process — the original fork-only behavior.
         // Signature: fn (int $workerId, int $totalWorkers, string $sqlitePath): void
         private ?\Closure $drainSpawner = null,
@@ -327,9 +328,9 @@ final class AsyncServer
             $this->healthServer?->close();
 
             // Preferred path: exec a fresh interpreter via the injected spawner so
-            // the drain worker doesn't inherit the parent's OpenSSL/libpq state
-            // (see $drainSpawner docblock). The spawner pcntl_exec()s and never
-            // returns; if it returns, exec failed — fall through to in-process.
+            // the drain worker doesn't inherit the parent agent's long-lived
+            // runtime state (see $drainSpawner docblock). The spawner pcntl_exec()s
+            // and never returns; if it returns, exec failed — fall through to in-process.
             if ($this->drainSpawner !== null) {
                 ($this->drainSpawner)($workerId, $this->drainWorkerCount, $this->sqlitePath);
                 error_log('[NightOwl Agent] drain spawner exec failed ('.(error_get_last()['message'] ?? 'unknown').') — falling back to in-process drain');

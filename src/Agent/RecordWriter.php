@@ -225,6 +225,19 @@ final class RecordWriter
             return;
         }
 
+        // Swoole/OpenSwoole's PDO-pgsql coroutine hook reimplements
+        // pgsqlCopyFromArray() and busy-loops on COPY (100% CPU, never returns)
+        // when the host app (typically Laravel Octane) has enabled runtime hooks.
+        // Disabling the hooks reverts the connect override but NOT the COPY one —
+        // once enabled it stays broken — so when either extension is present we
+        // avoid COPY entirely and drain via multi-row INSERT instead. Plain
+        // (non-Swoole) installs keep the faster COPY path.
+        if (extension_loaded('swoole') || extension_loaded('openswoole')) {
+            $this->insertBatch($table, $columns, $rows);
+
+            return;
+        }
+
         $colList = implode(', ', $columns);
         $tsvRows = [];
 
@@ -252,13 +265,17 @@ final class RecordWriter
         // literal string "N" for non-text columns. The text COPY default
         // null marker is already `\N`.
         //
-        // pgsqlCopyFromArray can hang the PHP process entirely on certain libpq
-        // failures (mid-stream network stall, broken SSL renegotiation) — it
-        // never returns false, it just blocks forever. Wrap with the same
-        // SIGALRM backstop used in connect(): if the call doesn't return within
-        // COPY_TIMEOUT seconds the drain child exits so the parent SIGCHLD
-        // handler restarts it. pcntl_async_signals(true) is already set by
-        // DrainWorker before run().
+        // pgsqlCopyFromArray can hang on a genuine libpq stall (mid-stream network
+        // stall against a remote/managed Postgres) — it never returns false, it
+        // just blocks. Wrap with the same SIGALRM backstop used in connect(): if
+        // the call doesn't return within COPY_TIMEOUT seconds the drain child exits
+        // so the parent SIGCHLD handler restarts it. pcntl_async_signals(true) is
+        // already set by DrainWorker before run().
+        //
+        // Note: this backstop CANNOT catch a Swoole pgsqlCopyFromArray spin — that
+        // busy-loops in swoole.so's C code without yielding to the PHP VM, so the
+        // pending signal never dispatches. That case is handled earlier by routing
+        // to insertBatch() when Swoole is loaded (see the top of this method).
         //
         // When pgsqlCopyFromArray does return, it returns false rather than
         // throwing (even under ERRMODE_EXCEPTION) on some errors. Convert to
@@ -297,6 +314,43 @@ final class RecordWriter
                 $table,
                 $error[2] ?? 'unknown libpq error (pgsqlCopyFromArray returned '.var_export($ok, true).')'
             ));
+        }
+    }
+
+    /**
+     * COPY-equivalent write using multi-row INSERT. Used only when Swoole is
+     * loaded (its pgsqlCopyFromArray hook is broken — see copyBatch). Slower than
+     * COPY but correct; the values and column order are identical to copyBatch's,
+     * so all callers stay unchanged.
+     *
+     * @param  string[]  $columns
+     * @param  array[]  $rows  Each row is an array of values matching $columns order
+     */
+    private function insertBatch(string $table, array $columns, array $rows): void
+    {
+        $colCount = count($columns);
+        if ($colCount === 0) {
+            return;
+        }
+
+        $colList = implode(', ', $columns);
+        $rowPlaceholder = '('.implode(', ', array_fill(0, $colCount, '?')).')';
+
+        // Postgres caps bound parameters at 65535 per statement — chunk so a
+        // large batch (up to drain_batch_size rows × columns) never exceeds it.
+        $maxRowsPerStatement = max(1, intdiv(65535, $colCount));
+
+        foreach (array_chunk($rows, $maxRowsPerStatement) as $chunk) {
+            $values = implode(', ', array_fill(0, count($chunk), $rowPlaceholder));
+            $params = [];
+            foreach ($chunk as $row) {
+                foreach ($row as $value) {
+                    $params[] = $value;
+                }
+            }
+
+            $stmt = $this->pdo()->prepare("INSERT INTO {$table} ({$colList}) VALUES {$values}");
+            $stmt->execute($params);
         }
     }
 

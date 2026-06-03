@@ -155,9 +155,10 @@ class NightOwlAgentServiceProvider extends ServiceProvider
      * Build the drain-worker respawn strategy for the async server.
      *
      * Returns a closure that pcntl_exec()s a fresh `php artisan nightowl:drain-worker`
-     * so the drain worker runs in a clean interpreter that never inherited the
-     * parent's OpenSSL/libpq state — the fix for the TLS handshake deadlock against
-     * managed Postgres (PlanetScale/Supabase/RDS) seen with fork-only workers.
+     * so the drain worker runs in a clean interpreter, isolated from the parent
+     * agent's long-lived ReactPHP state (event-loop FDs, signal handlers, sockets
+     * opened for health reporting) — sound hygiene for a long-running forking
+     * process versus continuing to run PHP in a bare fork() child.
      *
      * Returns null when exec can't be used (missing pcntl_exec, or no artisan
      * entrypoint — e.g. some embedded/Octane contexts), so AsyncServer falls back

@@ -8,9 +8,9 @@ use PHPUnit\Framework\TestCase;
  * Proves the drain worker takes the exec path, not the in-process fork.
  *
  * When AsyncServer is given a drainSpawner, the forked child must pcntl_exec()
- * a fresh interpreter (clean OpenSSL/libpq state — the fix for the TLS handshake
- * deadlock against managed Postgres) instead of cloning the DrainWorker and
- * running the drain loop in-process.
+ * a fresh interpreter (a clean process isolated from the parent agent's
+ * long-lived ReactPHP state) instead of cloning the DrainWorker and running the
+ * drain loop in-process.
  *
  * We boot a real AsyncServer in a subprocess with a spawner that execs a tiny
  * stub which writes its PID to a marker file. The marker can ONLY appear via the
