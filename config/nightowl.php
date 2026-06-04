@@ -4,6 +4,48 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Master Switch
+    |--------------------------------------------------------------------------
+    |
+    | Set NIGHTOWL_ENABLED=false to make the package fully inert: the agent's
+    | Nightwatch ingest hook is not wired (no telemetry is collected or
+    | transmitted) and the migrations are not registered. Use this to turn
+    | NightOwl off in environments where you don't want it — most commonly the
+    | `testing` environment, so your unit/feature tests don't pay the ingest
+    | overhead or require the `nightowl` database to exist.
+    |
+    | Read via env() at config-load so `php artisan config:cache` is safe.
+    |
+    */
+    'enabled' => (bool) env('NIGHTOWL_ENABLED', true),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Migration Registration
+    |--------------------------------------------------------------------------
+    |
+    | NightOwl's tables live in your (BYO) `nightowl` PostgreSQL connection. By
+    | default the package registers its migrations with your app, so they run
+    | with `php artisan migrate` and `php artisan nightowl:install`.
+    |
+    | Laravel records migration history against your app's PRIMARY database,
+    | but the tables are created on the `nightowl` connection. So if several app
+    | environments (local, staging, production) point at ONE shared NightOwl
+    | database, each environment's `php artisan migrate` has its own empty
+    | history and re-runs the table creation — the second environment to deploy
+    | fails with "relation already exists".
+    |
+    | Set NIGHTOWL_RUN_MIGRATIONS=false on every environment except the one that
+    | owns schema management (or set it false everywhere and run
+    | `php artisan nightowl:install` once against the shared database). Telemetry
+    | is unaffected — this only controls whether the migrations ride along with
+    | your app's `migrate` command. `nightowl:install` always runs them.
+    |
+    */
+    'run_migrations' => (bool) env('NIGHTOWL_RUN_MIGRATIONS', true),
+
+    /*
+    |--------------------------------------------------------------------------
     | Database
     |--------------------------------------------------------------------------
     |

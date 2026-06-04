@@ -21,14 +21,23 @@ class InstallCommand extends Command
         ]);
         $this->line('  Published config/nightowl.php');
 
-        // 2. Run migrations. We deliberately do NOT pass --database=nightowl:
-        // each migration declares `protected $connection = 'nightowl'` and uses
+        // 2. Run migrations. We point --path explicitly at the package's
+        // migrations rather than relying on the service provider's
+        // loadMigrationsFrom(): when NIGHTOWL_ENABLED=false the provider does
+        // not register the path, but `nightowl:install` is an explicit opt-in,
+        // so it must run them regardless of the master switch.
+        //
+        // We deliberately do NOT pass --database=nightowl: each migration
+        // declares `protected $connection = 'nightowl'` and uses
         // Schema::connection(...), so the schema lands in the customer's nightowl
         // database either way. Passing --database would also record the migration
         // history in the nightowl DB, so the app's normal `php artisan migrate`
         // (which tracks against the primary connection) wouldn't see these as run
         // and would try to re-create the tables — "table already exists" on deploy.
-        $this->call('migrate');
+        $this->call('migrate', [
+            '--path' => realpath(__DIR__.'/../../database/migrations'),
+            '--realpath' => true,
+        ]);
         $this->line('  Ran migrations');
 
         // 3. Fork-safety probe — catches PHP builds / filesystems where the

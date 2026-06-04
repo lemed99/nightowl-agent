@@ -52,6 +52,35 @@ You don't need to wire up Nightwatch's transport — the service provider automa
 
 Tables fill up. Run any SQL you want against them.
 
+## Disabling NightOwl
+
+Set `NIGHTOWL_ENABLED=false` to make the package fully inert — the Nightwatch ingest hook is not wired (no telemetry is collected or transmitted) and the migrations are not registered. The most common use is turning it off in your test suite so tests don't pay the ingest overhead or require the `nightowl` database to exist:
+
+```xml
+<!-- phpunit.xml -->
+<php>
+    <env name="NIGHTOWL_ENABLED" value="false"/>
+</php>
+```
+
+`nightowl:install` runs its migrations regardless of this flag (it's an explicit opt-in), so you can still install while the switch is off.
+
+## Sharing one database across environments
+
+NightOwl stamps an `environment` column on every row, so several app environments (local, staging, production) can point at one NightOwl database and be filtered apart in the dashboard.
+
+Because Laravel tracks migration history against your app's primary database — but the `nightowl_*` tables live in the `nightowl` connection — each environment's `php artisan migrate` re-runs the table creation and the second deploy fails with `relation "nightowl_requests" already exists`.
+
+Let one environment own the schema and opt the rest out:
+
+```env
+# On every environment that SHARES a NightOwl database with another,
+# except the one that owns schema management:
+NIGHTOWL_RUN_MIGRATIONS=false
+```
+
+Their `php artisan migrate` then skips the NightOwl tables (telemetry is unaffected). Alternatively set it `false` everywhere and run `php artisan nightowl:install` once against the shared database. Leave it `true` if each environment has its own NightOwl database.
+
 ## What you get out of the box
 
 These features run in the agent process. Postgres is the only thing it talks to.

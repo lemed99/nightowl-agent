@@ -160,6 +160,8 @@ docker run -d --name nightowl-test-pg -p 5433:5432 \
 
 ## Configuration
 ```
+NIGHTOWL_ENABLED=true                    # Master switch — false makes the package inert (no ingest wiring, no migrations). Flip off in the testing env.
+NIGHTOWL_RUN_MIGRATIONS=true             # false stops migrations riding along with host `php artisan migrate`. Set false on all-but-one env when sharing one nightowl DB across environments (avoids 42P07 duplicate-table on deploy). nightowl:install runs them regardless.
 NIGHTOWL_ENVIRONMENT=                    # Override APP_ENV for the environment column (rare: standalone harness or custom labels)
 NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=false  # Run alongside Nightwatch (fan-out via MultiIngest)
 NIGHTOWL_DRAIN_BATCH_SIZE=5000           # Rows per COPY batch

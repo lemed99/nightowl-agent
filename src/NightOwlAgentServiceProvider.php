@@ -78,6 +78,13 @@ class NightOwlAgentServiceProvider extends ServiceProvider
         });
 
         $this->app->booted(function () {
+            // Master switch: when disabled (e.g. NIGHTOWL_ENABLED=false in the
+            // testing environment) we never rebind Nightwatch's ingest, so no
+            // telemetry is collected or transmitted to the agent socket.
+            if (! config('nightowl.enabled', true)) {
+                return;
+            }
+
             if (! $this->app->bound(Core::class)) {
                 return;
             }
@@ -219,6 +226,24 @@ class NightOwlAgentServiceProvider extends ServiceProvider
 
     protected function registerMigrations(): void
     {
+        // When disabled, don't register the migrations so the host app's
+        // `php artisan migrate` (and RefreshDatabase in tests) doesn't try to
+        // create the nightowl_* tables on a connection that may not exist.
+        // `nightowl:install` loads them explicitly via --path regardless.
+        if (! config('nightowl.enabled', true)) {
+            return;
+        }
+
+        // Opt-out for shared-database, multi-environment setups: when several
+        // app environments point at one NightOwl database, only the environment
+        // that owns schema management should let the migrations ride along with
+        // `php artisan migrate` — otherwise the others re-run the table creation
+        // and fail with "relation already exists". `nightowl:install` runs them
+        // explicitly (via --path) regardless of this flag.
+        if (! config('nightowl.run_migrations', true)) {
+            return;
+        }
+
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
     }
 }
