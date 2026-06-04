@@ -3,6 +3,7 @@
 namespace NightOwl\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Schema;
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\Server;
 
@@ -36,11 +37,75 @@ class AgentCommand extends Command
             config()->set('nightowl.agent.sqlite_path', $this->option('sqlite-path'));
         }
 
+        $this->warnOnSchemaDrift();
+
         if ($driver === 'async') {
             return $this->runAsync($host, $port);
         }
 
         return $this->runSync($host, $port);
+    }
+
+    /**
+     * Warn loudly at startup if the NightOwl schema is behind the package's
+     * migrations.
+     *
+     * In the default (DB-history) model the schema is applied by
+     * `php artisan nightowl:migrate`, which is NOT wired into the host app's
+     * `php artisan migrate`. If a package upgrade ships a new migration and the
+     * operator forgets to run nightowl:migrate, the agent would otherwise fail
+     * mid-drain on a missing column. Surfacing it here turns a silent break
+     * into an obvious one.
+     *
+     * A migration counts as applied if it's recorded in EITHER the nightowl
+     * database (the DB-history model) or the host app's primary history (legacy
+     * ride-along / old install), so a legacy install that's fallen behind is
+     * still caught. An empty applied set everywhere is deliberately not treated
+     * as drift — that's an untracked-but-present schema, not a known gap.
+     *
+     * Skipped under legacy ride-along (`NIGHTOWL_RUN_MIGRATIONS=true`), where the
+     * host's `php artisan migrate` keeps the schema current. Best-effort: any
+     * error is swallowed so a transient DB issue never blocks the agent.
+     */
+    private function warnOnSchemaDrift(): void
+    {
+        if (config('nightowl.run_migrations', false)) {
+            return;
+        }
+
+        try {
+            if (! Schema::connection('nightowl')->hasTable('nightowl_requests')) {
+                return; // not initialised — handled by the onboarding path, not drift
+            }
+
+            $repository = app('migrator')->getRepository();
+            $repository->setSource('nightowl');
+            $nightowlHistory = $repository->repositoryExists() ? $repository->getRan() : [];
+
+            $all = collect(glob(realpath(__DIR__.'/../../database/migrations').'/*.php'))
+                ->map(fn (string $file) => basename($file, '.php'))
+                ->all();
+
+            $applied = MigrateCommand::appliedSet($all, $nightowlHistory, MigrateCommand::primaryHistory());
+
+            if (! MigrateCommand::isBehind($all, $applied)) {
+                return;
+            }
+
+            $pending = MigrateCommand::pendingMigrations($all, $applied);
+
+            $message = sprintf(
+                'NightOwl schema is behind: %d migration(s) not applied to the nightowl database. '
+                .'Run `php artisan nightowl:migrate`. The agent will keep running, but some writes '
+                .'may fail until the schema is updated.',
+                count($pending),
+            );
+
+            error_log('[NightOwl Agent] '.$message);
+            $this->warn($message);
+        } catch (\Throwable $e) {
+            error_log('[NightOwl Agent] Schema drift check skipped: '.$e->getMessage());
+        }
     }
 
     private function runAsync(string $host, int $port): int

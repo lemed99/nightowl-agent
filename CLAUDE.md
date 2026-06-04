@@ -85,7 +85,8 @@ src/Agent/
 src/Support/
   MultiIngest.php        — Nightwatch coexistence adapter (fan-out wrapper)
 src/Commands/
-  AgentCommand.php        — nightowl:agent [--driver=async|sync]
+  AgentCommand.php        — nightowl:agent [--driver=async|sync]; warns at startup if the nightowl-DB migration history is behind (MigrateCommand::isBehind), skipped under run_migrations ride-along
+  MigrateCommand.php      — nightowl:migrate: migrate --database=nightowl (history in nightowl DB) + baseline adoption; pure helpers migrationsToBaseline/pendingMigrations/isBehind
   InstallCommand.php      — nightowl:install
   PruneCommand.php        — nightowl:prune (retention cleanup)
   ClearCommand.php        — nightowl:clear (truncate all tables)
@@ -96,7 +97,8 @@ src/Commands/
 | Command | Purpose |
 |---------|---------|
 | `nightowl:agent [--driver=async\|sync]` | Start agent (TCP + UDP + Health API) |
-| `nightowl:install` | Publish config, run migrations |
+| `nightowl:install` | Publish config, create/update schema (via `nightowl:migrate`), fork-safety probe |
+| `nightowl:migrate` | Idempotent schema sync — `migrate --database=nightowl` (history in the nightowl DB) + baseline adoption of an already-present schema. Run on each deploy. |
 | `nightowl:prune` | Delete telemetry older than retention (14d default) |
 | `nightowl:clear` | Truncate all NightOwl tables |
 
@@ -161,7 +163,7 @@ docker run -d --name nightowl-test-pg -p 5433:5432 \
 ## Configuration
 ```
 NIGHTOWL_ENABLED=true                    # Master switch — false makes the package inert (no ingest wiring, no migrations). Flip off in the testing env.
-NIGHTOWL_RUN_MIGRATIONS=true             # false stops migrations riding along with host `php artisan migrate`. Set false on all-but-one env when sharing one nightowl DB across environments (avoids 42P07 duplicate-table on deploy). nightowl:install runs them regardless.
+NIGHTOWL_RUN_MIGRATIONS=false            # Legacy ride-along. true also runs migrations via host `php artisan migrate` (history in PRIMARY db). Off by default — schema is managed by nightowl:migrate/install (history in the nightowl DB, idempotent across envs). Don't combine true with nightowl:install.
 NIGHTOWL_ENVIRONMENT=                    # Override APP_ENV for the environment column (rare: standalone harness or custom labels)
 NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=false  # Run alongside Nightwatch (fan-out via MultiIngest)
 NIGHTOWL_DRAIN_BATCH_SIZE=5000           # Rows per COPY batch

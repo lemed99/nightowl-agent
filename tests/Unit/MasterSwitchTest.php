@@ -27,7 +27,7 @@ final class MasterSwitchTest extends TestCase
         $config = require __DIR__.'/../../config/nightowl.php';
 
         $this->assertTrue($config['enabled'], 'NightOwl must default to enabled when NIGHTOWL_ENABLED is unset.');
-        $this->assertTrue($config['run_migrations'], 'Migrations must ride along with `php artisan migrate` by default.');
+        $this->assertFalse($config['run_migrations'], 'Migrations are managed by nightowl:install/migrate, so the host-migrate ride-along is off by default.');
     }
 
     public function test_disabled_switch_does_not_rebind_nightwatch_ingest(): void

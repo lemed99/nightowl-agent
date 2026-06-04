@@ -21,28 +21,27 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Migration Registration
+    | Migration Registration (legacy ride-along)
     |--------------------------------------------------------------------------
     |
-    | NightOwl's tables live in your (BYO) `nightowl` PostgreSQL connection. By
-    | default the package registers its migrations with your app, so they run
-    | with `php artisan migrate` and `php artisan nightowl:install`.
+    | NightOwl's tables live in your (BYO) `nightowl` PostgreSQL connection, and
+    | the schema is managed by `php artisan nightowl:install` /
+    | `php artisan nightowl:migrate`. Those commands track migration history
+    | INSIDE the nightowl database, so they're idempotent across every
+    | environment that shares that database — run them on each deploy and the
+    | first creates the tables, the rest are no-ops.
     |
-    | Laravel records migration history against your app's PRIMARY database,
-    | but the tables are created on the `nightowl` connection. So if several app
-    | environments (local, staging, production) point at ONE shared NightOwl
-    | database, each environment's `php artisan migrate` has its own empty
-    | history and re-runs the table creation — the second environment to deploy
-    | fails with "relation already exists".
-    |
-    | Set NIGHTOWL_RUN_MIGRATIONS=false on every environment except the one that
-    | owns schema management (or set it false everywhere and run
-    | `php artisan nightowl:install` once against the shared database). Telemetry
-    | is unaffected — this only controls whether the migrations ride along with
-    | your app's `migrate` command. `nightowl:install` always runs them.
+    | Set NIGHTOWL_RUN_MIGRATIONS=true to ALSO register the migrations with your
+    | app, so they run as part of `php artisan migrate`. This is the legacy
+    | behavior: it records history against your app's PRIMARY database, which
+    | (a) breaks when several environments share one nightowl database — each
+    | has its own empty history and re-creates the tables — and (b) must not be
+    | combined with `nightowl:install`, since the two track history in different
+    | places and would both try to create the tables. Only enable it for a
+    | single-database setup where you'd rather not run `nightowl:migrate`.
     |
     */
-    'run_migrations' => (bool) env('NIGHTOWL_RUN_MIGRATIONS', true),
+    'run_migrations' => (bool) env('NIGHTOWL_RUN_MIGRATIONS', false),
 
     /*
     |--------------------------------------------------------------------------

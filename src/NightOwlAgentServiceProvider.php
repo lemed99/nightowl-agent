@@ -17,6 +17,7 @@ use NightOwl\Commands\AgentCommand;
 use NightOwl\Commands\ClearCommand;
 use NightOwl\Commands\DrainWorkerCommand;
 use NightOwl\Commands\InstallCommand;
+use NightOwl\Commands\MigrateCommand;
 use NightOwl\Commands\PruneCommand;
 use NightOwl\Support\MultiIngest;
 
@@ -203,6 +204,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 AgentCommand::class,
                 DrainWorkerCommand::class,
                 InstallCommand::class,
+                MigrateCommand::class,
                 PruneCommand::class,
                 ClearCommand::class,
             ]);
@@ -234,13 +236,13 @@ class NightOwlAgentServiceProvider extends ServiceProvider
             return;
         }
 
-        // Opt-out for shared-database, multi-environment setups: when several
-        // app environments point at one NightOwl database, only the environment
-        // that owns schema management should let the migrations ride along with
-        // `php artisan migrate` — otherwise the others re-run the table creation
-        // and fail with "relation already exists". `nightowl:install` runs them
-        // explicitly (via --path) regardless of this flag.
-        if (! config('nightowl.run_migrations', true)) {
+        // The schema is managed by `nightowl:install` / `nightowl:migrate`,
+        // which track history inside the nightowl database (idempotent across
+        // environments). Registering the migrations with the host app's
+        // `php artisan migrate` is opt-in legacy behavior — it tracks history in
+        // the PRIMARY database and must not be combined with those commands, so
+        // it's off by default.
+        if (! config('nightowl.run_migrations', false)) {
             return;
         }
 

@@ -67,19 +67,17 @@ Set `NIGHTOWL_ENABLED=false` to make the package fully inert — the Nightwatch 
 
 ## Sharing one database across environments
 
-NightOwl stamps an `environment` column on every row, so several app environments (local, staging, production) can point at one NightOwl database and be filtered apart in the dashboard.
+NightOwl stamps an `environment` column (your `APP_ENV`) on every row, so several app environments (local, staging, production) can point at one NightOwl database and be filtered apart in the dashboard. The data is partitioned by environment; the `nightowl_*` tables are shared.
 
-Because Laravel tracks migration history against your app's primary database — but the `nightowl_*` tables live in the `nightowl` connection — each environment's `php artisan migrate` re-runs the table creation and the second deploy fails with `relation "nightowl_requests" already exists`.
+`nightowl:install` and `nightowl:migrate` track their migration history **inside the NightOwl database**, so they're idempotent across environments. Run the schema sync as part of each deploy:
 
-Let one environment own the schema and opt the rest out:
-
-```env
-# On every environment that SHARES a NightOwl database with another,
-# except the one that owns schema management:
-NIGHTOWL_RUN_MIGRATIONS=false
+```bash
+php artisan nightowl:migrate
 ```
 
-Their `php artisan migrate` then skips the NightOwl tables (telemetry is unaffected). Alternatively set it `false` everywhere and run `php artisan nightowl:install` once against the shared database. Leave it `true` if each environment has its own NightOwl database.
+The first environment to deploy creates the tables, the rest are no-ops, and upgrades' new migrations apply on whichever environment deploys first. No "owner" environment and no flags. A database that already has the tables but no NightOwl migration history (e.g. created by an older version or by your app's `php artisan migrate`) is adopted as a baseline, so you never hit `relation "nightowl_requests" already exists`.
+
+By default these migrations are **not** bundled into your app's `php artisan migrate`. If you'd rather run them that way (single-database setups only — it tracks history in your primary database and must not be combined with `nightowl:install`), set `NIGHTOWL_RUN_MIGRATIONS=true`.
 
 ## What you get out of the box
 
