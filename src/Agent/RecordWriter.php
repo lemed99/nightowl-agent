@@ -2,6 +2,9 @@
 
 namespace NightOwl\Agent;
 
+use NightOwl\Support\QueryHistogram;
+use NightOwl\Support\RollupSpec;
+use NightOwl\Support\RollupSpecs;
 use PDO;
 
 final class RecordWriter
@@ -19,6 +22,15 @@ final class RecordWriter
     private ?string $thresholdUpdatedAt = null;
 
     private AlertNotifier $notifier;
+
+    /** Cached per rollup table: whether it exists on the target DB. */
+    private array $rollupTableChecked = [];
+
+    /** Built once: the queries rollup upsert SQL (includes the generated hist_NN columns). */
+    private ?string $rollupUpsertSql = null;
+
+    /** Built once per rollup table: the generic spec-driven upsert SQL. */
+    private array $rollupSqlCache = [];
 
     public function __construct(
         private string $host,
@@ -356,6 +368,11 @@ final class RecordWriter
 
     private function writeRequests(array $records): void
     {
+        // One clock per batch: written to created_at AND used for the rollup
+        // bucket so live drain and the read path bucket on the same value.
+        $nowTs = time();
+        $now = date('Y-m-d H:i:s', $nowTs);
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'user_id', 'method', 'url', 'route_name', 'route_methods',
@@ -366,7 +383,7 @@ final class RecordWriter
             'exceptions', 'logs', 'queries',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
             'cache_events', 'peak_memory_usage',
-            'exception_preview', 'context', 'headers', 'payload',
+            'exception_preview', 'context', 'headers', 'payload', 'created_at',
         ];
 
         $rows = [];
@@ -412,20 +429,33 @@ final class RecordWriter
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
                 is_string($r['headers'] ?? null) ? $r['headers'] : json_encode($r['headers'] ?? null),
                 is_string($r['payload'] ?? null) ? $r['payload'] : json_encode($r['payload'] ?? null),
+                $now,
             ];
         }
 
         $this->copyBatch('nightowl_requests', $columns, $rows);
+
+        if ($this->rollupEnabled('nightowl_request_rollups')) {
+            $this->writeRollup($records, RollupSpecs::requests(), $nowTs);
+        }
 
         $this->checkRouteThresholds($records);
     }
 
     private function writeQueries(array $records): void
     {
+        // One clock for the whole batch: written to created_at AND used for the
+        // rollup bucket, so live drain and the read path (which filters on
+        // created_at) bucket on the identical value. created_at was previously
+        // left to the column's useCurrent() (DB insert time); setting it
+        // explicitly makes the agent clock authoritative — fine when NTP-synced.
+        $nowTs = time();
+        $now = date('Y-m-d H:i:s', $nowTs);
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
-            'sql_query', 'file', 'line', 'duration', 'connection', 'connection_type',
+            'sql_query', 'file', 'line', 'duration', 'connection', 'connection_type', 'created_at',
         ];
 
         $rows = [];
@@ -449,12 +479,317 @@ final class RecordWriter
                 $r['duration'] ?? null,
                 $r['connection'] ?? null,
                 $r['connection_type'] ?? null,
+                $now,
             ];
         }
 
         $this->copyBatch('nightowl_queries', $columns, $rows);
 
+        if ($this->rollupEnabled('nightowl_query_rollups')) {
+            $this->writeQueryRollups($records, $nowTs);
+        }
+
         $this->checkThresholds('query', $records, 'connection');
+    }
+
+    /**
+     * A rollup table's existence is fixed for the agent's lifetime, so probe
+     * once per table and cache. When the table is missing (a customer running
+     * new agent code before `nightowl:migrate` created it), skip the rollup
+     * write rather than aborting the whole drain transaction — the upsert shares
+     * the COPY's transaction, so its failure would roll the raw write back too.
+     * Restart picks up the table once migrations have run.
+     */
+    private function rollupEnabled(string $table): bool
+    {
+        if (! array_key_exists($table, $this->rollupTableChecked)) {
+            try {
+                $this->rollupTableChecked[$table] = (bool) $this->pdo()->query(
+                    "SELECT to_regclass('public.".$table."') IS NOT NULL"
+                )->fetchColumn();
+            } catch (\Throwable) {
+                $this->rollupTableChecked[$table] = false;
+            }
+
+            if ($this->rollupTableChecked[$table] === false) {
+                error_log('[NightOwl Agent] '.$table.' missing — rollups for it disabled until nightowl:migrate runs (restart the agent afterward)');
+            }
+        }
+
+        return $this->rollupTableChecked[$table];
+    }
+
+    /**
+     * Generic, spec-driven rollup writer — the engine behind every non-query
+     * rollup (requests/jobs/outgoing/cache). Groups the batch in PHP by the
+     * spec's group columns, accumulates call_count + additive counters + (when
+     * the spec carries duration) totals/min/max and histogram bins + first-seen
+     * representatives, then one additive UPSERT per group. Same transaction as
+     * the COPY (atomic with raw), same concurrency-safety as the query rollup.
+     */
+    private function writeRollup(array $records, RollupSpec $spec, int $nowTs): void
+    {
+        $bucketStart = date('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
+        $histColumns = $spec->hasHistogram ? QueryHistogram::columns() : [];
+        $counterCols = $spec->counterColumns();
+        $repCols = $spec->representativeColumns();
+
+        $groups = [];
+        foreach ($records as $r) {
+            $groupVals = [];
+            $keyParts = [];
+            foreach ($spec->groupColumns as $col => $def) {
+                $value = (string) ($def['php'])($r);
+                $groupVals[$col] = $value;
+                $keyParts[] = $value;
+            }
+            $key = implode("\0", $keyParts);
+
+            if (! isset($groups[$key])) {
+                $groups[$key] = [
+                    'group' => $groupVals,
+                    'call_count' => 0,
+                    'counters' => array_fill_keys($counterCols, 0),
+                    'total_duration' => 0,
+                    'min_duration' => null,
+                    'max_duration' => null,
+                    'hist' => $spec->hasHistogram ? array_fill(0, count($histColumns), 0) : [],
+                    'reps' => array_fill_keys($repCols, null),
+                ];
+            }
+
+            $groups[$key]['call_count']++;
+            foreach ($spec->counters as $cc => $def) {
+                if (($def['php'])($r)) {
+                    $groups[$key]['counters'][$cc]++;
+                }
+            }
+            if ($spec->hasDuration) {
+                $duration = $r[$spec->durationField] ?? null;
+                if ($duration !== null) {
+                    $duration = (int) $duration;
+                    $groups[$key]['total_duration'] += $duration;
+                    $groups[$key]['min_duration'] = $groups[$key]['min_duration'] === null
+                        ? $duration : min($groups[$key]['min_duration'], $duration);
+                    $groups[$key]['max_duration'] = $groups[$key]['max_duration'] === null
+                        ? $duration : max($groups[$key]['max_duration'], $duration);
+                    if ($spec->hasHistogram) {
+                        $groups[$key]['hist'][QueryHistogram::binIndex($duration)]++;
+                    }
+                }
+            }
+            foreach ($spec->representatives as $rc => $def) {
+                if ($groups[$key]['reps'][$rc] === null) {
+                    $value = ($def['php'])($r);
+                    if ($value !== null && $value !== '') {
+                        $groups[$key]['reps'][$rc] = $value;
+                    }
+                }
+            }
+        }
+
+        if (empty($groups)) {
+            return;
+        }
+
+        $upsert = $this->pdo()->prepare($this->rollupSql($spec, $histColumns));
+
+        foreach ($groups as $g) {
+            $params = $g['group'];
+            $params['bucket_start'] = $bucketStart;
+            $params['environment'] = $this->environment;
+            $params['call_count'] = $g['call_count'];
+            foreach ($g['counters'] as $cc => $value) {
+                $params[$cc] = $value;
+            }
+            if ($spec->hasDuration) {
+                $params['total_duration'] = $g['total_duration'];
+                $params['min_duration'] = $g['min_duration'];
+                $params['max_duration'] = $g['max_duration'];
+                foreach ($histColumns as $i => $hc) {
+                    $params[$hc] = $g['hist'][$i];
+                }
+            }
+            foreach ($g['reps'] as $rc => $value) {
+                $params[$rc] = $value;
+            }
+
+            $upsert->execute($params);
+        }
+    }
+
+    /**
+     * Build (and cache) the spec-driven upsert SQL. Counters, duration totals,
+     * and histogram bins accumulate additively; min/max use LEAST/GREATEST;
+     * representatives keep the first-seen value via COALESCE.
+     *
+     * @param  list<string>  $histColumns
+     */
+    private function rollupSql(RollupSpec $spec, array $histColumns): string
+    {
+        if (isset($this->rollupSqlCache[$spec->table])) {
+            return $this->rollupSqlCache[$spec->table];
+        }
+
+        $groupCols = $spec->groupColumnNames();
+        $insertCols = [...$groupCols, 'bucket_start', 'environment', 'call_count', ...$spec->counterColumns()];
+        if ($spec->hasDuration) {
+            $insertCols = [...$insertCols, 'total_duration', 'min_duration', 'max_duration'];
+        }
+        if ($spec->hasHistogram) {
+            $insertCols = [...$insertCols, ...$histColumns];
+        }
+        $insertCols = [...$insertCols, ...$spec->representativeColumns()];
+
+        $placeholders = array_map(static fn (string $c): string => ':'.$c, $insertCols);
+        $pk = [...$groupCols, 'bucket_start', 'environment'];
+
+        $t = $spec->table;
+        $set = ["call_count = {$t}.call_count + EXCLUDED.call_count"];
+        foreach ($spec->counterColumns() as $c) {
+            $set[] = "{$c} = {$t}.{$c} + EXCLUDED.{$c}";
+        }
+        if ($spec->hasDuration) {
+            $set[] = "total_duration = {$t}.total_duration + EXCLUDED.total_duration";
+            $set[] = "min_duration = LEAST({$t}.min_duration, EXCLUDED.min_duration)";
+            $set[] = "max_duration = GREATEST({$t}.max_duration, EXCLUDED.max_duration)";
+        }
+        if ($spec->hasHistogram) {
+            foreach ($histColumns as $c) {
+                $set[] = "{$c} = {$t}.{$c} + EXCLUDED.{$c}";
+            }
+        }
+        foreach ($spec->representativeColumns() as $c) {
+            $set[] = "{$c} = COALESCE({$t}.{$c}, EXCLUDED.{$c})";
+        }
+
+        return $this->rollupSqlCache[$t] = sprintf(
+            'INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s',
+            $t,
+            implode(', ', $insertCols),
+            implode(', ', $placeholders),
+            implode(', ', $pk),
+            implode(', ', $set),
+        );
+    }
+
+    /**
+     * Maintain the pre-aggregated nightowl_query_rollups summary alongside the
+     * raw COPY, in the SAME transaction (doWrite wraps every type-writer in one
+     * transaction), so the rollup can never diverge from raw — both commit or
+     * both roll back. Mirrors syncIssuesToExceptions(): group in PHP, then one
+     * additive UPSERT per group with SQL-side accumulation, which is
+     * concurrency-safe across NIGHTOWL_DRAIN_WORKERS (two workers hitting the
+     * same (hash, bucket) serialize on the row lock; both increments land).
+     *
+     * Unlike copyBatch, this is a plain prepared statement, so it is unaffected
+     * by the Swoole pgsqlCopyFromArray spin — no special-casing needed.
+     */
+    private function writeQueryRollups(array $records, int $nowTs): void
+    {
+        // Bucket on the SAME clock written to created_at, truncated to 60s.
+        $bucketStart = date('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
+
+        $histColumns = QueryHistogram::columns();
+
+        $groups = [];
+        foreach ($records as $r) {
+            $groupHash = (string) ($r['_group'] ?? '');
+            $connection = (string) ($r['connection'] ?? ''); // '' sentinel (see migration)
+            $key = $groupHash."\0".$connection;
+
+            $duration = $r['duration'] ?? null;
+            $duration = $duration === null ? null : (int) $duration;
+
+            if (! isset($groups[$key])) {
+                $groups[$key] = [
+                    'group_hash' => $groupHash,
+                    'connection' => $connection,
+                    'call_count' => 0,
+                    'total_duration' => 0,
+                    'min_duration' => null,
+                    'max_duration' => null,
+                    'sql_query' => null,
+                    'hist' => array_fill(0, count($histColumns), 0),
+                ];
+            }
+
+            $groups[$key]['call_count']++;
+            if ($duration !== null) {
+                $groups[$key]['total_duration'] += $duration;
+                $groups[$key]['min_duration'] = $groups[$key]['min_duration'] === null
+                    ? $duration : min($groups[$key]['min_duration'], $duration);
+                $groups[$key]['max_duration'] = $groups[$key]['max_duration'] === null
+                    ? $duration : max($groups[$key]['max_duration'], $duration);
+                $groups[$key]['hist'][QueryHistogram::binIndex($duration)]++;
+            }
+            if ($groups[$key]['sql_query'] === null && isset($r['sql']) && $r['sql'] !== '') {
+                $groups[$key]['sql_query'] = $r['sql'];
+            }
+        }
+
+        if (empty($groups)) {
+            return;
+        }
+
+        $upsert = $this->pdo()->prepare($this->rollupUpsertSql($histColumns));
+
+        foreach ($groups as $g) {
+            $params = [
+                'group_hash' => $g['group_hash'],
+                'bucket_start' => $bucketStart,
+                'environment' => $this->environment,
+                'connection' => $g['connection'],
+                'call_count' => $g['call_count'],
+                'total_duration' => $g['total_duration'],
+                'min_duration' => $g['min_duration'],
+                'max_duration' => $g['max_duration'],
+                'sql_query' => $g['sql_query'],
+            ];
+            foreach ($histColumns as $i => $column) {
+                $params[$column] = $g['hist'][$i];
+            }
+
+            $upsert->execute($params);
+        }
+    }
+
+    /**
+     * Build (and cache) the rollup upsert SQL. Additive columns accumulate via
+     * `existing + EXCLUDED`; min/max use LEAST/GREATEST (which ignore NULL
+     * operands in Postgres, so an all-null-duration batch leaves them
+     * untouched); each histogram bin accumulates additively too.
+     *
+     * @param  list<string>  $histColumns
+     */
+    private function rollupUpsertSql(array $histColumns): string
+    {
+        if ($this->rollupUpsertSql !== null) {
+            return $this->rollupUpsertSql;
+        }
+
+        $insertColumns = ['group_hash', 'bucket_start', 'environment', 'connection',
+            'call_count', 'total_duration', 'min_duration', 'max_duration', 'sql_query', ...$histColumns];
+        $placeholders = array_map(static fn (string $c): string => ':'.$c, $insertColumns);
+
+        $setClauses = [
+            'call_count     = nightowl_query_rollups.call_count     + EXCLUDED.call_count',
+            'total_duration = nightowl_query_rollups.total_duration + EXCLUDED.total_duration',
+            'min_duration   = LEAST(nightowl_query_rollups.min_duration,  EXCLUDED.min_duration)',
+            'max_duration   = GREATEST(nightowl_query_rollups.max_duration, EXCLUDED.max_duration)',
+            'sql_query      = COALESCE(nightowl_query_rollups.sql_query, EXCLUDED.sql_query)',
+        ];
+        foreach ($histColumns as $column) {
+            $setClauses[] = "{$column} = nightowl_query_rollups.{$column} + EXCLUDED.{$column}";
+        }
+
+        return $this->rollupUpsertSql = sprintf(
+            'INSERT INTO nightowl_query_rollups (%s) VALUES (%s) '.
+            'ON CONFLICT (group_hash, bucket_start, environment, connection) DO UPDATE SET %s',
+            implode(', ', $insertColumns),
+            implode(', ', $placeholders),
+            implode(', ', $setClauses),
+        );
     }
 
     private function writeExceptions(array $records): void
@@ -636,6 +971,9 @@ final class RecordWriter
 
     private function writeJobs(array $records): void
     {
+        $nowTs = time();
+        $now = date('Y-m-d H:i:s', $nowTs);
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
@@ -643,7 +981,7 @@ final class RecordWriter
             'job_class', 'queue', 'connection', 'status', 'duration', 'attempts',
             'exceptions', 'logs', 'queries',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
-            'cache_events', 'peak_memory_usage', 'exception_preview', 'context',
+            'cache_events', 'peak_memory_usage', 'exception_preview', 'context', 'created_at',
         ];
 
         $rows = [];
@@ -660,20 +998,28 @@ final class RecordWriter
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
                 $r['cache_events'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
+                $now,
             ];
         }
 
         $this->copyBatch('nightowl_jobs', $columns, $rows);
+
+        if ($this->rollupEnabled('nightowl_job_rollups')) {
+            $this->writeRollup($records, RollupSpecs::jobs(), $nowTs);
+        }
 
         $this->checkThresholds('job', $records, ['name', 'job_class']);
     }
 
     private function writeCacheEvents(array $records): void
     {
+        $nowTs = time();
+        $now = date('Y-m-d H:i:s', $nowTs);
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
-            'event_type', 'key', 'store', 'ttl', 'duration',
+            'event_type', 'key', 'store', 'ttl', 'duration', 'created_at',
         ];
 
         $rows = [];
@@ -683,10 +1029,15 @@ final class RecordWriter
                 $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment, $r['server'] ?? null, $r['_group'] ?? null,
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['type'] ?? 'unknown', $r['key'] ?? '', $r['store'] ?? null, $r['ttl'] ?? null, $r['duration'] ?? null,
+                $now,
             ];
         }
 
         $this->copyBatch('nightowl_cache_events', $columns, $rows);
+
+        if ($this->rollupEnabled('nightowl_cache_rollups')) {
+            $this->writeRollup($records, RollupSpecs::cacheEvents(), $nowTs);
+        }
 
         $this->checkThresholds('cache', $records, 'store');
     }
@@ -743,11 +1094,14 @@ final class RecordWriter
 
     private function writeOutgoingRequests(array $records): void
     {
+        $nowTs = time();
+        $now = date('Y-m-d H:i:s', $nowTs);
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'host', 'method', 'url', 'status_code', 'duration',
-            'request_size', 'response_size', 'request_headers',
+            'request_size', 'response_size', 'request_headers', 'created_at',
         ];
 
         $rows = [];
@@ -758,10 +1112,15 @@ final class RecordWriter
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['host'] ?? null, $r['method'] ?? 'GET', $r['url'] ?? '', $r['status_code'] ?? null, $r['duration'] ?? null,
                 $r['request_size'] ?? null, $r['response_size'] ?? null, $r['request_headers'] ?? null,
+                $now,
             ];
         }
 
         $this->copyBatch('nightowl_outgoing_requests', $columns, $rows);
+
+        if ($this->rollupEnabled('nightowl_outgoing_request_rollups')) {
+            $this->writeRollup($records, RollupSpecs::outgoingRequests(), $nowTs);
+        }
 
         $this->checkThresholds('outgoing_request', $records, 'host');
     }

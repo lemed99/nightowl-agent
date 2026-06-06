@@ -51,10 +51,55 @@ class HealthReporterTest extends TestCase
         $this->assertSame(0, $prop->getValue($reporter));
     }
 
+    public function test_non_retryable_rejection_is_counted_and_logged(): void
+    {
+        // A non-2xx response (e.g. 401/422) must surface, not be silently
+        // dropped: the first occurrence increments the failure counter and is
+        // logged so a bad token or rejected payload is visible immediately.
+        $reporter = new HealthReporter('https://api.example.com', 'token');
+
+        $logFile = tempnam(sys_get_temp_dir(), 'nightowl-health-log');
+        $previous = ini_set('error_log', $logFile);
+
+        try {
+            $this->handleFailure($reporter, 'HTTP 422 from health endpoint', false);
+        } finally {
+            ini_set('error_log', $previous === false ? '' : $previous);
+        }
+
+        $prop = (new ReflectionClass($reporter))->getProperty('consecutiveFailures');
+        $this->assertSame(1, $prop->getValue($reporter));
+
+        $logged = (string) file_get_contents($logFile);
+        @unlink($logFile);
+
+        $this->assertStringContainsString('Health report failed', $logged);
+        $this->assertStringContainsString('HTTP 422 from health endpoint', $logged);
+    }
+
     private function computeInterval(HealthReporter $reporter, string $status): int
     {
         $method = (new ReflectionClass($reporter))->getMethod('computeInterval');
 
         return $method->invoke($reporter, $status);
+    }
+
+    private function handleFailure(HealthReporter $reporter, string $reason, bool $retryable): void
+    {
+        // The non-retryable path returns before touching the loop/connector,
+        // so real lightweight instances are safe (no connection is opened).
+        $method = (new ReflectionClass($reporter))->getMethod('handleFailure');
+
+        $method->invoke(
+            $reporter,
+            \React\EventLoop\Loop::get(),
+            new \React\Socket\Connector(),
+            'https://api.example.com/agent/health',
+            '{}',
+            'rpt-1',
+            0,
+            $reason,
+            $retryable,
+        );
     }
 }

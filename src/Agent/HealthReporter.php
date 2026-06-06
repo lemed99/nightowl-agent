@@ -80,7 +80,7 @@ final class HealthReporter
         $reactScheme = $scheme === 'https' ? 'tls' : 'tcp';
 
         $connector->connect("{$reactScheme}://{$host}:{$port}")->then(
-            function (ConnectionInterface $connection) use ($host, $path, $body) {
+            function (ConnectionInterface $connection) use ($loop, $connector, $url, $host, $path, $body, $reportId, $attempt) {
                 $request = "POST {$path} HTTP/1.1\r\n"
                     . "Host: {$host}\r\n"
                     . "Content-Type: application/json\r\n"
@@ -93,32 +93,80 @@ final class HealthReporter
                 $connection->write($request);
 
                 $responseBuffer = '';
-                $connection->on('data', function (string $chunk) use ($connection, &$responseBuffer) {
-                    $responseBuffer .= $chunk;
-                    if (str_contains($responseBuffer, "\r\n\r\n")) {
-                        $statusLine = strtok($responseBuffer, "\r\n");
-                        $parts = explode(' ', $statusLine, 3);
-                        $code = (int) ($parts[1] ?? 0);
-                        if ($code >= 200 && $code < 300) {
-                            $this->consecutiveFailures = 0;
-                        }
-                        $connection->close();
+                $handled = false;
+                $connection->on('data', function (string $chunk) use ($connection, &$responseBuffer, &$handled, $loop, $connector, $url, $body, $reportId, $attempt) {
+                    if ($handled) {
+                        return;
                     }
+
+                    $responseBuffer .= $chunk;
+                    if (! str_contains($responseBuffer, "\r\n")) {
+                        return;
+                    }
+
+                    $handled = true;
+                    $statusLine = strtok($responseBuffer, "\r\n");
+                    $parts = explode(' ', $statusLine, 3);
+                    $code = (int) ($parts[1] ?? 0);
+                    $connection->close();
+
+                    if ($code >= 200 && $code < 300) {
+                        $this->consecutiveFailures = 0;
+
+                        return;
+                    }
+
+                    // The report reached the API but was rejected. 5xx is
+                    // transient (retry); a 4xx means a bad token or a payload
+                    // the API won't accept — that won't fix itself, so surface
+                    // it instead of silently dropping the report.
+                    $this->handleFailure(
+                        $loop, $connector, $url, $body, $reportId, $attempt,
+                        "HTTP {$code} from health endpoint",
+                        retryable: $code >= 500,
+                    );
                 });
             },
             function (\Throwable $e) use ($loop, $connector, $url, $body, $reportId, $attempt) {
-                $this->consecutiveFailures++;
-
-                if ($attempt < self::MAX_RETRIES) {
-                    $backoff = self::RETRY_BASE_SECONDS * (2 ** $attempt);
-                    $loop->addTimer($backoff, function () use ($loop, $connector, $url, $body, $reportId, $attempt) {
-                        $this->sendWithRetry($loop, $connector, $url, $body, $reportId, $attempt + 1);
-                    });
-                } elseif ($this->consecutiveFailures % 5 === 0) {
-                    error_log("[NightOwl Agent] Health report failed ({$this->consecutiveFailures} consecutive): {$e->getMessage()}");
-                }
+                $this->handleFailure(
+                    $loop, $connector, $url, $body, $reportId, $attempt,
+                    $e->getMessage(),
+                    retryable: true,
+                );
             }
         );
+    }
+
+    /**
+     * Handle a failed report: retry transient failures with backoff, and log
+     * persistent ones. A non-retryable failure (e.g. 401/422) is logged on its
+     * first occurrence so a misconfigured token or contract mismatch is visible
+     * immediately rather than silently discarded.
+     */
+    private function handleFailure(
+        LoopInterface $loop,
+        Connector $connector,
+        string $url,
+        string $body,
+        string $reportId,
+        int $attempt,
+        string $reason,
+        bool $retryable,
+    ): void {
+        $this->consecutiveFailures++;
+
+        if ($retryable && $attempt < self::MAX_RETRIES) {
+            $backoff = self::RETRY_BASE_SECONDS * (2 ** $attempt);
+            $loop->addTimer($backoff, function () use ($loop, $connector, $url, $body, $reportId, $attempt) {
+                $this->sendWithRetry($loop, $connector, $url, $body, $reportId, $attempt + 1);
+            });
+
+            return;
+        }
+
+        if ($this->consecutiveFailures % 5 === 0 || (! $retryable && $this->consecutiveFailures === 1)) {
+            error_log("[NightOwl Agent] Health report failed ({$this->consecutiveFailures} consecutive): {$reason}");
+        }
     }
 
     private function computeInterval(string $status): int

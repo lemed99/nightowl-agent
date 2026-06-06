@@ -5,7 +5,60 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
-## [1.1.0] - unreleased
+## [1.2.0] - 2026-06-06
+
+### Added
+
+- **Pre-aggregated rollups for fast dashboard reads.** The agent now maintains
+  per-minute summary tables — `nightowl_query_rollups`, `nightowl_request_rollups`,
+  `nightowl_job_rollups`, `nightowl_outgoing_request_rollups`, and
+  `nightowl_cache_rollups` — at drain time, in the **same transaction** as the raw
+  write (so a rollup can never diverge from raw). The dashboard reads these for
+  wide time ranges instead of scanning the high-volume raw tables, which fixes
+  read-time query timeouts on busy apps. Duration-bearing types also keep a
+  fixed log-scale histogram for approximate p50/p95/p99 over wide ranges. New
+  migrations create the tables — run `php artisan nightowl:migrate`. The drain
+  skips a rollup whose table is missing rather than failing, so upgrading the
+  package before running migrations is safe (restart the agent after migrating).
+- **`php artisan nightowl:backfill-rollups`.** Populates every rollup table from
+  existing raw telemetry so historical ranges work immediately after upgrade.
+  Chunked, throttled, and idempotent; `--type=` restricts to one table,
+  `--since=` / `--until=` / `--chunk-days=` bound and pace the run. It never
+  touches the most recent ~10 minutes, so it can't race live drain.
+- **`NIGHTOWL_ROLLUP_RETENTION_DAYS`** (default `90`). Rollups are tiny, so
+  `nightowl:prune` now retains them far longer than raw telemetry — keep
+  long-range trend charts while pruning raw aggressively. `--rollup-days=`
+  overrides per run.
+
+### Changed
+
+- **`created_at` is now stamped by the agent on requests/queries/jobs/
+  outgoing-requests/cache rows** (previously left to the database column
+  default). One clock per drain batch is written to both `created_at` and the
+  rollup bucket so the summaries align with the read path. The agent's clock —
+  not the database's — now authors these timestamps, so keep the agent host
+  NTP-synced (the offset was already bounded by drain lag before this change).
+
+### Fixed
+
+- **Health reports now surface API rejections instead of dropping them.** A
+  health report that reached the API but was rejected (e.g. `401` bad token,
+  `422` payload the API won't accept) was previously discarded silently. The
+  reporter now retries transient `5xx` failures with backoff and logs a
+  non-retryable `4xx` on its first occurrence, so a misconfigured token or
+  contract mismatch is visible immediately. Response parsing was also hardened
+  against partial reads.
+
+### Upgrading to 1.2.0
+
+- **Populate rollups for historical data.** Live drain only fills the rollup
+  tables for telemetry collected *after* this upgrade. To make wide time ranges
+  fast immediately, run `php artisan nightowl:backfill-rollups` once after
+  `nightowl:migrate` (it's idempotent and throttled, safe to run alongside a
+  live agent). Without it, recent data still works and the tables fill in over
+  time as drain runs.
+
+## [1.1.0] - 2026-06-04
 
 ### Added
 

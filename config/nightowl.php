@@ -61,6 +61,10 @@ return [
         'password' => env('NIGHTOWL_DB_PASSWORD', 'nightowl'),
         'sslmode' => env('NIGHTOWL_DB_SSLMODE', 'prefer'),
         'retention_days' => env('NIGHTOWL_RETENTION_DAYS', 14),
+        // Query rollups (nightowl_query_rollups) are tiny pre-aggregated
+        // summaries, so they're kept far longer than raw telemetry — this is
+        // what powers long-range trend charts without retaining raw rows.
+        'rollup_retention_days' => env('NIGHTOWL_ROLLUP_RETENTION_DAYS', 90),
     ],
 
     /*

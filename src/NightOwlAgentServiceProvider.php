@@ -14,6 +14,7 @@ use NightOwl\Agent\PayloadParser;
 use NightOwl\Agent\RecordWriter;
 use NightOwl\Agent\Server;
 use NightOwl\Commands\AgentCommand;
+use NightOwl\Commands\BackfillRollupsCommand;
 use NightOwl\Commands\ClearCommand;
 use NightOwl\Commands\DrainWorkerCommand;
 use NightOwl\Commands\InstallCommand;
@@ -206,6 +207,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 InstallCommand::class,
                 MigrateCommand::class,
                 PruneCommand::class,
+                BackfillRollupsCommand::class,
                 ClearCommand::class,
             ]);
         }

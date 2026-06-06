@@ -307,6 +307,559 @@ class RecordWriterTest extends TestCase
         $this->assertSame('updated@test.com', $row['email']);
     }
 
+    // ─── Query rollups ─────────────────────────────────────
+
+    public function test_write_query_populates_rollup(): void
+    {
+        $records = [];
+        for ($i = 1; $i <= 5; $i++) {
+            $records[] = $this->sim->makeQuery([
+                'trace_id' => "rollup-{$i}",
+                '_group' => 'rollupgrouphash',
+                'sql' => 'SELECT * FROM widgets',
+                'duration' => $i * 1000, // 1000..5000
+                'connection' => 'pgsql',
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $rollup = self::$pdo->query(
+            "SELECT * FROM nightowl_query_rollups WHERE group_hash = 'rollupgrouphash'"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        // Same hash + connection + minute bucket collapse to a single row.
+        $this->assertCount(1, $rollup);
+        $row = $rollup[0];
+        $this->assertSame(5, (int) $row['call_count']);
+        $this->assertSame(15000, (int) $row['total_duration']);
+        $this->assertSame(1000, (int) $row['min_duration']);
+        $this->assertSame(5000, (int) $row['max_duration']);
+        $this->assertSame('pgsql', $row['connection']);
+        $this->assertSame('SELECT * FROM widgets', $row['sql_query']);
+    }
+
+    public function test_rollup_accumulates_additively_across_batches(): void
+    {
+        $make = fn (string $trace, int $duration) => $this->sim->makeQuery([
+            'trace_id' => $trace,
+            '_group' => 'accumhash',
+            'sql' => 'SELECT 1',
+            'duration' => $duration,
+            'connection' => 'pgsql',
+        ]);
+
+        $this->writer->write([$make('a1', 2000), $make('a2', 4000)]);
+        $this->writer->write([$make('a3', 1000)]);
+
+        $row = self::$pdo->query(
+            "SELECT * FROM nightowl_query_rollups WHERE group_hash = 'accumhash'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        // Both batches land in the same minute bucket and accumulate via the
+        // additive ON CONFLICT upsert.
+        $this->assertSame(3, (int) $row['call_count']);
+        $this->assertSame(7000, (int) $row['total_duration']);
+        $this->assertSame(1000, (int) $row['min_duration']);
+        $this->assertSame(4000, (int) $row['max_duration']);
+    }
+
+    /**
+     * Drift guard: the rollup, summed across its keys, must exactly reproduce a
+     * raw re-aggregation of nightowl_queries. This is the single highest-value
+     * defense against the rollup and raw paths diverging — any future change to
+     * writeQueries that updates one without the other trips this.
+     */
+    public function test_rollup_sums_match_raw_reaggregation(): void
+    {
+        $records = [];
+        for ($i = 1; $i <= 24; $i++) {
+            $records[] = $this->sim->makeQuery([
+                'trace_id' => "drift-{$i}",
+                '_group' => 'g'.($i % 3),
+                'sql' => 'SELECT '.($i % 3),
+                'duration' => $i * 100,
+                'connection' => $i % 2 === 0 ? 'pgsql' : 'mysql',
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(group_hash, '') AS gh, COALESCE(connection, '') AS conn,
+                    COUNT(*) AS c, SUM(duration) AS s, MIN(duration) AS mn, MAX(duration) AS mx
+             FROM nightowl_queries
+             GROUP BY 1, 2 ORDER BY 1, 2"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $rollup = self::$pdo->query(
+            "SELECT group_hash AS gh, connection AS conn,
+                    SUM(call_count) AS c, SUM(total_duration) AS s,
+                    MIN(min_duration) AS mn, MAX(max_duration) AS mx
+             FROM nightowl_query_rollups
+             GROUP BY 1, 2 ORDER BY 1, 2"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'Rollup aggregates must match a raw re-aggregation exactly');
+    }
+
+    public function test_rollup_populates_histogram_bins(): void
+    {
+        $this->writer->write([
+            $this->sim->makeQuery(['trace_id' => 'h-1', '_group' => 'histgroup', 'sql' => 'SELECT 1', 'duration' => 100, 'connection' => 'pgsql']),     // bin 0 (< 128)
+            $this->sim->makeQuery(['trace_id' => 'h-2', '_group' => 'histgroup', 'sql' => 'SELECT 1', 'duration' => 150, 'connection' => 'pgsql']),     // bin 1 ([128, 181))
+            $this->sim->makeQuery(['trace_id' => 'h-3', '_group' => 'histgroup', 'sql' => 'SELECT 1', 'duration' => 2000000, 'connection' => 'pgsql']), // bin 28 ([1482910, 2097152))
+        ]);
+
+        $row = self::$pdo->query(
+            "SELECT * FROM nightowl_query_rollups WHERE group_hash = 'histgroup'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(3, (int) $row['call_count']);
+        $this->assertSame(1, (int) $row['hist_00']);
+        $this->assertSame(1, (int) $row['hist_01']);
+        $this->assertSame(1, (int) $row['hist_28']);
+
+        $binTotal = 0;
+        for ($i = 0; $i < 39; $i++) {
+            $binTotal += (int) $row[sprintf('hist_%02d', $i)];
+        }
+        $this->assertSame(3, $binTotal, 'Histogram bins must sum to call_count');
+    }
+
+    /**
+     * The drain assigns bins via QueryHistogram::binIndex (PHP); the backfill
+     * assigns them via QueryHistogram::caseSql (SQL). This asserts the two agree
+     * — drain-written bins equal a CASE re-aggregation of the raw rows.
+     */
+    public function test_histogram_matches_raw_case_aggregation(): void
+    {
+        $records = [];
+        for ($i = 1; $i <= 30; $i++) {
+            $records[] = $this->sim->makeQuery([
+                'trace_id' => "hc-{$i}",
+                '_group' => 'g'.($i % 2),
+                'sql' => 'SELECT '.($i % 2),
+                'duration' => $i * $i * 50, // 50µs … 45ms
+                'connection' => 'pgsql',
+            ]);
+        }
+        $this->writer->write($records);
+
+        $case = \NightOwl\Support\QueryHistogram::caseSql('duration');
+        $rawSelect = [];
+        foreach ($case as $col => $expr) {
+            $rawSelect[] = "{$expr} as {$col}";
+        }
+        $rollSelect = array_map(static fn (string $c): string => "SUM({$c}) as {$c}", array_keys($case));
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(group_hash, '') AS gh, ".implode(', ', $rawSelect).
+            ' FROM nightowl_queries GROUP BY 1 ORDER BY 1'
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $rollup = self::$pdo->query(
+            'SELECT group_hash AS gh, '.implode(', ', $rollSelect).
+            ' FROM nightowl_query_rollups GROUP BY 1 ORDER BY 1'
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'Drain-written histogram must match a CASE re-aggregation of raw');
+    }
+
+    public function test_rollup_handles_null_duration(): void
+    {
+        // A query with no duration still counts toward call_count, but must not
+        // touch min/max (stay null) or any histogram bin.
+        $this->writer->write([
+            $this->sim->makeQuery(['trace_id' => 'nd-1', '_group' => 'nulldur', 'sql' => 'SELECT 1', 'duration' => null, 'connection' => 'pgsql']),
+        ]);
+
+        $row = self::$pdo->query(
+            "SELECT * FROM nightowl_query_rollups WHERE group_hash = 'nulldur'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(1, (int) $row['call_count']);
+        $this->assertSame(0, (int) $row['total_duration']);
+        $this->assertNull($row['min_duration']);
+        $this->assertNull($row['max_duration']);
+
+        $binTotal = 0;
+        for ($i = 0; $i < 39; $i++) {
+            $binTotal += (int) $row[sprintf('hist_%02d', $i)];
+        }
+        $this->assertSame(0, $binTotal, 'Null-duration rows must not increment any histogram bin');
+    }
+
+    /**
+     * Critical availability path: when nightowl_query_rollups is missing (new
+     * agent code before nightowl:migrate created it), the rollup write is skipped
+     * and the raw query still drains — the upsert shares the COPY's transaction,
+     * so a hard failure here would roll the raw write back and trap the drain in
+     * a retry loop.
+     */
+    public function test_drain_succeeds_when_rollup_table_missing(): void
+    {
+        self::$pdo->exec('DROP TABLE IF EXISTS nightowl_query_rollups');
+
+        try {
+            // Fresh writer so the table-exists probe re-runs and observes the drop.
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer->write([
+                $this->sim->makeQuery(['trace_id' => 'no-rollup-tbl', 'sql' => 'SELECT 1', 'duration' => 1000]),
+            ]);
+
+            $raw = self::$pdo->query("SELECT COUNT(*) FROM nightowl_queries WHERE trace_id = 'no-rollup-tbl'")->fetchColumn();
+            $this->assertSame(1, (int) $raw, 'Raw query must still drain when the rollup table is missing');
+        } finally {
+            // Recreate the table for the remaining tests in this class.
+            $this->rollupMigration32()->up();
+            $this->rollupMigration33()->up();
+        }
+    }
+
+    public function test_rollup_merges_across_independent_writers(): void
+    {
+        // Simulates two NIGHTOWL_DRAIN_WORKERS: independent RecordWriter
+        // instances (separate connections) hitting the same (hash, bucket). The
+        // additive ON CONFLICT upsert must merge both — counts/sums add,
+        // histogram bins add.
+        $make = fn (string $trace, int $duration) => $this->sim->makeQuery([
+            'trace_id' => $trace, '_group' => 'multiworker', 'sql' => 'SELECT 1',
+            'duration' => $duration, 'connection' => 'pgsql',
+        ]);
+
+        $writerA = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $writerB = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+
+        $writerA->write([$make('mw-a1', 1000), $make('mw-a2', 200000)]); // bins for 1000 and 200000
+        $writerB->write([$make('mw-b1', 1000)]);
+
+        $row = self::$pdo->query(
+            "SELECT * FROM nightowl_query_rollups WHERE group_hash = 'multiworker'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(3, (int) $row['call_count'], 'Independent writers must accumulate, not overwrite');
+        $this->assertSame(202000, (int) $row['total_duration']);
+        $this->assertSame(1000, (int) $row['min_duration']);
+        $this->assertSame(200000, (int) $row['max_duration']);
+
+        $binTotal = 0;
+        for ($i = 0; $i < 39; $i++) {
+            $binTotal += (int) $row[sprintf('hist_%02d', $i)];
+        }
+        $this->assertSame(3, $binTotal, 'Histogram bins must accumulate across independent writers');
+    }
+
+    /**
+     * Migration round-trip: down() drops the histogram columns (000033) and then
+     * the rollup table (000032); up() restores both. Tenant migrations aren't
+     * rolled back in production, but down() should still be correct.
+     */
+    public function test_rollup_migrations_down_and_up_round_trip(): void
+    {
+        $tableExists = fn (): bool => (bool) self::$pdo->query(
+            "SELECT to_regclass('public.nightowl_query_rollups') IS NOT NULL"
+        )->fetchColumn();
+        $histExists = fn (): bool => (bool) self::$pdo->query(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'nightowl_query_rollups' AND column_name = 'hist_38'"
+        )->fetchColumn();
+
+        $this->assertTrue($tableExists());
+        $this->assertTrue($histExists());
+
+        try {
+            $this->rollupMigration33()->down();
+            $this->assertFalse($histExists(), 'down() must drop the histogram columns');
+            $this->assertTrue($tableExists(), 'dropping hist columns must leave the table');
+
+            $this->rollupMigration32()->down();
+            $this->assertFalse($tableExists(), 'down() must drop the rollup table');
+        } finally {
+            $this->rollupMigration32()->up();
+            $this->rollupMigration33()->up();
+        }
+
+        $this->assertTrue($tableExists());
+        $this->assertTrue($histExists());
+    }
+
+    /**
+     * Load a fresh migration instance. `require` caches by path (so a second
+     * require returns 1, not the object), and MigrationRunner may already have
+     * required these files — so eval the file contents to get a new instance
+     * regardless of include state.
+     */
+    private function rollupMigration32(): object
+    {
+        return $this->loadMigration(__DIR__.'/../../database/migrations/2024_01_01_000032_create_nightowl_query_rollups_table.php');
+    }
+
+    private function rollupMigration33(): object
+    {
+        return $this->loadMigration(__DIR__.'/../../database/migrations/2024_01_01_000033_add_histogram_to_query_rollups.php');
+    }
+
+    private function loadMigration(string $path): object
+    {
+        return eval('?>'.file_get_contents($path));
+    }
+
+    // ─── Request rollups (generic engine) ──────────────────
+
+    public function test_request_write_populates_rollup(): void
+    {
+        $mk = fn (string $trace, int $status, int $dur): array => $this->sim->makeRequest([
+            'trace_id' => $trace, '_group' => 'reqgroup', 'status_code' => $status, 'duration' => $dur,
+            'route_methods' => ['GET'], 'route_path' => '/api/widgets',
+        ]);
+
+        $this->writer->write([
+            $mk('rr-1', 200, 1000), $mk('rr-2', 200, 2000),
+            $mk('rr-3', 404, 3000), $mk('rr-4', 500, 4000), $mk('rr-5', 503, 5000),
+        ]);
+
+        $row = self::$pdo->query(
+            "SELECT * FROM nightowl_request_rollups WHERE group_hash = 'reqgroup'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(5, (int) $row['call_count']);
+        $this->assertSame(2, (int) $row['success_count']);
+        $this->assertSame(1, (int) $row['client_error_count']);
+        $this->assertSame(2, (int) $row['server_error_count']);
+        $this->assertSame(15000, (int) $row['total_duration']);
+        $this->assertSame(1000, (int) $row['min_duration']);
+        $this->assertSame(5000, (int) $row['max_duration']);
+        $this->assertSame('/api/widgets', $row['route_path']);
+        $this->assertSame('["GET"]', $row['route_methods']);
+
+        $bins = 0;
+        for ($i = 0; $i < 39; $i++) {
+            $bins += (int) $row[sprintf('hist_%02d', $i)];
+        }
+        $this->assertSame(5, $bins);
+    }
+
+    public function test_request_rollup_drift_matches_raw(): void
+    {
+        $statuses = [200, 201, 404, 500, 503];
+        $records = [];
+        for ($i = 1; $i <= 20; $i++) {
+            $records[] = $this->sim->makeRequest([
+                'trace_id' => "rd-{$i}",
+                '_group' => 'g'.($i % 3),
+                'status_code' => $statuses[$i % 5],
+                'duration' => $i * 100,
+                'route_path' => '/p/'.($i % 3),
+                'route_methods' => ['GET'],
+            ]);
+        }
+        $this->writer->write($records);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(group_hash, '') AS gh, COUNT(*) AS c,
+                    SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) AS s,
+                    SUM(CASE WHEN status_code >= 400 AND status_code < 500 THEN 1 ELSE 0 END) AS ce,
+                    SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END) AS se,
+                    SUM(duration) AS sd, MIN(duration) AS mn, MAX(duration) AS mx
+             FROM nightowl_requests GROUP BY 1 ORDER BY 1"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $rollup = self::$pdo->query(
+            'SELECT group_hash AS gh, SUM(call_count) AS c, SUM(success_count) AS s,
+                    SUM(client_error_count) AS ce, SUM(server_error_count) AS se,
+                    SUM(total_duration) AS sd, MIN(min_duration) AS mn, MAX(max_duration) AS mx
+             FROM nightowl_request_rollups GROUP BY 1 ORDER BY 1'
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'Request rollup must match a raw re-aggregation');
+    }
+
+    // ─── Job rollups (generic engine; attempts vs queued) ──
+
+    public function test_job_write_populates_rollup(): void
+    {
+        // 3 attempts (processed/released/failed) + 1 queued (no attempt_id, no duration).
+        $this->writer->write([
+            $this->sim->makeJob(['trace_id' => 'jr-1', '_group' => 'jobgroup', 'name' => 'App\\Jobs\\X', 'queue' => 'default', 'attempt_id' => 'a1', 'status' => 'processed', 'duration' => 1000]),
+            $this->sim->makeJob(['trace_id' => 'jr-2', '_group' => 'jobgroup', 'name' => 'App\\Jobs\\X', 'queue' => 'default', 'attempt_id' => 'a2', 'status' => 'released', 'duration' => 3000]),
+            $this->sim->makeJob(['trace_id' => 'jr-3', '_group' => 'jobgroup', 'name' => 'App\\Jobs\\X', 'queue' => 'default', 'attempt_id' => 'a3', 'status' => 'failed', 'duration' => 5000]),
+            $this->sim->makeJob(['trace_id' => 'jr-4', '_group' => 'jobgroup', 'name' => 'App\\Jobs\\X', 'queue' => 'default', 'attempt_id' => null, 'status' => null, 'duration' => null]),
+        ]);
+
+        $row = self::$pdo->query("SELECT * FROM nightowl_job_rollups WHERE group_hash = 'jobgroup'")->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(4, (int) $row['call_count']);
+        $this->assertSame(3, (int) $row['attempts_count']);
+        $this->assertSame(1, (int) $row['queued_count']);
+        $this->assertSame(1, (int) $row['processed_count']);
+        $this->assertSame(1, (int) $row['released_count']);
+        $this->assertSame(1, (int) $row['failed_count']);
+        $this->assertSame(9000, (int) $row['total_duration']);
+        $this->assertSame(1000, (int) $row['min_duration']);
+        $this->assertSame(5000, (int) $row['max_duration']);
+        $this->assertSame('App\\Jobs\\X', $row['job_class']);
+        $this->assertSame('default', $row['queue']);
+
+        // Only the 3 attempts (non-null duration) enter the histogram.
+        $bins = 0;
+        for ($i = 0; $i < 39; $i++) {
+            $bins += (int) $row[sprintf('hist_%02d', $i)];
+        }
+        $this->assertSame(3, $bins);
+    }
+
+    public function test_job_rollup_drift_matches_raw(): void
+    {
+        $records = [];
+        for ($i = 1; $i <= 18; $i++) {
+            $records[] = $this->sim->makeJob([
+                'trace_id' => "jd-{$i}",
+                '_group' => 'g'.($i % 3),
+                'name' => 'App\\Jobs\\Y',
+                'attempt_id' => $i % 4 === 0 ? null : "att-{$i}",
+                'status' => ['processed', 'released', 'failed'][$i % 3],
+                'duration' => $i % 4 === 0 ? null : $i * 100,
+            ]);
+        }
+        $this->writer->write($records);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(group_hash, '') AS gh, COUNT(*) AS c,
+                    SUM(CASE WHEN attempt_id IS NOT NULL THEN 1 ELSE 0 END) AS att,
+                    SUM(CASE WHEN attempt_id IS NULL THEN 1 ELSE 0 END) AS q,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS f,
+                    COALESCE(SUM(duration), 0) AS sd, MIN(duration) AS mn, MAX(duration) AS mx
+             FROM nightowl_jobs GROUP BY 1 ORDER BY 1"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $rollup = self::$pdo->query(
+            'SELECT group_hash AS gh, SUM(call_count) AS c, SUM(attempts_count) AS att,
+                    SUM(queued_count) AS q, SUM(failed_count) AS f,
+                    SUM(total_duration) AS sd, MIN(min_duration) AS mn, MAX(max_duration) AS mx
+             FROM nightowl_job_rollups GROUP BY 1 ORDER BY 1'
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'Job rollup must match a raw re-aggregation');
+    }
+
+    // ─── Outgoing-request rollups ──────────────────────────
+
+    public function test_outgoing_write_populates_rollup(): void
+    {
+        $mk = fn (string $trace, int $status, int $dur): array => $this->sim->makeOutgoingRequest([
+            'trace_id' => $trace, '_group' => 'outgroup', 'status_code' => $status, 'duration' => $dur,
+            'url' => 'https://api.stripe.com/v1/charges',
+        ]);
+
+        $this->writer->write([
+            $mk('og-1', 200, 1000), $mk('og-2', 201, 2000),
+            $mk('og-3', 404, 3000), $mk('og-4', 503, 4000),
+        ]);
+
+        $row = self::$pdo->query("SELECT * FROM nightowl_outgoing_request_rollups WHERE group_hash = 'outgroup'")->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(4, (int) $row['call_count']);
+        $this->assertSame(2, (int) $row['success_count']);
+        $this->assertSame(1, (int) $row['client_error_count']);
+        $this->assertSame(1, (int) $row['server_error_count']);
+        $this->assertSame(10000, (int) $row['total_duration']);
+        // host = extractHost(url) = scheme://host
+        $this->assertSame('https://api.stripe.com', $row['host']);
+    }
+
+    public function test_outgoing_rollup_host_matches_extracthost(): void
+    {
+        $this->writer->write([
+            $this->sim->makeOutgoingRequest(['trace_id' => 'oh-1', '_group' => 'hostgroup', 'url' => 'https://example.com/a/b/c', 'status_code' => 200, 'duration' => 500]),
+        ]);
+
+        // The rollup's stored host must equal the SQL extractHost(url) the read
+        // path uses, so rollup and raw display the same host string.
+        $rollupHost = self::$pdo->query("SELECT host FROM nightowl_outgoing_request_rollups WHERE group_hash = 'hostgroup'")->fetchColumn();
+        $rawHost = self::$pdo->query(
+            "SELECT SPLIT_PART(url, '/', 1) || '//' || SPLIT_PART(url, '/', 3) FROM nightowl_outgoing_requests WHERE trace_id = 'oh-1'"
+        )->fetchColumn();
+
+        $this->assertSame($rawHost, $rollupHost);
+        $this->assertSame('https://example.com', $rollupHost);
+    }
+
+    // ─── Cache rollups (key/store group, no histogram) ─────
+
+    public function test_cache_write_populates_rollup(): void
+    {
+        $mk = fn (string $trace, string $type, int $dur): array => $this->sim->makeCacheEvent([
+            'trace_id' => $trace, 'type' => $type, 'key' => 'users:1', 'store' => 'redis', 'duration' => $dur,
+        ]);
+
+        $this->writer->write([
+            $mk('cr-1', 'hit', 100), $mk('cr-2', 'hit', 200), $mk('cr-3', 'miss', 300),
+            $mk('cr-4', 'set', 400), $mk('cr-5', 'forget', 500), $mk('cr-6', 'fail', 0),
+            $mk('cr-7', 'write_fail', 0), $mk('cr-8', 'delete_fail', 0),
+        ]);
+
+        $row = self::$pdo->query(
+            "SELECT * FROM nightowl_cache_rollups WHERE \"key\" = 'users:1' AND store = 'redis'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(8, (int) $row['call_count']);
+        $this->assertSame(2, (int) $row['hits']);
+        $this->assertSame(1, (int) $row['misses']);
+        $this->assertSame(1, (int) $row['writes']);
+        $this->assertSame(1, (int) $row['deletes']);
+        $this->assertSame(1, (int) $row['fails']);
+        $this->assertSame(1, (int) $row['delete_failures']);
+        // write_failures includes 'write_fail' AND 'fail'.
+        $this->assertSame(2, (int) $row['write_failures']);
+        $this->assertSame(1500, (int) $row['total_duration']);
+    }
+
+    public function test_cache_rollup_drift_matches_raw(): void
+    {
+        $types = ['hit', 'miss', 'set', 'forget', 'fail', 'write_fail'];
+        $records = [];
+        for ($i = 1; $i <= 24; $i++) {
+            $records[] = $this->sim->makeCacheEvent([
+                'trace_id' => "cd-{$i}",
+                'type' => $types[$i % 6],
+                'key' => 'k:'.($i % 3),
+                'store' => $i % 2 === 0 ? 'redis' : 'file',
+                'duration' => $i * 10,
+            ]);
+        }
+        $this->writer->write($records);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(\"key\", '') AS k, COALESCE(store, '') AS s, COUNT(*) AS c,
+                    SUM(CASE WHEN event_type = 'hit' THEN 1 ELSE 0 END) AS h,
+                    SUM(CASE WHEN event_type IN ('write_fail', 'set_fail', 'put_fail', 'fail') THEN 1 ELSE 0 END) AS wf,
+                    COALESCE(SUM(duration), 0) AS sd
+             FROM nightowl_cache_events GROUP BY 1, 2 ORDER BY 1, 2"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $rollup = self::$pdo->query(
+            'SELECT "key" AS k, store AS s, SUM(call_count) AS c, SUM(hits) AS h,
+                    SUM(write_failures) AS wf, SUM(total_duration) AS sd
+             FROM nightowl_cache_rollups GROUP BY 1, 2 ORDER BY 1, 2'
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'Cache rollup must match a raw re-aggregation');
+    }
+
+    public function test_query_write_sets_created_at(): void
+    {
+        $this->writer->write([
+            $this->sim->makeQuery(['trace_id' => 'created-at-1', 'sql' => 'SELECT now()']),
+        ]);
+
+        $createdAt = self::$pdo->query(
+            "SELECT created_at FROM nightowl_queries WHERE trace_id = 'created-at-1'"
+        )->fetchColumn();
+
+        $this->assertNotNull($createdAt);
+        $this->assertNotFalse($createdAt);
+    }
+
     // ─── Mixed payload tests ───────────────────────────────
 
     public function test_write_mixed_payload(): void
@@ -567,7 +1120,9 @@ class RecordWriterTest extends TestCase
             'nightowl_commands', 'nightowl_jobs', 'nightowl_cache_events',
             'nightowl_mail', 'nightowl_notifications', 'nightowl_outgoing_requests',
             'nightowl_scheduled_tasks', 'nightowl_logs', 'nightowl_users',
-            'nightowl_settings', 'nightowl_alert_channels',
+            'nightowl_settings', 'nightowl_alert_channels', 'nightowl_query_rollups',
+            'nightowl_request_rollups', 'nightowl_job_rollups', 'nightowl_outgoing_request_rollups',
+            'nightowl_cache_rollups',
         ];
 
         foreach ($tables as $table) {

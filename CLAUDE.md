@@ -84,11 +84,14 @@ src/Agent/
   ConnectionHandler.php  — Sync payload handler
 src/Support/
   MultiIngest.php        — Nightwatch coexistence adapter (fan-out wrapper)
+  QueryHistogram.php     — Frozen √2-spaced duration bin edges + bin assignment for rollups; MUST stay byte-identical to nightowl-api's App\Support\QueryHistogram (checksum-guarded both sides)
+  RollupSpec.php / RollupSpecs.php — Declarative per-type rollup config (group cols, counters w/ PHP predicate + SQL condition, representatives, duration/histogram flags) driving RecordWriter::writeRollup + BackfillRollupsCommand. One spec each for queries/requests/jobs/outgoing/cache.
 src/Commands/
   AgentCommand.php        — nightowl:agent [--driver=async|sync]; warns at startup if the nightowl-DB migration history is behind (MigrateCommand::isBehind), skipped under run_migrations ride-along
   MigrateCommand.php      — nightowl:migrate: migrate --database=nightowl (history in nightowl DB) + baseline adoption; pure helpers migrationsToBaseline/pendingMigrations/isBehind
   InstallCommand.php      — nightowl:install
-  PruneCommand.php        — nightowl:prune (retention cleanup)
+  PruneCommand.php        — nightowl:prune (retention cleanup; raw + separate longer rollup retention)
+  BackfillRollupsCommand.php — nightowl:backfill-rollups (replace-per-bucket backfill of nightowl_query_rollups)
   ClearCommand.php        — nightowl:clear (truncate all tables)
 ```
 
@@ -99,14 +102,16 @@ src/Commands/
 | `nightowl:agent [--driver=async\|sync]` | Start agent (TCP + UDP + Health API) |
 | `nightowl:install` | Publish config, create/update schema (via `nightowl:migrate`), fork-safety probe |
 | `nightowl:migrate` | Idempotent schema sync — `migrate --database=nightowl` (history in the nightowl DB) + baseline adoption of an already-present schema. Run on each deploy. |
-| `nightowl:prune` | Delete telemetry older than retention (14d default) |
+| `nightowl:prune` | Delete telemetry older than retention (14d default); query rollups pruned separately (90d default) |
+| `nightowl:backfill-rollups` | Backfill every `nightowl_*_rollups` table from raw telemetry (chunked, throttled, idempotent; skips the trailing 10min so it never races live drain; `--type=` restricts to one table) |
 | `nightowl:clear` | Truncate all NightOwl tables |
 
 ## Database
 
-25 migrations, 16 tables (12 telemetry + 3 issues + alert_channels/settings):
+37 migrations, 22 tables (12 telemetry + 3 issues + alert_channels/settings + 5 rollups):
 
 - **Telemetry**: requests, queries, exceptions, commands, jobs, cache_events, mail, notifications, outgoing_requests, scheduled_tasks, logs, users
+- **Rollups**: query_rollups, request_rollups, job_rollups, outgoing_request_rollups, cache_rollups — pre-aggregated per-minute summaries maintained at drain time. Driven by a declarative `RollupSpec` per type (`src/Support/RollupSpecs.php`) consumed by the generic `RecordWriter::writeRollup`, `nightowl:backfill-rollups`, and `PruneCommand`. Duration-bearing types carry √2-spaced `hist_NN` histogram bins for approximate windowed percentiles (`src/Support/QueryHistogram.php`); cache groups by `(key, store)` with no histogram. Queries keeps a bespoke drain path (`writeQueryRollups`) but shares the generic backfill/prune. See `specs/query_rollups.md`.
 - **Issues**: issues (fingerprint upsert, subtype: exception/performance/health, threshold_metrics, deploy), issue_activity (with `actor_type`/`actor_meta` for MCP), issue_comments (with actor columns)
 - **Alerts**: alert_channels, settings
 
