@@ -5,6 +5,31 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.2] - 2026-06-07
+
+### Fixed
+
+- **`created_at` is now always stamped in UTC, regardless of the agent host's
+  timezone.** 1.2.0 moved `created_at`/rollup `bucket_start` authorship from the
+  database default to the agent's clock, but formatted them with `date()` —
+  which uses the host's local timezone. On a non-UTC host (e.g. `America/Bogota`,
+  UTC−5) every telemetry row landed hours behind the API's UTC `now()`, so the
+  dashboard's short time-range filters (1H/6H) showed **no data** even though
+  rows were drained correctly. All `created_at`, `bucket_start`,
+  `first_seen`/`last_seen`, log `created_at`, and `updated_at` stamps now use
+  `gmdate()` (UTC), matching the API's read path and the pre-1.2.0 database
+  default. **Rows written by 1.2.0/1.2.1 on a non-UTC host are skewed by the
+  host's UTC offset** — see *Upgrading* below.
+
+### Upgrading to 1.2.2
+
+- **Restart the agent** after upgrading so the new code authors timestamps.
+- **Existing skewed rows** (anything drained by 1.2.0/1.2.1 on a non-UTC host)
+  keep their wrong `created_at`. Options: let raw telemetry age out via
+  `nightowl:prune` (default 14d), or, on a throwaway/fresh dataset, run
+  `nightowl:clear` and let live drain repopulate. There is no automatic
+  correction migration.
+
 ## [1.2.1] - 2026-06-07
 
 ### Fixed

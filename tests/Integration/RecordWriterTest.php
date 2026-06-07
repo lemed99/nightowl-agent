@@ -860,6 +860,52 @@ class RecordWriterTest extends TestCase
         $this->assertNotFalse($createdAt);
     }
 
+    /**
+     * Regression: created_at must be stamped in UTC regardless of the agent
+     * host's default timezone. Before this fix the writer used date() (local
+     * time), so on a non-UTC host (e.g. America/Bogota, UTC-5) created_at was
+     * written hours behind the API's UTC now() and the dashboard's short
+     * time-range filters showed no data. See gmdate() in RecordWriter.
+     */
+    public function test_created_at_is_utc_under_non_utc_host_timezone(): void
+    {
+        $originalTz = date_default_timezone_get();
+        date_default_timezone_set('America/Bogota'); // UTC-5
+
+        try {
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer->write([
+                $this->sim->makeJob(['trace_id' => 'utc-created-at-1']),
+            ]);
+
+            $createdAt = self::$pdo->query(
+                "SELECT created_at FROM nightowl_jobs WHERE trace_id = 'utc-created-at-1'"
+            )->fetchColumn();
+
+            $this->assertNotFalse($createdAt);
+
+            // Interpret the stored string as UTC and compare to UTC now.
+            $stored = \DateTimeImmutable::createFromFormat(
+                'Y-m-d H:i:s',
+                substr((string) $createdAt, 0, 19),
+                new \DateTimeZone('UTC')
+            );
+            $this->assertNotFalse($stored, "Unparseable created_at: {$createdAt}");
+
+            $skew = abs($stored->getTimestamp() - time());
+
+            // With the local-time bug this skew would be ~5h (18000s); UTC
+            // stamping keeps it within drain/test latency.
+            $this->assertLessThan(
+                300,
+                $skew,
+                "created_at is {$skew}s from UTC now — not stamped in UTC (host tz leaked in)."
+            );
+        } finally {
+            date_default_timezone_set($originalTz);
+        }
+    }
+
     // ─── Mixed payload tests ───────────────────────────────
 
     public function test_write_mixed_payload(): void

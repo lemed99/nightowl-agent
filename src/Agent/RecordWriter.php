@@ -371,7 +371,7 @@ final class RecordWriter
         // One clock per batch: written to created_at AND used for the rollup
         // bucket so live drain and the read path bucket on the same value.
         $nowTs = time();
-        $now = date('Y-m-d H:i:s', $nowTs);
+        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -450,7 +450,7 @@ final class RecordWriter
         // left to the column's useCurrent() (DB insert time); setting it
         // explicitly makes the agent clock authoritative — fine when NTP-synced.
         $nowTs = time();
-        $now = date('Y-m-d H:i:s', $nowTs);
+        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -529,7 +529,7 @@ final class RecordWriter
      */
     private function writeRollup(array $records, RollupSpec $spec, int $nowTs): void
     {
-        $bucketStart = date('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
+        $bucketStart = gmdate('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
         $histColumns = $spec->hasHistogram ? QueryHistogram::columns() : [];
         $counterCols = $spec->counterColumns();
         $repCols = $spec->representativeColumns();
@@ -688,7 +688,7 @@ final class RecordWriter
     private function writeQueryRollups(array $records, int $nowTs): void
     {
         // Bucket on the SAME clock written to created_at, truncated to 60s.
-        $bucketStart = date('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
+        $bucketStart = gmdate('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
 
         $histColumns = QueryHistogram::columns();
 
@@ -908,13 +908,13 @@ final class RecordWriter
                 updated_at = EXCLUDED.updated_at
         ');
 
-        $now = date('Y-m-d H:i:s');
+        $now = gmdate('Y-m-d H:i:s');
 
         foreach ($issueGroups as $key => $group) {
             $timestamps = $group['timestamps'];
             sort($timestamps);
-            $firstSeen = ! empty($timestamps) ? date('Y-m-d H:i:s', (int) $timestamps[0]) : $now;
-            $lastSeen = ! empty($timestamps) ? date('Y-m-d H:i:s', (int) end($timestamps)) : $now;
+            $firstSeen = ! empty($timestamps) ? gmdate('Y-m-d H:i:s', (int) $timestamps[0]) : $now;
+            $lastSeen = ! empty($timestamps) ? gmdate('Y-m-d H:i:s', (int) end($timestamps)) : $now;
             $userCount = count($group['users']);
 
             $upsertStmt->execute([
@@ -972,7 +972,7 @@ final class RecordWriter
     private function writeJobs(array $records): void
     {
         $nowTs = time();
-        $now = date('Y-m-d H:i:s', $nowTs);
+        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1014,7 +1014,7 @@ final class RecordWriter
     private function writeCacheEvents(array $records): void
     {
         $nowTs = time();
-        $now = date('Y-m-d H:i:s', $nowTs);
+        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1095,7 +1095,7 @@ final class RecordWriter
     private function writeOutgoingRequests(array $records): void
     {
         $nowTs = time();
-        $now = date('Y-m-d H:i:s', $nowTs);
+        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1143,7 +1143,7 @@ final class RecordWriter
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
                 is_string($r['extra'] ?? null) ? $r['extra'] : json_encode($r['extra'] ?? null),
                 $r['channel'] ?? null,
-                isset($r['timestamp']) ? date('Y-m-d H:i:s', (int) $r['timestamp']) : date('Y-m-d H:i:s'),
+                isset($r['timestamp']) ? gmdate('Y-m-d H:i:s', (int) $r['timestamp']) : gmdate('Y-m-d H:i:s'),
             ];
         }
 
@@ -1175,7 +1175,7 @@ final class RecordWriter
                 'name' => $r['name'] ?? null,
                 'email' => $r['username'] ?? null,
                 'timestamp' => $r['timestamp'] ?? null,
-                'updated_at' => date('Y-m-d H:i:s'),
+                'updated_at' => gmdate('Y-m-d H:i:s'),
             ]);
         }
     }
@@ -1473,13 +1473,13 @@ final class RecordWriter
                 updated_at = EXCLUDED.updated_at
         ');
 
-        $now = date('Y-m-d H:i:s');
+        $now = gmdate('Y-m-d H:i:s');
 
         foreach ($issueGroups as $key => $group) {
             $timestamps = $group['timestamps'];
             sort($timestamps);
-            $firstSeen = ! empty($timestamps) ? date('Y-m-d H:i:s', (int) $timestamps[0]) : $now;
-            $lastSeen = ! empty($timestamps) ? date('Y-m-d H:i:s', (int) end($timestamps)) : $now;
+            $firstSeen = ! empty($timestamps) ? gmdate('Y-m-d H:i:s', (int) $timestamps[0]) : $now;
+            $lastSeen = ! empty($timestamps) ? gmdate('Y-m-d H:i:s', (int) end($timestamps)) : $now;
             $userCount = count($group['users']);
 
             $thresholdUs = $group['threshold_us'] ?? null;
