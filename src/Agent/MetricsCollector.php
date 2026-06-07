@@ -35,6 +35,14 @@ final class MetricsCollector
 
     private const DRAIN_METRICS_STALE_SECONDS = 15;
 
+    // Defensive emit ceilings — keep these two gauges within the API's decimal
+    // columns (pg_latency_ms decimal(12,2), buffer_utilization_pct decimal(8,2))
+    // so a stalled PG or a misconfigured max_pending_rows can never overflow the
+    // column and 422 the whole report. Picked as obviously-absurd ceilings.
+    private const MAX_PG_LATENCY_MS = 86_400_000.0; // 24h
+
+    private const MAX_BUFFER_UTILIZATION_PCT = 100_000.0; // 1000x capacity
+
     private const MEMORY_HIGH_PCT = 0.7;
 
     // System metrics thresholds
@@ -640,7 +648,7 @@ final class MetricsCollector
                 'total' => $this->drainTotal,
                 'rate_1m' => round($this->ringAvg($this->drainRing), 2),
                 'batches_failed' => $this->drainBatchesFailed,
-                'pg_latency_ms' => round($this->drainPgLatencyMs, 2),
+                'pg_latency_ms' => round(min($this->drainPgLatencyMs, self::MAX_PG_LATENCY_MS), 2),
                 'metrics_stale' => $this->drainMetricsUpdatedAt > 0
                     && (microtime(true) - $this->drainMetricsUpdatedAt) > self::DRAIN_METRICS_STALE_SECONDS,
             ],
@@ -648,7 +656,7 @@ final class MetricsCollector
                 'pending_rows' => $pendingRows,
                 'max_pending_rows' => $this->maxPendingRows,
                 'utilization_pct' => $this->maxPendingRows > 0
-                    ? round(($pendingRows / $this->maxPendingRows) * 100, 2)
+                    ? round(min(($pendingRows / $this->maxPendingRows) * 100, self::MAX_BUFFER_UTILIZATION_PCT), 2)
                     : 0,
                 'wal_size_bytes' => $walSize,
                 'back_pressure_active' => $backPressure,

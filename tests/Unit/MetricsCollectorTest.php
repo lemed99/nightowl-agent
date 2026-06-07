@@ -479,4 +479,34 @@ class MetricsCollectorTest extends TestCase
             @unlink("{$basePath}.drain-metrics-1.json");
         }
     }
+
+    // --- Defensive metric clamps (keep gauges within the API's decimal columns) ---
+
+    public function testBufferUtilizationIsClampedWhenMaxPendingRowsIsTiny(): void
+    {
+        // A misconfigured max_pending_rows of 1 makes raw utilization explode
+        // (50000 / 1 * 100 = 5,000,000%). The emitted value must be clamped so it
+        // can't overflow the API's decimal(8,2) buffer_utilization_pct column.
+        $collector = new MetricsCollector(
+            maxPendingRows: 1,
+            maxBufferMemory: 256 * 1024 * 1024,
+        );
+
+        $status = $collector->getFullStatus(microtime(true) - 60, false, 50000, 0, 0);
+
+        $this->assertSame(100_000.0, $status['buffer']['utilization_pct']);
+    }
+
+    public function testPgLatencyIsClampedToCeiling(): void
+    {
+        // A stalled PostgreSQL could push EWMA latency arbitrarily high. The
+        // emitted value must be clamped so it can't overflow the API's
+        // decimal(12,2) pg_latency_ms column.
+        $ref = new \ReflectionProperty(MetricsCollector::class, 'drainPgLatencyMs');
+        $ref->setValue($this->collector, 9_999_999_999.0);
+
+        $status = $this->collector->getFullStatus(microtime(true) - 60, false, 0, 0, 0);
+
+        $this->assertSame(86_400_000.0, $status['drain']['pg_latency_ms']);
+    }
 }

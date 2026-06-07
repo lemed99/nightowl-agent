@@ -2,6 +2,7 @@
 
 namespace NightOwl\Agent;
 
+use NightOwl\Support\AgentInstanceId;
 use React\Datagram\Socket as DatagramSocket;
 use React\EventLoop\Loop;
 use React\EventLoop\LoopInterface;
@@ -199,7 +200,7 @@ final class AsyncServer
 
         // Health alert notifier — dispatches to Slack/Discord/Webhook/Email
         // when a new diagnosis crosses the debounce threshold.
-        $instanceId = gethostname() . ':' . getmypid();
+        $instanceId = AgentInstanceId::current();
         $this->healthAlertNotifier = HealthAlertNotifier::fromConfig($instanceId);
 
         // 10-second diagnosis — run health checks and update score

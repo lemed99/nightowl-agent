@@ -2,6 +2,7 @@
 
 namespace NightOwl\Agent;
 
+use NightOwl\Support\AgentInstanceId;
 use React\EventLoop\LoopInterface;
 use React\Socket\ConnectionInterface;
 use React\Socket\Connector;
@@ -39,7 +40,7 @@ final class HealthReporter
     {
         $connector = new Connector();
         $url = rtrim($this->apiUrl, '/') . '/agent/health';
-        $instanceId = gethostname() . ':' . getmypid();
+        $instanceId = AgentInstanceId::current();
 
         $scheduleNext = function () use (&$scheduleNext, $connector, $url, $instanceId, $agent, $loop) {
             $status = $agent->getStatus();

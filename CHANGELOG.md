@@ -5,6 +5,22 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.1] - 2026-06-07
+
+### Fixed
+
+- **Health reports are no longer dropped on long instance IDs or extreme
+  metrics.** The agent identifies each instance as `hostname:pid`; on a
+  Kubernetes pod or a cloud FQDN host that string could exceed the API's column
+  limit and `422` the whole health report. It's now built through a single
+  helper (`Support\AgentInstanceId`) that caps it to 191 chars — truncating the
+  hostname while always preserving the `:pid` suffix. Two drain gauges,
+  `pg_latency_ms` and `buffer_utilization_pct`, are also clamped to sane
+  ceilings before emit, so a stalled PostgreSQL or a misconfigured
+  `NIGHTOWL_MAX_PENDING_ROWS` can't overflow the API's decimal columns and lose
+  the report. This is the agent half of a belt-and-suspenders fix paired with
+  the API-side column widening.
+
 ## [1.2.0] - 2026-06-06
 
 ### Added
