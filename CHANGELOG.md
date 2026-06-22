@@ -5,6 +5,64 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.3] - 2026-06-22
+
+### Added
+
+- **App-vitals in the health report (fleet overview).** The drain worker now
+  tallies per-app request, 5xx, and exception counts off the records it already
+  parses (zero extra decode on the hot path — counting happens in the forked
+  drain child, never the ingest loop) and ships them as a cumulative
+  `app_vitals` block on the existing `POST /agent/health` body:
+  `{ "requests_total", "requests_5xx", "exceptions_total" }`. Counts are
+  cumulative since agent start (like `rows_drained`); the platform computes
+  window deltas. Multi-worker counts are summed across drain workers. The block
+  also carries `open_issues` — a current gauge (not cumulative) of the tenant's
+  open issues, refreshed at most once a minute by a cheap indexed `COUNT` off
+  the ingest path, taken as a MAX across workers (they share one tenant DB).
+  The block is additive/back-compat — older agents simply omit it. Powers the
+  Agency fleet-overview / apps-page health. No request content leaves the
+  customer's PostgreSQL — only counts.
+
+- **`nightowl_reports` tenant table (Agency white-label reports).** New
+  migration creating `nightowl_reports` (`period_start`, `period_end`, `payload`
+  JSON snapshot, `created_at`, indexed on `period_start`) to store frozen
+  aggregate report snapshots. Schema only — the agent does not write this table;
+  report generation lives in the API. Created on the next `nightowl:migrate`.
+
+### Changed
+
+- **More accurate query percentile estimates (shared histogram).**
+  `QueryHistogram::estimatePercentile()` now interpolates geometrically
+  (log-linear) within the √2-spaced bins instead of linearly, and clamps the
+  crossing bin to the rollup's observed min/max — so a high percentile on
+  bounded or spiky data no longer overshoots into the empty top of a wide bin
+  (e.g. p95 returning 211 ms when the largest observed query was 190 ms), and
+  the previously-unbounded overflow bin gets a real upper edge from the observed
+  max. The frozen bin edges are unchanged (agent and API stay byte-identical);
+  percentiles are computed API-side at read time, so this mirrors the API's fix.
+
+### Fixed
+
+- **`created_at` is now stamped in UTC for every telemetry table, regardless of
+  the tenant PostgreSQL server's timezone.** The 1.2.2 UTC fix only covered the
+  writers that already authored `created_at` from the agent's clock
+  (requests/queries/jobs/cache/outgoing/logs). The **exceptions, commands, mail,
+  notifications, scheduled_tasks** writers and the **users** upsert never set
+  `created_at` at all — they fell back to the column's `useCurrent()` default
+  (`CURRENT_TIMESTAMP`), which resolves in the **database session timezone**. On
+  a non-UTC tenant DB (e.g. `Asia/Dhaka`, UTC+6) those rows were stored as local
+  wall-clock; the dashboard appended `Z` and rendered them hours in the future
+  ("LAST SEEN" showing e.g. `-17923s ago`), and short time-range filters dropped
+  fresh data. All these writers now stamp `created_at` explicitly via `gmdate()`
+  (UTC), matching the rest and the API's read path; the users upsert stamps it on
+  insert only (left untouched on conflict). A regression test pins `created_at`
+  to UTC across all twelve write paths under a non-UTC session timezone.
+  **Rows written by earlier versions on a non-UTC server are skewed by the
+  server's UTC offset** — let them age out via `nightowl:prune`, or
+  `nightowl:clear` on a throwaway dataset. There is no automatic correction
+  migration.
+
 ## [1.2.2] - 2026-06-07
 
 ### Fixed

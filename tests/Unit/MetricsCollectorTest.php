@@ -345,6 +345,52 @@ class MetricsCollectorTest extends TestCase
         }
     }
 
+    public function testReadDrainMetricsSumsAppVitalsAcrossWorkers(): void
+    {
+        $tmpDir = sys_get_temp_dir();
+        $basePath = $tmpDir . '/nightowl_metrics_vitals_' . uniqid();
+
+        $workers = [
+            ['rows_drained' => 5000, 'app_requests_total' => 1000, 'app_requests_5xx' => 12, 'app_exceptions_total' => 4, 'app_open_issues' => 7, 'updated_at' => microtime(true)],
+            ['rows_drained' => 4000, 'app_requests_total' => 800, 'app_requests_5xx' => 3, 'app_exceptions_total' => 1, 'app_open_issues' => 0, 'updated_at' => microtime(true)],
+            ['rows_drained' => 6000, 'app_requests_total' => 1200, 'app_requests_5xx' => 5, 'app_exceptions_total' => 0, 'app_open_issues' => 7, 'updated_at' => microtime(true)],
+        ];
+
+        foreach ($workers as $i => $data) {
+            file_put_contents("{$basePath}.drain-metrics-{$i}.json", json_encode($data));
+        }
+
+        try {
+            $this->collector->readDrainMetrics($basePath, 3);
+
+            $status = $this->collector->getFullStatus(microtime(true) - 60, false, 0, 0, 0);
+
+            // Cumulative vitals are summed across workers.
+            $this->assertSame(3000, $status['app_vitals']['requests_total']); // 1000 + 800 + 1200
+            $this->assertSame(20, $status['app_vitals']['requests_5xx']);      // 12 + 3 + 5
+            $this->assertSame(5, $status['app_vitals']['exceptions_total']);   // 4 + 1 + 0
+            // Open issues is a per-tenant gauge — MAX across workers, not summed
+            // (a worker that hasn't counted yet reports 0).
+            $this->assertSame(7, $status['app_vitals']['open_issues']);
+        } finally {
+            for ($i = 0; $i < 3; $i++) {
+                @unlink("{$basePath}.drain-metrics-{$i}.json");
+            }
+        }
+    }
+
+    public function testAppVitalsDefaultToZeroWhenAbsent(): void
+    {
+        // Older drain workers omit the app_vitals keys — the block must still
+        // render as zeros (back-compat), never crash.
+        $status = $this->collector->getFullStatus(microtime(true) - 60, false, 0, 0, 0);
+
+        $this->assertSame(0, $status['app_vitals']['requests_total']);
+        $this->assertSame(0, $status['app_vitals']['requests_5xx']);
+        $this->assertSame(0, $status['app_vitals']['exceptions_total']);
+        $this->assertSame(0, $status['app_vitals']['open_issues']);
+    }
+
     public function testReadDrainMetricsSingleWorkerFallback(): void
     {
         $tmpDir = sys_get_temp_dir();

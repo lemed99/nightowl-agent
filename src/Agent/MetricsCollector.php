@@ -76,6 +76,19 @@ final class MetricsCollector
 
     private float $drainMetricsUpdatedAt = 0.0;
 
+    // App-vitals (fleet overview): cumulative per-app counts summed across
+    // drain workers. Shipped to the platform, which computes window deltas.
+    private int $appRequestsTotal = 0;
+
+    private int $app5xxTotal = 0;
+
+    private int $appExceptionsTotal = 0;
+
+    // Open-issues gauge (current, not cumulative). All drain workers of an
+    // instance query the same tenant DB, so this is a MAX across workers, not
+    // a sum — see readDrainMetrics().
+    private int $appOpenIssues = 0;
+
     // Previous drain totals for rate calculation
     private int $prevDrainTotal = 0;
 
@@ -227,6 +240,10 @@ final class MetricsCollector
         $latencyCount = 0;
         $oldestUpdate = PHP_FLOAT_MAX;
         $anyFound = false;
+        $appRequests = 0;
+        $app5xx = 0;
+        $appExceptions = 0;
+        $appOpenIssues = 0;
 
         for ($w = 0; $w < $workerCount; $w++) {
             $metricsPath = $workerCount > 1
@@ -254,6 +271,13 @@ final class MetricsCollector
             $anyFound = true;
             $totalRows += (int) ($data['rows_drained'] ?? 0);
             $totalFailed += (int) ($data['batches_failed'] ?? 0);
+            $appRequests += (int) ($data['app_requests_total'] ?? 0);
+            $app5xx += (int) ($data['app_requests_5xx'] ?? 0);
+            $appExceptions += (int) ($data['app_exceptions_total'] ?? 0);
+            // Gauge, not cumulative: every worker queries the same tenant DB and
+            // reports the same count, so take MAX (a worker that hasn't counted
+            // yet reports 0) rather than summing across workers.
+            $appOpenIssues = max($appOpenIssues, (int) ($data['app_open_issues'] ?? 0));
 
             $lat = (float) ($data['pg_latency_ms'] ?? 0.0);
             if ($lat > 0) {
@@ -290,6 +314,10 @@ final class MetricsCollector
         $this->drainBatchesFailed = $totalFailed;
         $this->drainPgLatencyMs = $latencyCount > 0 ? $latencySum / $latencyCount : 0.0;
         $this->drainMetricsUpdatedAt = $oldestUpdate < PHP_FLOAT_MAX ? $oldestUpdate : 0.0;
+        $this->appRequestsTotal = $appRequests;
+        $this->app5xxTotal = $app5xx;
+        $this->appExceptionsTotal = $appExceptions;
+        $this->appOpenIssues = $appOpenIssues;
     }
 
     /**
@@ -674,6 +702,12 @@ final class MetricsCollector
                 'memory_total_bytes' => $this->sysMemoryTotalBytes,
                 'memory_available_bytes' => $this->sysMemoryAvailableBytes,
                 'load_avg' => $this->loadAvg,
+            ],
+            'app_vitals' => [
+                'requests_total' => $this->appRequestsTotal,
+                'requests_5xx' => $this->app5xxTotal,
+                'exceptions_total' => $this->appExceptionsTotal,
+                'open_issues' => $this->appOpenIssues,
             ],
             'diagnoses' => $this->getEnrichedDiagnoses(),
             'resolved_diagnoses' => $this->getResolvedDiagnoses(),

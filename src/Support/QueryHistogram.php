@@ -81,12 +81,22 @@ final class QueryHistogram
     /**
      * Estimate a percentile (p in 0..1) in microseconds from per-bin counts,
      * by walking the cumulative counts to the rank crossing and interpolating
-     * linearly within the crossing bin. The overflow bin has no upper bound, so
-     * a percentile landing there returns its lower edge.
+     * within the crossing bin.
+     *
+     * When the observed $min/$max are supplied (the rollup stores them per row),
+     * the crossing bin's interpolation span is clamped to them. A √2 bin can be
+     * ~76 ms wide at the high end, and a high percentile on bounded or spiky data
+     * lands in a bin whose upper part is empty — plain linear interpolation then
+     * overshoots into that empty space (e.g. returns 211 ms when the true p95 and
+     * the largest observed row are both 190 ms). Clamping to $max removes that
+     * overshoot (a percentile can never exceed the max) and gives the otherwise
+     * unbounded overflow bin a real upper edge. It is a no-op for long-tail data,
+     * where $min/$max fall outside the crossing bin. Omit them for the raw
+     * bin-edge behaviour.
      *
      * @param  array<int, int|float|string|null>  $binCounts  Indexed 0..binCount-1
      */
-    public static function estimatePercentile(array $binCounts, float $p): float
+    public static function estimatePercentile(array $binCounts, float $p, ?int $min = null, ?int $max = null): float
     {
         $total = 0;
         $n = self::binCount();
@@ -111,16 +121,29 @@ final class QueryHistogram
 
             if ($cumulative + $count >= $rank) {
                 $lo = $i === 0 ? 0 : self::EDGES[$i - 1];
-
-                // Overflow bin — unbounded above, so report its lower edge.
-                if ($i >= $n - 1) {
-                    return (float) $lo;
-                }
-
-                $hi = self::EDGES[$i];
+                // Overflow bin (i === n-1) is unbounded above → no edge.
+                $hi = $i >= $n - 1 ? null : self::EDGES[$i];
                 $within = ($rank - $cumulative) / $count; // (0, 1]
 
-                return $lo + ($hi - $lo) * $within;
+                // Constrain the span to the observed range when known.
+                if ($max !== null && ($hi === null || $max < $hi)) {
+                    $hi = $max;
+                }
+                if ($min !== null && $min > $lo) {
+                    $lo = $min;
+                }
+
+                if ($hi === null) {
+                    return (float) $lo; // overflow, no observed max to bound it
+                }
+                $hi = max($hi, $lo);
+
+                // Interpolate geometrically (log-linear). The bins are √2 log-spaced,
+                // so a constant-density-in-log-space model fits real (log-normal-ish)
+                // duration data far better than linear interpolation — roughly halving
+                // the within-bin error on long-tailed distributions. The underflow bin
+                // starts at 0, where a geometric step is undefined, so it stays linear.
+                return $lo > 0 ? $lo * ($hi / $lo) ** $within : $hi * $within;
             }
 
             $cumulative += $count;

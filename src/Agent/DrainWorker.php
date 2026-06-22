@@ -21,6 +21,21 @@ final class DrainWorker
 
     private int $rowsDrained = 0;
 
+    // App-vitals: cumulative per-app request/5xx/exception counts since worker
+    // start, shipped to the platform for the fleet overview. Each drain worker
+    // tracks its own cumulative; the parent sums across workers. See impl plan §4.2.
+    private int $cumRequests = 0;
+
+    private int $cum5xx = 0;
+
+    private int $cumExceptions = 0;
+
+    // Open-issues gauge (current, not cumulative) for the fleet overview's
+    // per-app "issues" count. Refreshed at most once per minute — see run().
+    private int $openIssues = 0;
+
+    private const ISSUE_COUNT_INTERVAL = 60; // seconds
+
     private float $pgLatencyEwma = 0.0; // EWMA in ms
 
     // Checkpoint observability — answers "is TRUNCATE actually firing under load?"
@@ -107,6 +122,7 @@ final class DrainWorker
         $lastCleanup = time();
         $lastFlushTime = microtime(true);
         $lastMetricsWrite = 0.0;
+        $lastIssueCount = 0.0;
 
         while ($this->running) {
             $drained = $this->drainBatch($buffer, $writer);
@@ -126,8 +142,19 @@ final class DrainWorker
                 $lastCleanup = time();
             }
 
-            // Write drain metrics for parent process every 5 seconds
+            // Refresh the open-issues gauge for the fleet overview at most once
+            // a minute — a cheap indexed COUNT on the tenant DB, off the ingest
+            // path. Keep the last good value if the query fails (null).
             $now = microtime(true);
+            if ($now - $lastIssueCount >= self::ISSUE_COUNT_INTERVAL) {
+                $issues = $writer->countOpenIssues();
+                if ($issues !== null) {
+                    $this->openIssues = $issues;
+                }
+                $lastIssueCount = $now;
+            }
+
+            // Write drain metrics for parent process every 5 seconds
             if ($now - $lastMetricsWrite >= self::METRICS_WRITE_INTERVAL) {
                 $this->writeDrainMetrics();
                 $lastMetricsWrite = $now;
@@ -270,6 +297,11 @@ final class DrainWorker
             // Update drain metrics
             $this->batchesDrained++;
             $this->rowsDrained += count($rows);
+
+            // Accumulate app-vitals from the batch the writer just persisted.
+            $this->cumRequests += $writer->lastRequestCount;
+            $this->cum5xx += $writer->last5xxCount;
+            $this->cumExceptions += $writer->lastExceptionCount;
             $this->pgLatencyEwma = $this->pgLatencyEwma === 0.0
                 ? $pgElapsed
                 : (self::EWMA_ALPHA * $pgElapsed) + ((1 - self::EWMA_ALPHA) * $this->pgLatencyEwma);
@@ -298,6 +330,10 @@ final class DrainWorker
             'batches_drained' => $this->batchesDrained,
             'batches_failed' => $this->batchesFailed,
             'rows_drained' => $this->rowsDrained,
+            'app_requests_total' => $this->cumRequests,
+            'app_requests_5xx' => $this->cum5xx,
+            'app_exceptions_total' => $this->cumExceptions,
+            'app_open_issues' => $this->openIssues,
             'pg_latency_ms' => round($this->pgLatencyEwma, 2),
             'wal_size_bytes' => $this->walSizeBytes,
             'truncate_attempts' => $this->truncateAttempts,

@@ -130,6 +130,24 @@ class RecordWriterTest extends TestCase
         $this->assertSame('req-001', $row['trace_id']);
     }
 
+    public function test_write_tallies_app_vitals_including_5xx(): void
+    {
+        $records = [
+            $this->sim->makeRequest(['trace_id' => 'av-1', 'status_code' => 200]),
+            $this->sim->makeRequest(['trace_id' => 'av-2', 'status_code' => 503]),
+            $this->sim->makeRequest(['trace_id' => 'av-3', 'status_code' => 500]),
+            $this->sim->makeQuery(['trace_id' => 'av-q', 'sql' => 'SELECT 1']),
+            $this->sim->makeException(['trace_id' => 'av-e', 'class' => 'RuntimeException', 'message' => 'boom']),
+        ];
+
+        $this->writer->write($records);
+
+        // 3 requests, 2 of which are 5xx, 1 exception — queries don't count.
+        $this->assertSame(3, $this->writer->lastRequestCount);
+        $this->assertSame(2, $this->writer->last5xxCount);
+        $this->assertSame(1, $this->writer->lastExceptionCount);
+    }
+
     public function test_write_query(): void
     {
         $record = $this->sim->makeQuery(['trace_id' => 'qry-001', 'sql' => 'SELECT * FROM users']);
@@ -193,6 +211,38 @@ class RecordWriterTest extends TestCase
         $fingerprint = md5('App\\Exceptions\\DuplicateTest'.'|'.'0'.'|'.'app/Dup.php'.'|'.'10');
         $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetch(PDO::FETCH_ASSOC);
         $this->assertSame(3, (int) $issue['occurrences_count']);
+    }
+
+    public function test_count_open_issues_reflects_status(): void
+    {
+        // No issues yet.
+        $this->assertSame(0, $this->writer->countOpenIssues());
+
+        // Two distinct exceptions → two open issues.
+        $this->writer->write([$this->sim->makeException([
+            'trace_id' => 'oi-1', 'class' => 'App\\Oi\\AException', 'file' => 'app/A.php', 'line' => 1,
+        ])]);
+        $this->writer->write([$this->sim->makeException([
+            'trace_id' => 'oi-2', 'class' => 'App\\Oi\\BException', 'file' => 'app/B.php', 'line' => 2,
+        ])]);
+        $this->assertSame(2, $this->writer->countOpenIssues());
+
+        // Resolving one drops the open count.
+        self::$pdo->exec("UPDATE nightowl_issues SET status = 'resolved' WHERE exception_class = 'App\\Oi\\AException'");
+        $this->assertSame(1, $this->writer->countOpenIssues());
+    }
+
+    public function test_count_open_issues_returns_null_when_table_missing(): void
+    {
+        // Older tenant schemas have no nightowl_issues table — the gauge must
+        // degrade to null, never throw and break the drain loop. Rename it away
+        // for the duration of the assertion, then restore it.
+        self::$pdo->exec('ALTER TABLE nightowl_issues RENAME TO nightowl_issues_tmp');
+        try {
+            $this->assertNull($this->writer->countOpenIssues());
+        } finally {
+            self::$pdo->exec('ALTER TABLE nightowl_issues_tmp RENAME TO nightowl_issues');
+        }
     }
 
     public function test_write_command(): void
@@ -903,6 +953,82 @@ class RecordWriterTest extends TestCase
             );
         } finally {
             date_default_timezone_set($originalTz);
+        }
+    }
+
+    /**
+     * Regression for the reported "-17923s ago" bug, swept across *every* write
+     * path: created_at must be stamped in UTC even when the tenant PostgreSQL
+     * server runs in a non-UTC zone.
+     *
+     * The exception/command/mail/notification/scheduled_task writers and the
+     * users upsert omitted created_at entirely and fell back to the column's
+     * useCurrent() default (CURRENT_TIMESTAMP), which resolves in the DB session
+     * timezone. On a UTC+6 server (Asia/Dhaka — the real customer was in
+     * Bangladesh) rows landed ~6h in the future; the dashboard appended "Z" and
+     * rendered "LAST SEEN" hours ahead, and short time-range filters dropped
+     * fresh data. This test pins all of them so no writer can regress.
+     */
+    public function test_created_at_is_utc_for_all_write_paths_under_non_utc_db_timezone(): void
+    {
+        // DB-level setting only affects sessions opened *after* it's applied,
+        // so a fresh writer connection inherits the non-UTC zone.
+        self::$pdo->exec('ALTER DATABASE '.self::$database." SET timezone = 'Asia/Dhaka'");
+
+        try {
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer->write([
+                $this->sim->makeRequest(['trace_id' => 'tz-req']),
+                $this->sim->makeQuery(['trace_id' => 'tz-qry']),
+                $this->sim->makeException(['trace_id' => 'tz-exc']),
+                $this->sim->makeJob(['trace_id' => 'tz-job']),
+                $this->sim->makeCommand(['trace_id' => 'tz-cmd']),
+                $this->sim->makeScheduledTask(['trace_id' => 'tz-sch']),
+                $this->sim->makeCacheEvent(['trace_id' => 'tz-cache']),
+                $this->sim->makeMail(['trace_id' => 'tz-mail']),
+                $this->sim->makeNotification(['trace_id' => 'tz-notif']),
+                $this->sim->makeOutgoingRequest(['trace_id' => 'tz-out']),
+                $this->sim->makeLog(['trace_id' => 'tz-log']),
+                $this->sim->makeUser('tz-user'),
+            ]);
+
+            $cases = [
+                ['nightowl_requests', "trace_id = 'tz-req'"],
+                ['nightowl_queries', "trace_id = 'tz-qry'"],
+                ['nightowl_exceptions', "trace_id = 'tz-exc'"],
+                ['nightowl_jobs', "trace_id = 'tz-job'"],
+                ['nightowl_commands', "trace_id = 'tz-cmd'"],
+                ['nightowl_scheduled_tasks', "trace_id = 'tz-sch'"],
+                ['nightowl_cache_events', "trace_id = 'tz-cache'"],
+                ['nightowl_mail', "trace_id = 'tz-mail'"],
+                ['nightowl_notifications', "trace_id = 'tz-notif'"],
+                ['nightowl_outgoing_requests', "trace_id = 'tz-out'"],
+                ['nightowl_logs', "trace_id = 'tz-log'"],
+                ['nightowl_users', "user_id = 'tz-user'"],
+            ];
+
+            foreach ($cases as [$table, $where]) {
+                $createdAt = self::$pdo->query("SELECT created_at FROM {$table} WHERE {$where}")->fetchColumn();
+                $this->assertNotFalse($createdAt, "No row written to {$table}");
+
+                $stored = \DateTimeImmutable::createFromFormat(
+                    'Y-m-d H:i:s',
+                    substr((string) $createdAt, 0, 19),
+                    new \DateTimeZone('UTC')
+                );
+                $this->assertNotFalse($stored, "Unparseable created_at in {$table}: {$createdAt}");
+
+                // With the useCurrent() bug this skew would be ~6h (21600s) under
+                // Asia/Dhaka; explicit gmdate() stamping keeps it within latency.
+                $skew = abs($stored->getTimestamp() - time());
+                $this->assertLessThan(
+                    300,
+                    $skew,
+                    "{$table}.created_at is {$skew}s from UTC now — the DB session timezone leaked in (useCurrent regression)."
+                );
+            }
+        } finally {
+            self::$pdo->exec('ALTER DATABASE '.self::$database." SET timezone = 'UTC'");
         }
     }
 

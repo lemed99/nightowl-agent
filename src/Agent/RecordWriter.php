@@ -32,6 +32,18 @@ final class RecordWriter
     /** Built once per rollup table: the generic spec-driven upsert SQL. */
     private array $rollupSqlCache = [];
 
+    /**
+     * Per-batch app-vitals counts from the last doWrite() call, read by the
+     * drain worker to accumulate fleet-overview vitals. Counted directly off
+     * the already-grouped/parsed records — no extra json_decode. See
+     * AGENCY_PORTFOLIO_IMPL_PLAN §4.1.
+     */
+    public int $lastRequestCount = 0;
+
+    public int $last5xxCount = 0;
+
+    public int $lastExceptionCount = 0;
+
     public function __construct(
         private string $host,
         private int $port,
@@ -139,6 +151,27 @@ final class RecordWriter
     }
 
     /**
+     * Current count of open issues in the tenant DB — the fleet overview's
+     * per-app "issues" gauge. A snapshot (not cumulative): the platform stores
+     * it directly rather than diffing. Cheap (indexed `status` column), run off
+     * the ingest path at most once per minute by the drain worker.
+     *
+     * Returns null — never throws — when the issues table isn't present yet
+     * (older tenant schema) or the query fails, so a missing table or a brief
+     * PG blip never disrupts the drain. The caller keeps the last good value.
+     */
+    public function countOpenIssues(): ?int
+    {
+        try {
+            $count = $this->pdo()->query("SELECT COUNT(*) FROM nightowl_issues WHERE status = 'open'")->fetchColumn();
+
+            return $count === false ? null : (int) $count;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
      * Drop the current connection and force a fresh one on next use.
      * Ensures any stale transaction state is cleaned up before the
      * socket is discarded — critical for PgBouncer/Supavisor which
@@ -168,6 +201,18 @@ final class RecordWriter
                 continue;
             }
             $grouped[$type][] = $record;
+        }
+
+        // App-vitals tally for the fleet overview — counted off the grouped,
+        // already-parsed records (zero extra decode). 5xx is read from the
+        // status_code present on every request record. See impl plan §4.1.
+        $this->lastRequestCount = count($grouped['request'] ?? []);
+        $this->lastExceptionCount = count($grouped['exception'] ?? []);
+        $this->last5xxCount = 0;
+        foreach ($grouped['request'] ?? [] as $r) {
+            if ((int) ($r['status_code'] ?? 200) >= 500) {
+                $this->last5xxCount++;
+            }
         }
 
         $pdo = $this->pdo();
@@ -798,13 +843,20 @@ final class RecordWriter
             v, trace_id, timestamp, deploy, environment, server, group_hash,
             execution_source, execution_id, execution_stage, execution_preview, user_id,
             class, message, code, file, line, trace,
-            php_version, laravel_version, handled, fingerprint
+            php_version, laravel_version, handled, fingerprint, created_at
         ) VALUES (
             :v, :trace_id, :timestamp, :deploy, :environment, :server, :group_hash,
             :execution_source, :execution_id, :execution_stage, :execution_preview, :user_id,
             :class, :message, :code, :file, :line, :trace,
-            :php_version, :laravel_version, :handled, :fingerprint
+            :php_version, :laravel_version, :handled, :fingerprint, :created_at
         )');
+
+        // Stamp created_at as an explicit UTC string rather than relying on the
+        // column's useCurrent() default — CURRENT_TIMESTAMP resolves in the
+        // PostgreSQL session timezone, so on a non-UTC tenant DB it stored local
+        // wall-clock and the dashboard read it back as UTC (future-dated rows).
+        // Matches writeRequests()/writeQueries().
+        $now = gmdate('Y-m-d H:i:s', time());
 
         $issueGroups = [];
 
@@ -843,6 +895,7 @@ final class RecordWriter
                 'laravel_version' => $r['laravel_version'] ?? null,
                 'handled' => filter_var($r['handled'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
                 'fingerprint' => $fingerprint,
+                'created_at' => $now,
             ]);
 
             if (! isset($issueGroups[$groupKey])) {
@@ -940,13 +993,17 @@ final class RecordWriter
 
     private function writeCommands(array $records): void
     {
+        // Stamp created_at in UTC instead of leaning on the column's useCurrent()
+        // default, which resolves in the tenant DB's session timezone. See writeExceptions().
+        $now = gmdate('Y-m-d H:i:s', time());
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'user_id', 'class', 'name', 'command', 'exit_code', 'duration',
             'bootstrap', 'action', 'terminating',
             'exceptions', 'logs', 'queries',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
-            'cache_events', 'peak_memory_usage', 'exception_preview', 'context',
+            'cache_events', 'peak_memory_usage', 'exception_preview', 'context', 'created_at',
         ];
 
         $rows = [];
@@ -961,6 +1018,7 @@ final class RecordWriter
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
                 $r['cache_events'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
+                $now,
             ];
         }
 
@@ -1044,10 +1102,14 @@ final class RecordWriter
 
     private function writeMail(array $records): void
     {
+        // Stamp created_at in UTC instead of leaning on the column's useCurrent()
+        // default, which resolves in the tenant DB's session timezone. See writeExceptions().
+        $now = gmdate('Y-m-d H:i:s', time());
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
-            'mailer', 'recipients', 'cc', 'bcc', 'attachments', 'subject', 'mailable', 'duration', 'failed', 'queued',
+            'mailer', 'recipients', 'cc', 'bcc', 'attachments', 'subject', 'mailable', 'duration', 'failed', 'queued', 'created_at',
         ];
 
         $rows = [];
@@ -1060,6 +1122,7 @@ final class RecordWriter
                 $r['cc'] ?? 0, $r['bcc'] ?? 0, $r['attachments'] ?? 0,
                 $r['subject'] ?? null, $r['class'] ?? $r['mailable'] ?? null, $r['duration'] ?? null,
                 ($r['failed'] ?? false) ? 't' : 'f', ($r['queued'] ?? false) ? 't' : 'f',
+                $now,
             ];
         }
 
@@ -1070,10 +1133,14 @@ final class RecordWriter
 
     private function writeNotifications(array $records): void
     {
+        // Stamp created_at in UTC instead of leaning on the column's useCurrent()
+        // default, which resolves in the tenant DB's session timezone. See writeExceptions().
+        $now = gmdate('Y-m-d H:i:s', time());
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
-            'notification', 'channel', 'notifiable_type', 'notifiable_id', 'duration', 'failed', 'queued',
+            'notification', 'channel', 'notifiable_type', 'notifiable_id', 'duration', 'failed', 'queued', 'created_at',
         ];
 
         $rows = [];
@@ -1084,6 +1151,7 @@ final class RecordWriter
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['class'] ?? $r['notification'] ?? null, $r['channel'] ?? null, $r['notifiable_type'] ?? null, $r['notifiable_id'] ?? null,
                 $r['duration'] ?? null, ($r['failed'] ?? false) ? 't' : 'f', ($r['queued'] ?? false) ? 't' : 'f',
+                $now,
             ];
         }
 
@@ -1152,9 +1220,11 @@ final class RecordWriter
 
     private function writeUsers(array $records): void
     {
+        // created_at is set on first insert only (DO UPDATE leaves it untouched),
+        // stamped in UTC rather than via the column's session-tz useCurrent() default.
         $stmt = $this->pdo()->prepare('
-            INSERT INTO nightowl_users (v, user_id, name, email, timestamp, updated_at)
-            VALUES (:v, :user_id, :name, :email, :timestamp, :updated_at)
+            INSERT INTO nightowl_users (v, user_id, name, email, timestamp, created_at, updated_at)
+            VALUES (:v, :user_id, :name, :email, :timestamp, :created_at, :updated_at)
             ON CONFLICT (user_id) DO UPDATE SET
                 v = EXCLUDED.v,
                 name = EXCLUDED.name,
@@ -1162,6 +1232,8 @@ final class RecordWriter
                 timestamp = EXCLUDED.timestamp,
                 updated_at = EXCLUDED.updated_at
         ');
+
+        $now = gmdate('Y-m-d H:i:s');
 
         foreach ($records as $r) {
             $userId = $r['id'] ?? null;
@@ -1175,13 +1247,18 @@ final class RecordWriter
                 'name' => $r['name'] ?? null,
                 'email' => $r['username'] ?? null,
                 'timestamp' => $r['timestamp'] ?? null,
-                'updated_at' => gmdate('Y-m-d H:i:s'),
+                'created_at' => $now,
+                'updated_at' => $now,
             ]);
         }
     }
 
     private function writeScheduledTasks(array $records): void
     {
+        // Stamp created_at in UTC instead of leaning on the column's useCurrent()
+        // default, which resolves in the tenant DB's session timezone. See writeExceptions().
+        $now = gmdate('Y-m-d H:i:s', time());
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'user_id', 'command', 'expression',
@@ -1189,7 +1266,7 @@ final class RecordWriter
             'status', 'duration', 'exit_code',
             'exceptions', 'logs', 'queries',
             'jobs_queued', 'mail', 'notifications', 'outgoing_requests',
-            'cache_events', 'peak_memory_usage', 'exception_preview', 'context',
+            'cache_events', 'peak_memory_usage', 'exception_preview', 'context', 'created_at',
         ];
 
         $rows = [];
@@ -1207,6 +1284,7 @@ final class RecordWriter
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
                 $r['cache_events'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
+                $now,
             ];
         }
 
