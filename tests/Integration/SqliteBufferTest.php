@@ -300,6 +300,67 @@ class SqliteBufferTest extends TestCase
         $this->assertSame(0, $this->buffer->pendingCount());
     }
 
+    // --- quarantine (Phase 2 poison-row isolation) ---
+
+    public function testQuarantineHidesRowsFromDrainButKeepsThem(): void
+    {
+        for ($i = 0; $i < 6; $i++) {
+            $this->buffer->appendRaw(json_encode(['i' => $i]));
+        }
+        $pending = $this->buffer->fetchPending(10);
+        $poison = [$pending[1]['id'], $pending[3]['id']];
+
+        $this->buffer->quarantine($poison);
+
+        // Not re-fetched, not counted as pending, but retained as dead-letter.
+        $this->assertSame(2, $this->buffer->quarantinedCount());
+        $this->assertSame(4, $this->buffer->pendingCount());
+        $fetchedIds = array_column($this->buffer->fetchPending(10), 'id');
+        $this->assertEmpty(array_intersect($poison, $fetchedIds));
+
+        // cleanup() (which deletes synced=1) must NOT touch quarantined rows.
+        $this->buffer->markSynced([$pending[0]['id']]);
+        usleep(20_000);
+        $this->buffer->cleanup(0);
+        $this->assertSame(2, $this->buffer->quarantinedCount());
+    }
+
+    public function testQuarantineSurvivesReleaseClaimed(): void
+    {
+        for ($i = 0; $i < 4; $i++) {
+            $this->buffer->appendRaw(json_encode(['i' => $i]));
+        }
+        $claimed = $this->buffer->claimBatch(0, 4);
+        $poison = [$claimed[0]['id']];
+
+        // Quarantine a claimed row, then simulate worker-crash recovery.
+        $this->buffer->quarantine($poison);
+        $this->buffer->releaseClaimed(0);
+
+        // The 3 healthy rows return to pending; the quarantined one stays out.
+        $this->assertSame(3, $this->buffer->pendingCount());
+        $this->assertSame(1, $this->buffer->quarantinedCount());
+    }
+
+    public function testPruneQuarantinedRespectsAge(): void
+    {
+        for ($i = 0; $i < 3; $i++) {
+            $this->buffer->appendRaw(json_encode(['i' => $i]));
+        }
+        $ids = array_column($this->buffer->fetchPending(10), 'id');
+        $this->buffer->quarantine($ids);
+        $this->assertSame(3, $this->buffer->quarantinedCount());
+
+        // A generous retention keeps them.
+        $this->assertSame(0, $this->buffer->pruneQuarantined(3600));
+        $this->assertSame(3, $this->buffer->quarantinedCount());
+
+        // A zero retention drops them (tick so created_at < cutoff).
+        usleep(20_000);
+        $this->assertSame(3, $this->buffer->pruneQuarantined(0));
+        $this->assertSame(0, $this->buffer->quarantinedCount());
+    }
+
     public function testMarkSyncedAfterClaim(): void
     {
         for ($i = 0; $i < 5; $i++) {

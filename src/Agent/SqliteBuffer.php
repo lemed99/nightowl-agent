@@ -196,6 +196,55 @@ final class SqliteBuffer
     }
 
     /**
+     * Move rows to the quarantine / dead-letter state (synced = -1): a terminal
+     * marker the drain never re-fetches (fetchPending/claimBatch select synced=0),
+     * cleanup() never deletes (it targets synced=1), releaseClaimed() never resets
+     * (it targets synced=100+workerId), and pendingCount() never counts. Used for
+     * "poison" payloads a write keeps rejecting with a row-level data error, so one
+     * bad row can't head-of-line block the whole drain. Bounded by pruneQuarantined().
+     *
+     * @param  int[]  $ids
+     */
+    public function quarantine(array $ids): void
+    {
+        if (empty($ids)) {
+            return;
+        }
+
+        // Re-stamp created_at to NOW so pruneQuarantined()'s retention is measured
+        // from quarantine time, not original ingest time — a long-buffered poison
+        // row would otherwise be eligible for pruning immediately. (created_at is
+        // only read by cleanup (synced=1) and pruneQuarantined (synced=-1), and a
+        // row is only ever one of those, so re-stamping here is side-effect-free.)
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $stmt = $this->pdo->prepare("UPDATE buffer SET synced = -1, created_at = ? WHERE id IN ({$placeholders})");
+        $stmt->execute([microtime(true), ...array_values($ids)]);
+    }
+
+    /**
+     * Count of quarantined (dead-lettered) rows currently in the buffer.
+     */
+    public function quarantinedCount(): int
+    {
+        return (int) $this->pdo->query('SELECT COUNT(*) FROM buffer WHERE synced = -1')->fetchColumn();
+    }
+
+    /**
+     * Delete quarantined rows older than $maxAge seconds, bounding the dead-letter's
+     * disk footprint under a systemic poison (e.g. wrong DB / schema drift). The loss
+     * is not silent — the drain surfaces a DRAIN_QUARANTINE health diagnosis with the
+     * count + SQLSTATE before rows age out.
+     */
+    public function pruneQuarantined(int $maxAge): int
+    {
+        $cutoff = microtime(true) - $maxAge;
+        $stmt = $this->pdo->prepare('DELETE FROM buffer WHERE synced = -1 AND created_at < :cutoff');
+        $stmt->execute(['cutoff' => $cutoff]);
+
+        return $stmt->rowCount();
+    }
+
+    /**
      * Count of rows not yet synced.
      */
     public function pendingCount(): int

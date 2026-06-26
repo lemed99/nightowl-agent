@@ -47,6 +47,38 @@ final class DrainWorker
 
     private int $walSizeBytes = 0;
 
+    // Last NON-connection write failure (poison row / missing schema / no
+    // privilege / wrong db). Only SQLSTATE + table — never the raw libpq message,
+    // which can echo customer row values. Surfaced as the DRAIN_WRITE_FAILING
+    // diagnosis so a stuck drain shows the real cause instead of the misleading
+    // "Postgres may be unreachable". Connection failures are excluded — those are
+    // handled by reconnect/DRAIN_STOPPED.
+    private ?string $lastWriteSqlstate = null;
+
+    private ?string $lastWriteTable = null;
+
+    private float $lastWriteAt = 0.0;
+
+    private float $lastWriteOkAt = 0.0;
+
+    // Poison-payload quarantine (Phase 2). Cumulative since worker start — a
+    // dropped telemetry row is data loss, so the DRAIN_QUARANTINE diagnosis stays
+    // visible. SQLSTATE + table only, never raw row values.
+    private int $quarantinedTotal = 0;
+
+    private ?string $lastQuarantineSqlstate = null;
+
+    private ?string $lastQuarantineTable = null;
+
+    private float $lastQuarantineAt = 0.0;
+
+    // Consecutive quarantines with no intervening successful drain (systematic-poison
+    // circuit breaker). Live count of dead-lettered rows in the buffer (durable
+    // across restart — drives the DRAIN_QUARANTINE diagnosis).
+    private int $consecutiveQuarantines = 0;
+
+    private int $quarantinedLive = 0;
+
     private const EWMA_ALPHA = 0.3;
 
     public function __construct(
@@ -68,6 +100,19 @@ final class DrainWorker
         // Knobs the chaos test tunes; defaults match prior hardcoded behavior.
         private int $checkpointIntervalSeconds = 60,
         private int $checkpointTruncateBytes = 100 * 1024 * 1024,
+        // Phase 2: when enabled, a batch that fails with a row-level data error is
+        // bisected to isolate and quarantine the poison payload so the rest drain,
+        // instead of head-of-line-blocking. Off by default — opt-in via
+        // NIGHTOWL_DRAIN_QUARANTINE. Quarantined rows are dead-lettered for
+        // $quarantineRetentionSeconds, then pruned (the loss is surfaced as the
+        // DRAIN_QUARANTINE health diagnosis with count + SQLSTATE).
+        private bool $quarantineEnabled = false,
+        private int $quarantineRetentionSeconds = 86400,
+        // Circuit breaker: if this many payloads quarantine in a row WITHOUT an
+        // intervening successful drain, treat it as a systematic schema mismatch
+        // (e.g. an unmigrated NOT-NULL column) rather than per-row poison — stop
+        // dropping the stream and head-of-line block + surface DRAIN_WRITE_FAILING.
+        private int $quarantineBreakerThreshold = 50,
     ) {}
 
     /**
@@ -135,6 +180,9 @@ final class DrainWorker
             if (time() - $lastCleanup >= $this->checkpointIntervalSeconds) {
                 try {
                     $buffer->cleanup(300);
+                    if ($this->quarantineEnabled) {
+                        $buffer->pruneQuarantined($this->quarantineRetentionSeconds);
+                    }
                     $this->checkpointWithEscalation($buffer);
                 } catch (\Throwable $e) {
                     error_log("[NightOwl Drain] Cleanup error: {$e->getMessage()}");
@@ -156,6 +204,11 @@ final class DrainWorker
 
             // Write drain metrics for parent process every 5 seconds
             if ($now - $lastMetricsWrite >= self::METRICS_WRITE_INTERVAL) {
+                // Refresh the live dead-letter count off the buffer (durable across
+                // restart) so the DRAIN_QUARANTINE diagnosis survives a worker respawn.
+                if ($this->quarantineEnabled) {
+                    $this->quarantinedLive = $buffer->quarantinedCount();
+                }
                 $this->writeDrainMetrics();
                 $lastMetricsWrite = $now;
             }
@@ -267,20 +320,31 @@ final class DrainWorker
                 return false;
             }
 
-            $allRecords = [];
-            $ids = [];
-
+            // Decode into per-payload units, preserving the buffer id ↔ records
+            // link so isolation can quarantine a single offending payload (records
+            // are flattened only at write time). Unparseable rows are marked done
+            // immediately so they can't head-of-line block.
+            $units = [];
+            $corruptIds = [];
             foreach ($rows as $row) {
-                $ids[] = $row['id'];
                 try {
                     $records = json_decode($row['payload'], true, 512, JSON_THROW_ON_ERROR);
                 } catch (\JsonException) {
-                    // Row is corrupt — skip it rather than crash the drain worker.
+                    $corruptIds[] = $row['id'];
+
                     continue;
                 }
                 if (is_array($records)) {
-                    array_push($allRecords, ...$records);
+                    $units[] = ['id' => $row['id'], 'records' => $records];
+                } else {
+                    $corruptIds[] = $row['id'];
                 }
+            }
+            if (! empty($corruptIds)) {
+                $buffer->markSynced($corruptIds);
+            }
+            if (empty($units)) {
+                return true;
             }
 
             // Write to Postgres first, then mark synced. If the process is
@@ -289,30 +353,223 @@ final class DrainWorker
             // alternative (mark-first) loses data on hard kill — unacceptable
             // for a zero-data-loss requirement.
             $pgStart = microtime(true);
-            $writer->write($allRecords);
+            if ($this->quarantineEnabled) {
+                $result = $this->drainUnits($buffer, $writer, $units);
+            } else {
+                // Phase-1 behavior: all-or-nothing. A non-connection failure throws
+                // out to the catch (recorded as DRAIN_WRITE_FAILING) and the whole
+                // batch is retried — no quarantine.
+                $records = [];
+                foreach ($units as $u) {
+                    array_push($records, ...$u['records']);
+                }
+                $writer->write($records);
+                $buffer->markSynced(array_column($units, 'id'));
+                $this->onDrainSuccess($writer);
+                $result = ['drained' => count($units), 'quarantined' => 0, 'deferred' => 0];
+            }
             $pgElapsed = (microtime(true) - $pgStart) * 1000; // ms
 
-            $buffer->markSynced($ids);
-
-            // Update drain metrics
             $this->batchesDrained++;
-            $this->rowsDrained += count($rows);
-
-            // Accumulate app-vitals from the batch the writer just persisted.
-            $this->cumRequests += $writer->lastRequestCount;
-            $this->cum5xx += $writer->last5xxCount;
-            $this->cumExceptions += $writer->lastExceptionCount;
+            $this->rowsDrained += $result['drained'];
             $this->pgLatencyEwma = $this->pgLatencyEwma === 0.0
                 ? $pgElapsed
                 : (self::EWMA_ALPHA * $pgElapsed) + ((1 - self::EWMA_ALPHA) * $this->pgLatencyEwma);
 
-            return true;
+            // Treat a batch that only deferred (transient failures, nothing committed
+            // or quarantined) as idle so the loop backs off instead of busy-looping.
+            return ($result['drained'] + $result['quarantined']) > 0;
         } catch (\Throwable $e) {
             $this->batchesFailed++;
             error_log("[NightOwl Drain] Error: {$e->getMessage()}");
 
+            // Capture the SQLSTATE + table for the health report, but only for
+            // NON-connection failures (PG reachable, rejecting the write). True
+            // connection failures are handled by reconnect + DRAIN_STOPPED; folding
+            // them in here would mislabel "unreachable" as "rejecting writes".
+            $err = $writer->lastWriteError;
+            if (is_array($err) && empty($err['connection'])) {
+                $this->lastWriteSqlstate = is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : null;
+                $this->lastWriteTable = is_string($err['table'] ?? null) ? $err['table'] : null;
+                $this->lastWriteAt = microtime(true);
+            }
+
             return false;
         }
+    }
+
+    /**
+     * Drain a set of payload units with poison-row isolation (Phase 2).
+     *
+     * Each subset that writes cleanly is markSynced immediately — an atomic
+     * write→mark that preserves the at-most-one-batch-duplicate guarantee at
+     * sub-batch granularity (a crash replays at most the in-flight subset, never
+     * an already-committed one, so additive rollups can't double-count). On a
+     * row-level data error the set is bisected to isolate the offending payload(s),
+     * which — after a forceInsert retry — are quarantined so the rest drain.
+     *
+     * Connection failures and whole-target failures (missing schema / no privilege
+     * / bad credentials / exhausted resources) are NOT the payload's fault: they
+     * re-throw to abort isolation, leaving every unit pending for the next attempt
+     * and surfacing DRAIN_WRITE_FAILING instead of quarantining good data.
+     *
+     * @param  array<int, array{id: int, records: array<int, mixed>}>  $units
+     * @return array{drained: int, quarantined: int}
+     */
+    private function drainUnits(SqliteBuffer $buffer, RecordWriter $writer, array $units): array
+    {
+        // Heartbeat so a long isolation isn't mistaken for a stalled/crashed worker
+        // (the run loop's periodic writeDrainMetrics is blocked while we recurse).
+        $this->writeDrainMetrics();
+
+        $records = [];
+        foreach ($units as $u) {
+            array_push($records, ...$u['records']);
+        }
+        $ids = array_column($units, 'id');
+
+        try {
+            $writer->write($records);
+            $buffer->markSynced($ids);
+            $this->onDrainSuccess($writer);
+
+            return ['drained' => count($units), 'quarantined' => 0, 'deferred' => 0];
+        } catch (\Throwable $e) {
+            // Connection / whole-target failures hit every payload equally — abort
+            // isolation and retry the whole batch (surfaces DRAIN_WRITE_FAILING).
+            if ($this->isWholeTargetFailure($writer->lastWriteError)) {
+                throw $e;
+            }
+
+            if (count($units) > 1) {
+                $mid = intdiv(count($units), 2);
+                $left = $this->drainUnits($buffer, $writer, array_slice($units, 0, $mid));
+                $right = $this->drainUnits($buffer, $writer, array_slice($units, $mid));
+
+                return [
+                    'drained' => $left['drained'] + $right['drained'],
+                    'quarantined' => $left['quarantined'] + $right['quarantined'],
+                    'deferred' => $left['deferred'] + $right['deferred'],
+                ];
+            }
+
+            return $this->isolateSinglePayload($buffer, $writer, $units[0]);
+        }
+    }
+
+    /**
+     * One isolated payload that failed the batch write. Re-run it alone via INSERT
+     * (clears a COPY-hostile target and forces a definitive SQLSTATE), then:
+     *   - whole-target failure (connection/schema/auth) → re-throw, retry whole batch;
+     *   - transient failure (deadlock/serialization/lock) → DEFER: leave it pending,
+     *     don't abort its siblings, retry next loop (it is not deterministically bad);
+     *   - circuit breaker open (sustained ~100% quarantine rate ⇒ systematic schema
+     *     mismatch, not per-row poison) → re-throw so the stream head-of-line blocks
+     *     and surfaces DRAIN_WRITE_FAILING instead of silently dropping everything;
+     *   - otherwise the database DETERMINISTICALLY rejects just this payload (22/23,
+     *     54000 index-row-too-large, …) → quarantine it so the rest of the stream drains.
+     *
+     * @param  array{id: int, records: array<int, mixed>}  $unit
+     * @return array{drained: int, quarantined: int, deferred: int}
+     */
+    private function isolateSinglePayload(SqliteBuffer $buffer, RecordWriter $writer, array $unit): array
+    {
+        $ids = [$unit['id']];
+
+        try {
+            $writer->writeForceInsert($unit['records']);
+            $buffer->markSynced($ids);
+            $this->onDrainSuccess($writer);
+
+            return ['drained' => 1, 'quarantined' => 0, 'deferred' => 0];
+        } catch (\Throwable $e) {
+            $err = $writer->lastWriteError;
+
+            if ($this->isWholeTargetFailure($err)) {
+                throw $e;
+            }
+            if ($this->isTransientFailure($err)) {
+                return ['drained' => 0, 'quarantined' => 0, 'deferred' => 1];
+            }
+            if ($this->consecutiveQuarantines >= $this->quarantineBreakerThreshold) {
+                // Systematic, not per-row — stop dropping the stream; surface it.
+                throw $e;
+            }
+
+            $sqlstate = is_array($err) && is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : null;
+            $buffer->quarantine($ids);
+            $this->quarantinedTotal++;
+            $this->consecutiveQuarantines++;
+            $this->lastQuarantineSqlstate = $sqlstate;
+            $this->lastQuarantineTable = is_array($err) && is_string($err['table'] ?? null) ? $err['table'] : null;
+            $this->lastQuarantineAt = microtime(true);
+            error_log(sprintf(
+                '[NightOwl Drain] Quarantined poison payload id=%d (SQLSTATE %s on %s)',
+                $unit['id'],
+                $sqlstate ?? 'unknown',
+                $this->lastQuarantineTable ?? '?'
+            ));
+
+            return ['drained' => 0, 'quarantined' => 1, 'deferred' => 0];
+        }
+    }
+
+    /** A successful write: record progress and reset the systematic-poison breaker. */
+    private function onDrainSuccess(RecordWriter $writer): void
+    {
+        $this->lastWriteOkAt = microtime(true);
+        $this->consecutiveQuarantines = 0;
+        $this->cumRequests += $writer->lastRequestCount;
+        $this->cum5xx += $writer->last5xxCount;
+        $this->cumExceptions += $writer->lastExceptionCount;
+    }
+
+    /**
+     * A failure that hits the whole target rather than one payload — re-throw to
+     * abort isolation and retry the whole batch (surfacing DRAIN_WRITE_FAILING):
+     * connection drops, plus schema/syntax/privilege (42), auth (28), catalog (3D),
+     * resource (53), operator (57), system (58). An EMPTY SQLSTATE is NOT treated as
+     * whole-target — isolation proceeds so the per-payload INSERT can surface a code.
+     *
+     * @param  mixed  $err  RecordWriter::$lastWriteError
+     */
+    private function isWholeTargetFailure($err): bool
+    {
+        if (! is_array($err)) {
+            return false;
+        }
+        if (! empty($err['connection'])) {
+            return true;
+        }
+        $sqlstate = is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : '';
+        if ($sqlstate === '') {
+            return false;
+        }
+
+        return str_starts_with($sqlstate, '08')
+            || str_starts_with($sqlstate, '42')
+            || str_starts_with($sqlstate, '28')
+            || str_starts_with($sqlstate, '3D')
+            || str_starts_with($sqlstate, '53')
+            || str_starts_with($sqlstate, '57')
+            || str_starts_with($sqlstate, '58');
+    }
+
+    /**
+     * Transient, non-deterministic failures — serialization (40001), deadlock
+     * (40P01), lock-not-available / object-in-use (55xxx). Not the payload's fault
+     * and likely to succeed on retry, so DEFER rather than quarantine.
+     *
+     * @param  mixed  $err  RecordWriter::$lastWriteError
+     */
+    private function isTransientFailure($err): bool
+    {
+        if (! is_array($err)) {
+            return false;
+        }
+        $sqlstate = is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : '';
+
+        return str_starts_with($sqlstate, '40') || str_starts_with($sqlstate, '55');
     }
 
     /**
@@ -326,6 +583,9 @@ final class DrainWorker
             : $this->sqlitePath.'.drain-metrics.json';
         $tmpPath = $metricsPath.'.tmp';
 
+        // JSON_INVALID_UTF8_SUBSTITUTE (and no JSON_THROW_ON_ERROR): the write
+        // error fields are ASCII (SQLSTATE + table identifier), but harden anyway
+        // so a stray byte can never throw out of the run loop and crash the worker.
         $data = json_encode([
             'batches_drained' => $this->batchesDrained,
             'batches_failed' => $this->batchesFailed,
@@ -339,10 +599,18 @@ final class DrainWorker
             'truncate_attempts' => $this->truncateAttempts,
             'truncate_successes' => $this->truncateSuccesses,
             'truncate_failures' => $this->truncateFailures,
+            'last_write_sqlstate' => $this->lastWriteSqlstate,
+            'last_write_table' => $this->lastWriteTable,
+            'last_write_at' => $this->lastWriteAt,
+            'last_write_ok_at' => $this->lastWriteOkAt,
+            'quarantined_live' => $this->quarantinedLive,
+            'last_quarantine_sqlstate' => $this->lastQuarantineSqlstate,
+            'last_quarantine_table' => $this->lastQuarantineTable,
+            'last_quarantine_at' => $this->lastQuarantineAt,
             'updated_at' => microtime(true),
-        ], JSON_THROW_ON_ERROR);
+        ], JSON_INVALID_UTF8_SUBSTITUTE);
 
-        if (@file_put_contents($tmpPath, $data) !== false) {
+        if ($data !== false && @file_put_contents($tmpPath, $data) !== false) {
             @rename($tmpPath, $metricsPath);
         }
     }

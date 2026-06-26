@@ -99,6 +99,12 @@ return [
         'drain_interval_ms' => env('NIGHTOWL_DRAIN_INTERVAL_MS', 100),
         'drain_batch_size' => env('NIGHTOWL_DRAIN_BATCH_SIZE', 5000),
         'drain_workers' => env('NIGHTOWL_DRAIN_WORKERS', 1),
+        // Poison-row isolation (Phase 2): when true, a batch failing with a
+        // row-level data error (SQLSTATE class 22/23) is bisected to quarantine
+        // the offending payload so the rest drain, instead of head-of-line
+        // blocking. Quarantined rows are dropped after the retention window and
+        // surfaced as the DRAIN_QUARANTINE health diagnosis. Off by default.
+        'drain_quarantine_enabled' => env('NIGHTOWL_DRAIN_QUARANTINE', false),
         'max_pending_rows' => env('NIGHTOWL_MAX_PENDING_ROWS', 100_000),
         'max_buffer_memory' => env('NIGHTOWL_MAX_BUFFER_MEMORY', 256 * 1024 * 1024),
 

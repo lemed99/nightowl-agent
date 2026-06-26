@@ -44,6 +44,23 @@ final class RecordWriter
 
     public int $lastExceptionCount = 0;
 
+    /**
+     * Details of the most recent write failure, set by copyBatch() (COPY path)
+     * or doWrite()'s catch (INSERT/upsert path) and read by the drain worker.
+     * Shape: ['sqlstate' => ?string, 'table' => ?string, 'connection' => bool].
+     * Cleared to null at the start of every doWrite() — so a null value after a
+     * write() call means the batch succeeded. Only SQLSTATE + table travel to the
+     * health report; the raw libpq message (which can echo customer row values)
+     * stays in the local error_log only.
+     */
+    public ?array $lastWriteError = null;
+
+    /** Table currently being written — fallback table name for INSERT/upsert failures. */
+    private ?string $currentWriteTarget = null;
+
+    /** When true, copyBatch() routes the COPY tables through INSERT instead. */
+    private bool $forceInsert = false;
+
     public function __construct(
         private string $host,
         private int $port,
@@ -151,6 +168,23 @@ final class RecordWriter
     }
 
     /**
+     * Like write(), but routes the 10 COPY tables through multi-row INSERT instead
+     * of the COPY protocol (exceptions/users/rollups are already INSERT). Used by
+     * the drain worker's poison-row isolation: re-running the FULL batch as INSERT
+     * both clears a hypothetical COPY-hostile target and lets a single offending
+     * row surface its own data-error SQLSTATE. The latch resets even on failure.
+     */
+    public function writeForceInsert(array $records): void
+    {
+        $this->forceInsert = true;
+        try {
+            $this->write($records);
+        } finally {
+            $this->forceInsert = false;
+        }
+    }
+
+    /**
      * Current count of open issues in the tenant DB — the fleet overview's
      * per-app "issues" gauge. A snapshot (not cumulative): the platform stores
      * it directly rather than diffing. Cheap (indexed `status` column), run off
@@ -194,6 +228,10 @@ final class RecordWriter
 
     private function doWrite(array $records): void
     {
+        // Clear last-error state; a null value after write() returns means success.
+        $this->lastWriteError = null;
+        $this->currentWriteTarget = null;
+
         $grouped = [];
         foreach ($records as $record) {
             $type = $record['t'] ?? null;
@@ -245,6 +283,16 @@ final class RecordWriter
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
+            // COPY failures already recorded their SQLSTATE+table in copyBatch.
+            // INSERT/upsert failures (PDOException) are captured here, where the
+            // failing table is known via currentWriteTarget.
+            if ($this->lastWriteError === null) {
+                $this->lastWriteError = [
+                    'sqlstate' => $this->sqlStateOf($e),
+                    'table' => $this->currentWriteTarget,
+                    'connection' => $this->isConnectionError($e),
+                ];
+            }
             throw $e;
         }
 
@@ -269,6 +317,29 @@ final class RecordWriter
     }
 
     /**
+     * Extract the 5-char PostgreSQL SQLSTATE from a write failure, or null.
+     * Only PDOExceptions carry one (errorInfo[0] / getCode()); COPY failures
+     * capture it directly in copyBatch. Used to pick the right operator advice
+     * (42P01 → migrate, 42501 → grant, 22xxx → bad row) without shipping the
+     * raw libpq message (which can contain customer row values).
+     */
+    private function sqlStateOf(\Throwable $e): ?string
+    {
+        if ($e instanceof \PDOException) {
+            $state = $e->errorInfo[0] ?? null;
+            if (is_string($state) && $state !== '' && $state !== '00000') {
+                return $state;
+            }
+            $code = (string) $e->getCode();
+            if ($code !== '' && $code !== '0' && $code !== '00000') {
+                return $code;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * COPY a batch of rows into a table using PostgreSQL's COPY protocol.
      * 5-10x faster than batched INSERTs because it bypasses the SQL parser.
      *
@@ -282,6 +353,8 @@ final class RecordWriter
             return;
         }
 
+        $this->currentWriteTarget = $table;
+
         // Swoole/OpenSwoole's PDO-pgsql coroutine hook reimplements
         // pgsqlCopyFromArray() and busy-loops on COPY (100% CPU, never returns)
         // when the host app (typically Laravel Octane) has enabled runtime hooks.
@@ -289,7 +362,7 @@ final class RecordWriter
         // once enabled it stays broken — so when either extension is present we
         // avoid COPY entirely and drain via multi-row INSERT instead. Plain
         // (non-Swoole) installs keep the faster COPY path.
-        if (extension_loaded('swoole') || extension_loaded('openswoole')) {
+        if ($this->forceInsert || extension_loaded('swoole') || extension_loaded('openswoole')) {
             $this->insertBatch($table, $columns, $rows);
 
             return;
@@ -358,6 +431,9 @@ final class RecordWriter
             // Capture the error before discarding the connection — errorInfo()
             // is only meaningful while the failing handle is still around.
             $error = $this->pdo()->errorInfo();
+            $sqlstate = (isset($error[0]) && is_string($error[0]) && $error[0] !== '' && $error[0] !== '00000')
+                ? $error[0]
+                : null;
 
             // A failed COPY can leave libpq stuck in COPY_IN state, where every
             // later command on the same connection fails with "another command
@@ -366,11 +442,22 @@ final class RecordWriter
             // still holds its own reference for the rollback in its catch block.
             $this->pdo = null;
 
-            throw new \RuntimeException(sprintf(
+            $exception = new \RuntimeException(sprintf(
                 'COPY into %s failed: %s',
                 $table,
                 $error[2] ?? 'unknown libpq error (pgsqlCopyFromArray returned '.var_export($ok, true).')'
             ));
+
+            // Record SQLSTATE + table for the health report. The raw libpq message
+            // ($error[2], which can echo customer row values) stays out of the
+            // report — only stderr via the thrown exception's message.
+            $this->lastWriteError = [
+                'sqlstate' => $sqlstate,
+                'table' => $table,
+                'connection' => $this->isConnectionError($exception),
+            ];
+
+            throw $exception;
         }
     }
 
@@ -574,6 +661,7 @@ final class RecordWriter
      */
     private function writeRollup(array $records, RollupSpec $spec, int $nowTs): void
     {
+        $this->currentWriteTarget = $spec->table;
         $bucketStart = gmdate('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
         $histColumns = $spec->hasHistogram ? QueryHistogram::columns() : [];
         $counterCols = $spec->counterColumns();
@@ -732,6 +820,7 @@ final class RecordWriter
      */
     private function writeQueryRollups(array $records, int $nowTs): void
     {
+        $this->currentWriteTarget = 'nightowl_query_rollups';
         // Bucket on the SAME clock written to created_at, truncated to 60s.
         $bucketStart = gmdate('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
 
@@ -839,6 +928,7 @@ final class RecordWriter
 
     private function writeExceptions(array $records): void
     {
+        $this->currentWriteTarget = 'nightowl_exceptions';
         $stmt = $this->pdo()->prepare('INSERT INTO nightowl_exceptions (
             v, trace_id, timestamp, deploy, environment, server, group_hash,
             execution_source, execution_id, execution_stage, execution_preview, user_id,
@@ -1220,6 +1310,7 @@ final class RecordWriter
 
     private function writeUsers(array $records): void
     {
+        $this->currentWriteTarget = 'nightowl_users';
         // created_at is set on first insert only (DO UPDATE leaves it untouched),
         // stamped in UTC rather than via the column's session-tz useCurrent() default.
         $stmt = $this->pdo()->prepare('

@@ -70,6 +70,153 @@ class MetricsCollectorTest extends TestCase
         $this->assertContains('DRAIN_STOPPED', $codes);
     }
 
+    /**
+     * Feed a single-worker drain-metrics file into the collector, then delete it.
+     *
+     * @param  array<string, mixed>  $fields
+     */
+    private function loadDrainMetrics(array $fields): void
+    {
+        $base = tempnam(sys_get_temp_dir(), 'nightowl-drain-test');
+        $file = $base.'.drain-metrics.json';
+        file_put_contents($file, json_encode(array_merge([
+            'rows_drained' => 0,
+            'batches_failed' => 0,
+            'pg_latency_ms' => 0,
+            'updated_at' => microtime(true),
+            'last_write_sqlstate' => null,
+            'last_write_table' => null,
+            'last_write_at' => 0.0,
+            'last_write_ok_at' => 0.0,
+        ], $fields)));
+
+        $this->collector->readDrainMetrics($base, 1);
+
+        @unlink($file);
+        @unlink($base);
+    }
+
+    private function activeDiagnosis(array $status, string $code): array|false
+    {
+        return current(array_filter($status['diagnoses'], fn ($d) => $d['code'] === $code));
+    }
+
+    public function testDrainWriteFailingSurfacesMigrateAdviceAndSuppressesDrainStopped(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        // Drain stalled because the tenant schema isn't migrated (42P01).
+        $this->loadDrainMetrics([
+            'last_write_sqlstate' => '42P01',
+            'last_write_table' => 'nightowl_requests',
+            'last_write_at' => $now,
+            'batches_failed' => 5,
+        ]);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 500, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertContains('DRAIN_WRITE_FAILING', $codes);
+        // The misleading "Postgres may be unreachable" card must NOT fire — the
+        // connection is fine; only the writes are being rejected.
+        $this->assertNotContains('DRAIN_STOPPED', $codes);
+
+        $d = $this->activeDiagnosis($status, 'DRAIN_WRITE_FAILING');
+        $this->assertNotFalse($d);
+        $this->assertStringContainsString('nightowl:migrate', $d['recommendation']);
+    }
+
+    public function testDrainWriteFailingTemplatesDataErrorWithoutRawRowValue(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        // A poison row (value too long) — SQLSTATE 22001.
+        $this->loadDrainMetrics([
+            'last_write_sqlstate' => '22001',
+            'last_write_table' => 'nightowl_requests',
+            'last_write_at' => $now,
+        ]);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 500, 0, 0);
+        $d = $this->activeDiagnosis($status, 'DRAIN_WRITE_FAILING');
+
+        $this->assertNotFalse($d);
+        // Only SQLSTATE + table surface — never a raw libpq message / row value.
+        $this->assertStringContainsString('22001', $d['message']);
+        $this->assertStringContainsString('nightowl_requests', $d['message']);
+        $this->assertStringContainsString('rejected by your database', $d['message']);
+    }
+
+    public function testDrainQuarantineDiagnosisFiresFromLiveCount(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        // 3 payloads currently dead-lettered in the buffer (durable live count).
+        $this->loadDrainMetrics([
+            'quarantined_live' => 3,
+            'last_quarantine_sqlstate' => '22001',
+            'last_quarantine_table' => 'nightowl_requests',
+            'last_quarantine_at' => $now,
+        ]);
+        $this->collector->runDiagnosis(false, 0, 0, 0);
+        $this->collector->runDiagnosis(false, 0, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 0, 0, 0);
+        $d = $this->activeDiagnosis($status, 'DRAIN_QUARANTINE');
+
+        $this->assertNotFalse($d);
+        $this->assertStringContainsString('3', $d['message']);
+        $this->assertStringContainsString('22001', $d['recommendation']);
+    }
+
+    public function testDrainWriteFailingResolvesAfterSuccessfulWrite(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'last_write_sqlstate' => '42501',
+            'last_write_table' => 'nightowl_requests',
+            'last_write_at' => $now,
+        ]);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+        $this->assertContains(
+            'DRAIN_WRITE_FAILING',
+            array_column($this->collector->getFullStatus($now - 60, false, 500, 0, 0)['diagnoses'], 'code')
+        );
+
+        // A later successful write (ok_at newer than the error) clears it.
+        $this->loadDrainMetrics([
+            'last_write_sqlstate' => '42501',
+            'last_write_table' => 'nightowl_requests',
+            'last_write_at' => $now,
+            'last_write_ok_at' => $now + 1,
+        ]);
+        $this->collector->runDiagnosis(false, 0, 0, 0);
+        $this->collector->runDiagnosis(false, 0, 0, 0);
+
+        $this->assertNotContains(
+            'DRAIN_WRITE_FAILING',
+            array_column($this->collector->getFullStatus($now - 60, false, 0, 0, 0)['diagnoses'], 'code')
+        );
+    }
+
     public function testBackPressureActiveDiagnosis(): void
     {
         for ($i = 0; $i < 5; $i++) {

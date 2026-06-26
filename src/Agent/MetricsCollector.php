@@ -76,6 +76,25 @@ final class MetricsCollector
 
     private float $drainMetricsUpdatedAt = 0.0;
 
+    // Last NON-connection drain write rejection (reduced across workers by most
+    // recent). SQLSTATE + table only — never the raw libpq message. Drives the
+    // DRAIN_WRITE_FAILING diagnosis.
+    private ?string $lastDrainErrorSqlstate = null;
+
+    private ?string $lastDrainErrorTable = null;
+
+    private float $lastDrainErrorAt = 0.0;
+
+    private float $lastDrainOkAt = 0.0;
+
+    // Poison-payload quarantine (Phase 2): cumulative dropped-row count summed
+    // across workers, with the most recent SQLSTATE + table. Drives DRAIN_QUARANTINE.
+    private int $drainQuarantinedTotal = 0;
+
+    private ?string $lastQuarantineSqlstate = null;
+
+    private ?string $lastQuarantineTable = null;
+
     // App-vitals (fleet overview): cumulative per-app counts summed across
     // drain workers. Shipped to the platform, which computes window deltas.
     private int $appRequestsTotal = 0;
@@ -244,6 +263,14 @@ final class MetricsCollector
         $app5xx = 0;
         $appExceptions = 0;
         $appOpenIssues = 0;
+        $mostRecentErrAt = 0.0;
+        $mostRecentErrSqlstate = null;
+        $mostRecentErrTable = null;
+        $mostRecentOkAt = 0.0;
+        $quarantinedLive = 0;
+        $mostRecentQuarAt = 0.0;
+        $mostRecentQuarSqlstate = null;
+        $mostRecentQuarTable = null;
 
         for ($w = 0; $w < $workerCount; $w++) {
             $metricsPath = $workerCount > 1
@@ -278,6 +305,25 @@ final class MetricsCollector
             // reports the same count, so take MAX (a worker that hasn't counted
             // yet reports 0) rather than summing across workers.
             $appOpenIssues = max($appOpenIssues, (int) ($data['app_open_issues'] ?? 0));
+
+            // Drain write error: keep the most recent across workers (not summed).
+            $errAt = (float) ($data['last_write_at'] ?? 0.0);
+            if ($errAt > $mostRecentErrAt) {
+                $mostRecentErrAt = $errAt;
+                $mostRecentErrSqlstate = is_string($data['last_write_sqlstate'] ?? null) ? $data['last_write_sqlstate'] : null;
+                $mostRecentErrTable = is_string($data['last_write_table'] ?? null) ? $data['last_write_table'] : null;
+            }
+            $mostRecentOkAt = max($mostRecentOkAt, (float) ($data['last_write_ok_at'] ?? 0.0));
+
+            // Quarantine: live dead-letter count is the same buffer file for every
+            // worker, so take MAX (not sum); keep the most recent SQLSTATE.
+            $quarantinedLive = max($quarantinedLive, (int) ($data['quarantined_live'] ?? 0));
+            $quarAt = (float) ($data['last_quarantine_at'] ?? 0.0);
+            if ($quarAt > $mostRecentQuarAt) {
+                $mostRecentQuarAt = $quarAt;
+                $mostRecentQuarSqlstate = is_string($data['last_quarantine_sqlstate'] ?? null) ? $data['last_quarantine_sqlstate'] : null;
+                $mostRecentQuarTable = is_string($data['last_quarantine_table'] ?? null) ? $data['last_quarantine_table'] : null;
+            }
 
             $lat = (float) ($data['pg_latency_ms'] ?? 0.0);
             if ($lat > 0) {
@@ -314,6 +360,13 @@ final class MetricsCollector
         $this->drainBatchesFailed = $totalFailed;
         $this->drainPgLatencyMs = $latencyCount > 0 ? $latencySum / $latencyCount : 0.0;
         $this->drainMetricsUpdatedAt = $oldestUpdate < PHP_FLOAT_MAX ? $oldestUpdate : 0.0;
+        $this->lastDrainErrorAt = $mostRecentErrAt;
+        $this->lastDrainErrorSqlstate = $mostRecentErrSqlstate;
+        $this->lastDrainErrorTable = $mostRecentErrTable;
+        $this->lastDrainOkAt = $mostRecentOkAt;
+        $this->drainQuarantinedTotal = $quarantinedLive;
+        $this->lastQuarantineSqlstate = $mostRecentQuarSqlstate;
+        $this->lastQuarantineTable = $mostRecentQuarTable;
         $this->appRequestsTotal = $appRequests;
         $this->app5xxTotal = $app5xx;
         $this->appExceptionsTotal = $appExceptions;
@@ -341,14 +394,55 @@ final class MetricsCollector
         $totalTraffic = $ingestRate + $rejectRate;
         $rejectPct = $totalTraffic > 0 ? ($rejectRate / $totalTraffic) * 100 : 0.0;
 
-        // DRAIN_STOPPED
-        if ($drainRate == 0 && $pendingRows > 100) {
+        // Writes are being REJECTED — PostgreSQL is reachable but refusing the
+        // batch — when the most recent drain outcome was a non-connection failure
+        // with no later success. Distinct from "unreachable" (DRAIN_STOPPED) and
+        // "slow" (PG_LATENCY).
+        $writeFailing = $this->lastDrainErrorAt > 0.0
+            && $this->lastDrainErrorAt > $this->lastDrainOkAt;
+
+        // DRAIN_STOPPED — suppressed when writes are being rejected, because
+        // DRAIN_WRITE_FAILING below names the real cause (the connection is fine;
+        // saying "Postgres may be unreachable" would send the operator the wrong way).
+        if ($drainRate == 0 && $pendingRows > 100 && ! $writeFailing) {
             $diagnoses[] = [
                 'code' => 'DRAIN_STOPPED',
                 'level' => 'critical',
                 'message' => 'Drain worker is not processing rows.',
                 'recommendation' => 'Check PostgreSQL connectivity and drain worker logs. The drain process may have crashed or Postgres may be unreachable.',
                 'value' => $pendingRows,
+            ];
+        }
+
+        // DRAIN_WRITE_FAILING — PG reachable, rejecting the writes. SQLSTATE-keyed
+        // advice (42P01 → migrate, 42501 → grant, 22xxx/23xxx → bad row). The raw
+        // libpq message is never carried here — only SQLSTATE + table.
+        if ($writeFailing) {
+            [$message, $recommendation] = $this->drainWriteAdvice(
+                $this->lastDrainErrorSqlstate ?? '',
+                $this->lastDrainErrorTable ?? 'a NightOwl table',
+            );
+            $diagnoses[] = [
+                'code' => 'DRAIN_WRITE_FAILING',
+                'level' => 'critical',
+                'message' => $message,
+                'recommendation' => $recommendation,
+                'value' => $pendingRows,
+            ];
+        }
+
+        // DRAIN_QUARANTINE — rows the database rejected were isolated and dropped
+        // (data loss). Cumulative since worker start, so it stays visible after the
+        // fact rather than flickering. Templated: SQLSTATE + table only, no values.
+        if ($this->drainQuarantinedTotal > 0) {
+            $sqlstate = $this->lastQuarantineSqlstate ?? '';
+            $on = $this->lastQuarantineTable ? ' on '.$this->lastQuarantineTable : '';
+            $diagnoses[] = [
+                'code' => 'DRAIN_QUARANTINE',
+                'level' => 'critical',
+                'message' => sprintf('%d telemetry payload(s) were rejected by your database and quarantined (dropped).', $this->drainQuarantinedTotal),
+                'recommendation' => sprintf('A payload failed a column rule (SQLSTATE %s%s) and was set aside so the rest of the stream could drain. Check the agent log for the offending payloads; if many were dropped, a column/schema mismatch is likely.', $sqlstate !== '' ? $sqlstate : 'data error', $on),
+                'value' => $this->drainQuarantinedTotal,
             ];
         }
 
@@ -412,9 +506,11 @@ final class MetricsCollector
             ];
         }
 
-        // DRAIN_ERRORS
-        $totalBatches = $this->drainTotal > 0 ? ($this->drainTotal / max(1, 1000)) : 0; // rough batch estimate
-        if ($this->drainBatchesFailed > 0 && $totalBatches > 0) {
+        // DRAIN_ERRORS — un-gated from drainTotal>0 so a first-batch failure (fresh
+        // app whose schema isn't migrated yet) still warns instead of staying
+        // silent. Suppressed when the more specific DRAIN_WRITE_FAILING is firing.
+        $totalBatches = $this->drainTotal > 0 ? ($this->drainTotal / 1000) : 0; // rough batch estimate
+        if ($this->drainBatchesFailed > 0 && ! $writeFailing) {
             $failRate = ($this->drainBatchesFailed / ($this->drainBatchesFailed + $totalBatches)) * 100;
             if ($failRate > self::DRAIN_ERROR_RATE_PCT) {
                 $diagnoses[] = [
@@ -713,6 +809,49 @@ final class MetricsCollector
             'resolved_diagnoses' => $this->getResolvedDiagnoses(),
             'reported_at' => gmdate('Y-m-d\TH:i:s\Z'),
         ];
+    }
+
+    /**
+     * Operator-facing message + recommendation for a rejected drain write, keyed
+     * by SQLSTATE. Deliberately templated: it never includes the raw libpq text,
+     * which can echo customer row values (privacy) and would blow the platform's
+     * 1KB diagnosis-message cap.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private function drainWriteAdvice(string $sqlstate, string $table): array
+    {
+        return match ($sqlstate) {
+            '42P01' => [
+                'NightOwl tables are missing on your database.',
+                'Run `php artisan nightowl:migrate` on the monitored app to create the nightowl_* schema, then restart the agent.',
+            ],
+            '42501' => [
+                'The database role cannot write to the NightOwl tables.',
+                'Grant INSERT on the nightowl_* tables to the role the agent uses (NIGHTOWL_DB_USERNAME).',
+            ],
+            '28P01', '28000' => [
+                'The database rejected the agent credentials.',
+                'Check NIGHTOWL_DB_USERNAME and NIGHTOWL_DB_PASSWORD on the monitored app.',
+            ],
+            '3D000' => [
+                'The configured database does not exist.',
+                'Check NIGHTOWL_DB_DATABASE points at an existing database.',
+            ],
+            '53300' => [
+                'PostgreSQL has no free connection slots for the agent.',
+                'Lower NIGHTOWL_DRAIN_WORKERS or raise the database max_connections.',
+            ],
+            default => (str_starts_with($sqlstate, '22') || str_starts_with($sqlstate, '23'))
+                ? [
+                    sprintf('A telemetry row was rejected by your database (SQLSTATE %s on %s).', $sqlstate, $table),
+                    'A record failed a column rule (e.g. value too long or wrong type). Check the agent log for the offending row.',
+                ]
+                : [
+                    sprintf('Drain writes are failing (SQLSTATE %s on %s).', $sqlstate !== '' ? $sqlstate : 'unknown', $table),
+                    'PostgreSQL is reachable but rejecting writes. Check the agent log for details.',
+                ],
+        };
     }
 
     /**

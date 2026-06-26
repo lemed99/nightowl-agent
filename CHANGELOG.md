@@ -5,6 +5,37 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.4] - 2026-06-26
+
+### Added
+
+- **Actionable drain-failure diagnosis (`DRAIN_WRITE_FAILING`).** When PostgreSQL
+  is reachable but rejecting the agent's writes — the schema isn't migrated
+  (`42P01`), the role can't INSERT (`42501`), credentials/database are wrong
+  (`28P01`/`3D000`), or it's out of connection slots (`53300`) — the health
+  report now names the exact cause and the fix ("Run `php artisan
+  nightowl:migrate`", "Grant INSERT…") instead of the misleading "Postgres may
+  be unreachable". Only the SQLSTATE + table name leave the customer's box; the
+  raw libpq message (which can echo row values) stays in the local log.
+- **Opt-in poison-row isolation (`NIGHTOWL_DRAIN_QUARANTINE`, default off).** A
+  batch that one bad row would reject (e.g. an over-long value or a type
+  mismatch) is bisected to set that single payload aside in a SQLite dead-letter
+  so the rest of the stream keeps draining, instead of the whole drain
+  head-of-line blocking. A systematic-mismatch circuit breaker stops it from
+  silently dropping a whole stream (it surfaces `DRAIN_WRITE_FAILING` instead),
+  transient errors (deadlock/lock) are retried rather than dropped, and set-aside
+  payloads are reported via a new `DRAIN_QUARANTINE` diagnosis. Dead-lettered
+  rows are pruned after a bounded retention (1 day).
+
+### Changed
+
+- **`DRAIN_STOPPED` no longer blames connectivity when the drain is connected but
+  rejecting writes** — it defers to the more specific `DRAIN_WRITE_FAILING`, and
+  the batch-failure warning is no longer silenced on a brand-new app whose first
+  batch fails.
+- **Drain-metrics encoding hardened** against a non-UTF-8 byte in a database
+  error message (could previously crash the forked drain worker).
+
 ## [1.2.3] - 2026-06-22
 
 ### Added
