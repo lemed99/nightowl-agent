@@ -103,12 +103,13 @@ class NightOwlAgentServiceProvider extends ServiceProvider
 
             $core = $this->app->make(Core::class);
 
+            $nightowlHost = config('nightowl.agent.host', '127.0.0.1');
             $nightowlPort = (int) config('nightowl.agent.port', 2407);
             $nightowlToken = (string) config('nightowl.agent.token', config('nightwatch.token', ''));
             $tokenHash = substr(hash('xxh128', $nightowlToken), 0, 7);
 
             $nightowlIngest = new Ingest(
-                transmitTo: "127.0.0.1:{$nightowlPort}",
+                transmitTo: "{$nightowlHost}:{$nightowlPort}",
                 connectionTimeout: 0.5,
                 timeout: 0.5,
                 streamFactory: new SocketStreamFactory,
