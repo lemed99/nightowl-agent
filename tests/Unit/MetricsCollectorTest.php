@@ -88,6 +88,7 @@ class MetricsCollectorTest extends TestCase
             'last_write_table' => null,
             'last_write_at' => 0.0,
             'last_write_ok_at' => 0.0,
+            'last_conn_fail_at' => 0.0,
         ], $fields)));
 
         $this->collector->readDrainMetrics($base, 1);
@@ -131,6 +132,211 @@ class MetricsCollectorTest extends TestCase
         $this->assertStringContainsString('nightowl:migrate', $d['recommendation']);
     }
 
+    public function testDrainErrorsCoversFreshAppConnectivityFailureWithSmallBacklog(): void
+    {
+        // Regression guard: a fresh app (no successful drain yet, drainTotal==0) whose
+        // drain fails for a CONNECTIVITY reason (no write-rejection signal) with a SMALL
+        // backlog (pendingRows<=100, below DRAIN_STOPPED's >100 guard) must still surface
+        // a diagnosis. DRAIN_ERRORS is its only cover — gating it on drainTotal>0 made the
+        // agent falsely report healthy/score=100 while totally unable to drain.
+        // Reverting the gate to `&& $this->drainTotal > 0` fails this test.
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'rows_drained' => 0,   // never drained successfully (drainTotal == 0)
+            'batches_failed' => 5, // batches are failing
+            // no last_write_at -> writeFailing stays false (connection-class failure)
+        ]);
+        $this->collector->runDiagnosis(false, 50, 0, 0); // small backlog
+        $this->collector->runDiagnosis(false, 50, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 50, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertContains('DRAIN_ERRORS', $codes);
+        $this->assertNotContains('DRAIN_STOPPED', $codes);       // backlog too small
+        $this->assertNotContains('DRAIN_WRITE_FAILING', $codes); // not a write-rejection
+    }
+
+    public function testDrainErrorsSuppressedWhenDrainStoppedAlreadyFiring(): void
+    {
+        // #6: when DRAIN_STOPPED owns the same root cause (a non-draining backlog),
+        // the generic DRAIN_ERRORS warning must not double-fire for it. Removing the
+        // `&& ! $drainStopped` guard (the original un-gated form) fails this test.
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'rows_drained' => 0,
+            'batches_failed' => 5,
+        ]);
+        $this->collector->runDiagnosis(false, 500, 0, 0); // large backlog + drainRate 0 -> DRAIN_STOPPED
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 500, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertContains('DRAIN_STOPPED', $codes);
+        $this->assertNotContains('DRAIN_ERRORS', $codes);
+    }
+
+    public function testDrainUnreachableFiresForEstablishedAppConnectivityStall(): void
+    {
+        // The headline Phase-3 bug: an ESTABLISHED, high-volume worker (large lifetime
+        // drainTotal) that loses PG CONNECTIVITY with a small backlog. DRAIN_STOPPED is
+        // skipped (pendingRows<=100), DRAIN_WRITE_FAILING is skipped (no write-rejection),
+        // and DRAIN_ERRORS' failRate dilutes below threshold against lifetime volume — so
+        // before Phase 3 the agent reported HEALTHY (score 100) while unable to drain.
+        // Reverting Phase 3 (no DRAIN_UNREACHABLE) yields zero diagnoses → this fails.
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'rows_drained' => 10_000_000, // huge lifetime volume → dilutes failRate
+            'batches_failed' => 50,
+            'last_conn_fail_at' => $now,  // PG unreachable, fresh; no success since
+        ]);
+        $this->collector->runDiagnosis(false, 80, 0, 0); // small backlog
+        $this->collector->runDiagnosis(false, 80, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 80, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertContains('DRAIN_UNREACHABLE', $codes);
+        $this->assertSame('critical', $this->activeDiagnosis($status, 'DRAIN_UNREACHABLE')['level']);
+        $this->assertNotContains('DRAIN_STOPPED', $codes);
+        $this->assertNotContains('DRAIN_WRITE_FAILING', $codes);
+        $this->assertNotContains('DRAIN_ERRORS', $codes);
+    }
+
+    public function testDrainUnreachableClearsWriteFailingLatch(): void
+    {
+        // #7: a prior non-connection rejection (42P01 "run migrate") must NOT latch
+        // DRAIN_WRITE_FAILING through a later full DB-down outage — a newer connection
+        // failure flips the diagnosis to DRAIN_UNREACHABLE. Reverting the latch-clear
+        // term (lastDrainErrorAt >= lastConnFailAt) leaves DRAIN_WRITE_FAILING firing.
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'last_write_sqlstate' => '42P01',
+            'last_write_table' => 'nightowl_requests',
+            'last_write_at' => $now - 1,  // earlier write-rejection
+            'last_conn_fail_at' => $now,  // newer connection outage
+        ]);
+        $this->collector->runDiagnosis(false, 200, 0, 0);
+        $this->collector->runDiagnosis(false, 200, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 200, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertContains('DRAIN_UNREACHABLE', $codes);
+        $this->assertNotContains('DRAIN_WRITE_FAILING', $codes); // latch cleared
+    }
+
+    public function testDrainUnreachableDoesNotFireAfterRecovery(): void
+    {
+        // False-positive guard: a connection failure followed by a SUCCESSFUL drain
+        // means the DB is reachable again — no alarm.
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'rows_drained' => 1000,
+            'last_conn_fail_at' => $now - 2,
+            'last_write_ok_at' => $now - 1, // drained OK AFTER the blip
+        ]);
+        $this->collector->runDiagnosis(false, 80, 0, 0);
+        $this->collector->runDiagnosis(false, 80, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 80, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertNotContains('DRAIN_UNREACHABLE', $codes);
+    }
+
+    public function testDrainUnreachableDecaysWhenConnectionFailureGoesStale(): void
+    {
+        // False-positive guard / no-latch: a connection failure older than the stale
+        // window no longer fires — the worker re-stamps lastConnFailAt every failed
+        // batch, so a stale value means it isn't actively failing to connect right now.
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'last_conn_fail_at' => $now - 60, // older than DRAIN_CONN_FAIL_FRESH_SECONDS (45)
+        ]);
+        $this->collector->runDiagnosis(false, 80, 0, 0);
+        $this->collector->runDiagnosis(false, 80, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 80, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertNotContains('DRAIN_UNREACHABLE', $codes);
+    }
+
+    public function testDrainUnreachableStaysFreshPastTheResolveWindow(): void
+    {
+        // The connection-failure freshness window must exceed the resolve window
+        // (MIN_TICKS_FOR_RESOLVE × tick ≈ 30s) so a reported critical can dispatch an
+        // all-clear. A 30s-old failure (beyond the OLD 15s window) must still fire —
+        // reverting DRAIN_CONN_FAIL_FRESH_SECONDS to 15 makes this absent.
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'last_conn_fail_at' => $now - 30, // within 45s, beyond the old 15s
+        ]);
+        $this->collector->runDiagnosis(false, 80, 0, 0);
+        $this->collector->runDiagnosis(false, 80, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 80, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertContains('DRAIN_UNREACHABLE', $codes);
+    }
+
+    public function testWriteFailingWinsWhenRejectionIsNewerThanConnectionFailure(): void
+    {
+        // Mutual exclusion (the reverse of the latch-clear): a write-rejection that
+        // POST-DATES a connection blip is the current cause — only DRAIN_WRITE_FAILING
+        // fires, never a contradictory DRAIN_UNREACHABLE alongside it.
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'last_conn_fail_at' => $now - 1, // earlier connection blip
+            'last_write_sqlstate' => '42P01',
+            'last_write_table' => 'nightowl_requests',
+            'last_write_at' => $now,         // newer write-rejection
+        ]);
+        $this->collector->runDiagnosis(false, 200, 0, 0);
+        $this->collector->runDiagnosis(false, 200, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 200, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertContains('DRAIN_WRITE_FAILING', $codes);
+        $this->assertNotContains('DRAIN_UNREACHABLE', $codes);
+    }
+
     public function testDrainWriteFailingTemplatesDataErrorWithoutRawRowValue(): void
     {
         for ($i = 0; $i < 60; $i++) {
@@ -157,16 +363,21 @@ class MetricsCollectorTest extends TestCase
         $this->assertStringContainsString('rejected by your database', $d['message']);
     }
 
-    public function testDrainQuarantineDiagnosisFiresFromLiveCount(): void
+    public function testDrainQuarantineDiagnosisFiresFromCumulativeTotalNotPrunableLiveCount(): void
     {
         for ($i = 0; $i < 60; $i++) {
             $this->collector->tick();
         }
         $now = microtime(true);
 
-        // 3 payloads currently dead-lettered in the buffer (durable live count).
+        // 3 payloads dropped (cumulative), but the live dead-letter count is already
+        // 0 — i.e. pruneQuarantined() has cleared the retention window. The diagnosis
+        // MUST still fire off the cumulative total: a dropped row is permanent data
+        // loss, so the critical can't silently clear once the buffer rows age out.
+        // (Before F7 the diagnosis rode quarantined_live and would vanish here.)
         $this->loadDrainMetrics([
-            'quarantined_live' => 3,
+            'quarantined_live' => 0,
+            'quarantined_total' => 3,
             'last_quarantine_sqlstate' => '22001',
             'last_quarantine_table' => 'nightowl_requests',
             'last_quarantine_at' => $now,

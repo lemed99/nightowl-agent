@@ -51,8 +51,8 @@ final class DrainWorker
     // privilege / wrong db). Only SQLSTATE + table — never the raw libpq message,
     // which can echo customer row values. Surfaced as the DRAIN_WRITE_FAILING
     // diagnosis so a stuck drain shows the real cause instead of the misleading
-    // "Postgres may be unreachable". Connection failures are excluded — those are
-    // handled by reconnect/DRAIN_STOPPED.
+    // "Postgres may be unreachable". Connection failures are tracked separately in
+    // lastConnFailAt (DRAIN_UNREACHABLE), not folded in here.
     private ?string $lastWriteSqlstate = null;
 
     private ?string $lastWriteTable = null;
@@ -60,6 +60,11 @@ final class DrainWorker
     private float $lastWriteAt = 0.0;
 
     private float $lastWriteOkAt = 0.0;
+
+    // Most recent PG CONNECTION failure (unreachable / refused / connect-time throw),
+    // as opposed to a write rejection (lastWriteAt) or a local buffer error. Drives the
+    // DRAIN_UNREACHABLE diagnosis and clears the write-rejection latch when newer.
+    private float $lastConnFailAt = 0.0;
 
     // Poison-payload quarantine (Phase 2). Cumulative since worker start — a
     // dropped telemetry row is data loss, so the DRAIN_QUARANTINE diagnosis stays
@@ -72,11 +77,17 @@ final class DrainWorker
 
     private float $lastQuarantineAt = 0.0;
 
-    // Consecutive quarantines with no intervening successful drain (systematic-poison
-    // circuit breaker). Live count of dead-lettered rows in the buffer (durable
-    // across restart — drives the DRAIN_QUARANTINE diagnosis).
-    private int $consecutiveQuarantines = 0;
+    // Per-table consecutive-quarantine counters for the systematic-poison circuit
+    // breaker: physical table name => quarantines of THAT table with no intervening
+    // successful write of it. Keyed per-table so a real per-table schema mismatch
+    // (e.g. an unmigrated NOT-NULL column on nightowl_requests) trips the breaker
+    // even while other tables keep draining — and so sparse poison on a table that
+    // otherwise drains fine never trips it. See isolateSinglePayload / onDrainSuccess.
+    /** @var array<string, int> */
+    private array $consecutiveQuarantines = [];
 
+    // Live count of dead-lettered rows in the buffer (durable across restart),
+    // shipped as quarantined_live for observability.
     private int $quarantinedLive = 0;
 
     private const EWMA_ALPHA = 0.3;
@@ -180,9 +191,13 @@ final class DrainWorker
             if (time() - $lastCleanup >= $this->checkpointIntervalSeconds) {
                 try {
                     $buffer->cleanup(300);
-                    if ($this->quarantineEnabled) {
-                        $buffer->pruneQuarantined($this->quarantineRetentionSeconds);
-                    }
+                    // Prune dead-letter rows regardless of whether quarantine is
+                    // currently enabled. Rows dead-lettered while it was on must still
+                    // be reclaimed after the retention window if the flag is later
+                    // turned off — otherwise they are orphaned forever (never
+                    // re-drained: fetchPending selects synced=0; never cleaned:
+                    // cleanup targets synced=1). A no-op when no synced=-1 rows exist.
+                    $buffer->pruneQuarantined($this->quarantineRetentionSeconds);
                     $this->checkpointWithEscalation($buffer);
                 } catch (\Throwable $e) {
                     error_log("[NightOwl Drain] Cleanup error: {$e->getMessage()}");
@@ -311,6 +326,12 @@ final class DrainWorker
      */
     private function drainBatch(SqliteBuffer $buffer, RecordWriter $writer): bool
     {
+        // Clear any prior batch's write error so a failure BEFORE write() runs
+        // (claimBatch/fetchPending under SQLite lock contention, disk-full) isn't
+        // misattributed to the previous batch's stale Postgres SQLSTATE. write()
+        // re-clears this on entry, so this only matters for pre-write throws.
+        $writer->lastWriteError = null;
+
         try {
             $rows = $this->totalWorkers > 1
                 ? $buffer->claimBatch($this->workerId, $this->batchSize)
@@ -383,15 +404,21 @@ final class DrainWorker
             $this->batchesFailed++;
             error_log("[NightOwl Drain] Error: {$e->getMessage()}");
 
-            // Capture the SQLSTATE + table for the health report, but only for
-            // NON-connection failures (PG reachable, rejecting the write). True
-            // connection failures are handled by reconnect + DRAIN_STOPPED; folding
-            // them in here would mislabel "unreachable" as "rejecting writes".
+            // Classify the failure for the health report:
+            //  - non-connection write rejection (PG reachable, refusing): capture
+            //    SQLSTATE + table → DRAIN_WRITE_FAILING.
+            //  - PG connection failure (unreachable / refused / connect-time throw,
+            //    surfaced as connection=true by write()): stamp the connection clock →
+            //    DRAIN_UNREACHABLE, independent of backlog size / lifetime drain volume.
+            //  - null $err: a local buffer error (SQLite claim/fetch) — NOT a PG problem,
+            //    so it stamps neither clock.
             $err = $writer->lastWriteError;
             if (is_array($err) && empty($err['connection'])) {
                 $this->lastWriteSqlstate = is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : null;
                 $this->lastWriteTable = is_string($err['table'] ?? null) ? $err['table'] : null;
                 $this->lastWriteAt = microtime(true);
+            } elseif (is_array($err) && ! empty($err['connection'])) {
+                $this->lastConnFailAt = microtime(true);
             }
 
             return false;
@@ -430,10 +457,6 @@ final class DrainWorker
 
         try {
             $writer->write($records);
-            $buffer->markSynced($ids);
-            $this->onDrainSuccess($writer);
-
-            return ['drained' => count($units), 'quarantined' => 0, 'deferred' => 0];
         } catch (\Throwable $e) {
             // Connection / whole-target failures hit every payload equally — abort
             // isolation and retry the whole batch (surfaces DRAIN_WRITE_FAILING).
@@ -441,6 +464,18 @@ final class DrainWorker
                 throw $e;
             }
 
+            // Transient failures (serialization 40001, deadlock 40P01, lock 55xxx)
+            // abort the whole COPY transaction, not one payload — defer the entire
+            // batch for the next loop instead of recursively bisecting to the leaf.
+            // Bisection would re-attempt ~2N-1 doomed writes (plus N leaf
+            // force-inserts) before every singleton simply defers anyway: pure
+            // wasted load with no progress, every loop the condition persists. The
+            // leaf-level isTransientFailure check remains as a backstop.
+            if ($this->isTransientFailure($writer->lastWriteError)) {
+                return ['drained' => 0, 'quarantined' => 0, 'deferred' => count($units)];
+            }
+
+            // Deterministic per-row rejection — bisect to isolate the poison payload.
             if (count($units) > 1) {
                 $mid = intdiv(count($units), 2);
                 $left = $this->drainUnits($buffer, $writer, array_slice($units, 0, $mid));
@@ -455,6 +490,22 @@ final class DrainWorker
 
             return $this->isolateSinglePayload($buffer, $writer, $units[0]);
         }
+
+        // write() committed to Postgres. markSynced() is a local SQLite UPDATE; a
+        // failure here (SQLITE_BUSY past busy_timeout, disk-full, I/O) is NOT a
+        // payload rejection — the rows are already durably committed. The old code
+        // wrapped markSynced() in the same try, so a post-commit SQLite fault left
+        // lastWriteError === null, isWholeTargetFailure(null) returned false, and the
+        // batch bisected — re-COPYing committed rows (duplicate telemetry +
+        // double-counted additive rollups). Keeping markSynced() outside the
+        // write() try lets the fault propagate to drainBatch's catch, which sees
+        // lastWriteError === null and records it as a local buffer error (no PG
+        // diagnosis); the unmarked rows re-drain next loop — the documented
+        // at-most-one-batch-duplicate crash-safety tradeoff, never a bisection storm.
+        $buffer->markSynced($ids);
+        $this->onDrainSuccess($writer);
+
+        return ['drained' => count($units), 'quarantined' => 0, 'deferred' => 0];
     }
 
     /**
@@ -491,17 +542,20 @@ final class DrainWorker
             if ($this->isTransientFailure($err)) {
                 return ['drained' => 0, 'quarantined' => 0, 'deferred' => 1];
             }
-            if ($this->consecutiveQuarantines >= $this->quarantineBreakerThreshold) {
-                // Systematic, not per-row — stop dropping the stream; surface it.
+            $table = is_array($err) && is_string($err['table'] ?? null) ? $err['table'] : '?';
+            if (($this->consecutiveQuarantines[$table] ?? 0) >= $this->quarantineBreakerThreshold) {
+                // Systematic for THIS table — every payload touching it rejects with no
+                // successful write of it in between — not per-row poison. Stop dropping
+                // the stream; re-throw to head-of-line block and surface DRAIN_WRITE_FAILING.
                 throw $e;
             }
 
             $sqlstate = is_array($err) && is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : null;
             $buffer->quarantine($ids);
             $this->quarantinedTotal++;
-            $this->consecutiveQuarantines++;
+            $this->consecutiveQuarantines[$table] = ($this->consecutiveQuarantines[$table] ?? 0) + 1;
             $this->lastQuarantineSqlstate = $sqlstate;
-            $this->lastQuarantineTable = is_array($err) && is_string($err['table'] ?? null) ? $err['table'] : null;
+            $this->lastQuarantineTable = $table === '?' ? null : $table;
             $this->lastQuarantineAt = microtime(true);
             error_log(sprintf(
                 '[NightOwl Drain] Quarantined poison payload id=%d (SQLSTATE %s on %s)',
@@ -514,11 +568,20 @@ final class DrainWorker
         }
     }
 
-    /** A successful write: record progress and reset the systematic-poison breaker. */
+    /**
+     * A successful write: record drain progress and roll up app vitals. Clears the
+     * systematic-poison breaker streak for every table this write actually landed —
+     * a table that just drained is not systematically broken. Tables NOT written
+     * here (the one whose poison is being isolated) keep their streak, so a genuine
+     * per-table schema mismatch still climbs to the threshold even while bisection
+     * drains clean siblings of other tables (the bug the old blanket reset caused).
+     */
     private function onDrainSuccess(RecordWriter $writer): void
     {
         $this->lastWriteOkAt = microtime(true);
-        $this->consecutiveQuarantines = 0;
+        foreach ($writer->lastWrittenTables as $table) {
+            unset($this->consecutiveQuarantines[$table]);
+        }
         $this->cumRequests += $writer->lastRequestCount;
         $this->cum5xx += $writer->last5xxCount;
         $this->cumExceptions += $writer->lastExceptionCount;
@@ -603,7 +666,13 @@ final class DrainWorker
             'last_write_table' => $this->lastWriteTable,
             'last_write_at' => $this->lastWriteAt,
             'last_write_ok_at' => $this->lastWriteOkAt,
+            'last_conn_fail_at' => $this->lastConnFailAt,
             'quarantined_live' => $this->quarantinedLive,
+            // Cumulative since worker start (never decays). The DRAIN_QUARANTINE
+            // diagnosis reads THIS, not quarantined_live (the prunable buffer gauge
+            // that pruneQuarantined() resets to 0 after the retention window — which
+            // would silently clear a critical that dropped real telemetry).
+            'quarantined_total' => $this->quarantinedTotal,
             'last_quarantine_sqlstate' => $this->lastQuarantineSqlstate,
             'last_quarantine_table' => $this->lastQuarantineTable,
             'last_quarantine_at' => $this->lastQuarantineAt,

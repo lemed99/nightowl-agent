@@ -23,7 +23,7 @@
 
 require_once __DIR__ . '/../../vendor/autoload.php';
 
-use NightOwl\Tests\Simulator\NightwatchSimulator;
+use NightOwl\Simulator\NightwatchSimulator;
 
 // ─── Parse arguments ───────────────────────────────────────
 

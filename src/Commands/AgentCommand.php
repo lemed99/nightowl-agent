@@ -5,6 +5,7 @@ namespace NightOwl\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Schema;
 use NightOwl\Agent\AsyncServer;
+use NightOwl\Agent\PortInUseException;
 use NightOwl\Agent\Server;
 
 class AgentCommand extends Command
@@ -133,7 +134,14 @@ class AgentCommand extends Command
 
         $this->line('Press Ctrl+C to stop.');
 
-        $server->listen($host, $port);
+        try {
+            $server->listen($host, $port);
+        } catch (PortInUseException $e) {
+            $this->newLine();
+            $this->error($e->getMessage());
+
+            return self::FAILURE;
+        }
 
         $this->info('NightOwl agent stopped.');
 

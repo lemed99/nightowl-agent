@@ -2,23 +2,27 @@
 
 namespace NightOwl\Tests\Unit;
 
+use NightOwl\Simulator\NightwatchSimulator;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Drift detector for tests/Simulator/fixtures/*.jsonl.
- *
- * For each Nightwatch sensor, this test extracts every wire-format key from
- * the sensor's return-array literal and asserts the matching fixture file
- * carries the same key on every row. If laravel/nightwatch ships a new
- * field, this test fails — at which point the fixture must be updated
- * (re-capture from a real app) before the simulator can claim parity.
+ * Drift detector for the simulator fixtures (now in the separate
+ * nightowl/agent-simulator package). For each Nightwatch sensor it extracts every
+ * wire-format key from the sensor's return-array literal and asserts the matching
+ * fixture row carries it; a new laravel/nightwatch field fails this until the
+ * fixture is re-captured. Kept in the agent suite (tests aren't shipped) because
+ * the agent's own Integration tests drive the pipeline through these fixtures.
  */
 class SimulatorFixturesTest extends TestCase
 {
     private const SENSOR_DIR = __DIR__.'/../../vendor/laravel/nightwatch/src/Sensors';
 
-    private const FIXTURE_DIR = __DIR__.'/../Simulator/fixtures';
+    /** Fixtures live in the simulator package — resolve from the engine's own dir. */
+    private static function fixtureDir(): string
+    {
+        return dirname((new \ReflectionClass(NightwatchSimulator::class))->getFileName()).'/fixtures';
+    }
 
     /** @return array<string, array{string, string}> */
     public static function sensorMap(): array
@@ -44,7 +48,7 @@ class SimulatorFixturesTest extends TestCase
     public function test_fixture_has_every_field_the_sensor_emits(string $sensorFile, string $type): void
     {
         $sensorPath = self::SENSOR_DIR.'/'.$sensorFile;
-        $fixturePath = self::FIXTURE_DIR.'/'.$type.'.jsonl';
+        $fixturePath = self::fixtureDir().'/'.$type.'.jsonl';
 
         if (! is_file($sensorPath)) {
             $this->markTestSkipped("Sensor not found: {$sensorPath} (laravel/nightwatch may have moved it)");

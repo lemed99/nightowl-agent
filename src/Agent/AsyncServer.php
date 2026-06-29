@@ -88,9 +88,30 @@ final class AsyncServer
         // The kernel distributes incoming connections across all listeners.
         // This is how you scale beyond one core: run N agent instances on
         // the same port, each with its own SQLite buffer file.
-        $this->server = new TcpServer("{$host}:{$port}", $this->loop, [
-            'so_reuseport' => true,
-        ]);
+        try {
+            $this->server = new TcpServer("{$host}:{$port}", $this->loop, [
+                'so_reuseport' => true,
+            ]);
+        } catch (RuntimeException $e) {
+            $message = strtolower($e->getMessage());
+            if (str_contains($message, 'address already in use') || str_contains($message, 'eaddrinuse')) {
+                $hint = $port === 2407
+                    ? "Port 2407 is also Nightwatch's default ingest port — if the Nightwatch agent is running, NightOwl can't share it. "
+                    : '';
+
+                throw new PortInUseException(
+                    "Could not start the agent: {$host}:{$port} is already in use.\n\n"
+                    .$hint
+                    ."To run NightOwl alongside Nightwatch, set NIGHTOWL_AGENT_PORT to a free port (e.g. 2410) and enable parallel mode:\n"
+                    ."  https://docs.usenightowl.com/agent/running-alongside-nightwatch\n\n"
+                    ."Otherwise, stop whatever already holds {$host}:{$port} (often a second nightowl:agent process or a leftover daemon).",
+                    (int) $e->getCode(),
+                    $e
+                );
+            }
+
+            throw $e;
+        }
 
         // forkDrainWorker() closes any existing SQLite buffer before fork
         // and re-creates it after — ensuring the child never inherits an open

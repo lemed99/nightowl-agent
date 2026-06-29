@@ -15,7 +15,7 @@
 
 require_once __DIR__ . '/../../vendor/autoload.php';
 
-use NightOwl\Tests\Simulator\NightwatchSimulator;
+use NightOwl\Simulator\NightwatchSimulator;
 
 if (! function_exists('pcntl_fork')) {
     fwrite(STDERR, "Error: pcntl extension required for benchmark.\n");

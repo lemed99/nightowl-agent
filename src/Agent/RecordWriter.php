@@ -58,6 +58,20 @@ final class RecordWriter
     /** Table currently being written — fallback table name for INSERT/upsert failures. */
     private ?string $currentWriteTarget = null;
 
+    /**
+     * Physical tables landed by the most recent SUCCESSFUL doWrite() (set only
+     * after commit). The drain worker uses this to clear a table's systematic-poison
+     * breaker streak — a table that just drained is not systematically broken. Built
+     * from the actual write-target stamps so the names match lastWriteError['table']
+     * exactly (no type→table map to drift). See DrainWorker::onDrainSuccess.
+     *
+     * @var list<string>
+     */
+    public array $lastWrittenTables = [];
+
+    /** Tables stamped during the in-flight doWrite(), promoted to lastWrittenTables on commit. */
+    private array $pendingWrittenTables = [];
+
     /** When true, copyBatch() routes the COPY tables through INSERT instead. */
     private bool $forceInsert = false;
 
@@ -157,10 +171,36 @@ final class RecordWriter
         try {
             $this->doWrite($records);
         } catch (\Throwable $e) {
-            // Check if this looks like a connection error — reconnect and retry once
-            if ($this->isConnectionError($e)) {
+            // Reconnect+retry only on a genuine connection failure. Prefer the
+            // structured classification already computed from the SQLSTATE
+            // (copyBatch / doWrite's catch both set lastWriteError['connection']
+            // off the captured code) over re-scanning $e — on the COPY path $e is a
+            // RuntimeException whose message echoes the offending customer row value,
+            // so isConnectionError($e) with no SQLSTATE falls through to the raw
+            // message scan and a row value containing "connection refused" (etc.)
+            // would force a needless reconnect + full-batch retry. lastWriteError is
+            // null only when pdo() threw at connect time (no row context — outside
+            // doWrite's try), where the message scan is the intended, safe fallback.
+            $isConnectionError = $this->lastWriteError !== null
+                ? ! empty($this->lastWriteError['connection'])
+                : $this->isConnectionError($e);
+            if ($isConnectionError) {
                 $this->reconnect();
-                $this->doWrite($records);
+                try {
+                    $this->doWrite($records);
+                } catch (\Throwable $retry) {
+                    // The reconnect+retry still failed. If it's STILL a connection error,
+                    // Postgres is unreachable — but a connect-time pdo() throw leaves
+                    // lastWriteError null (pdo() runs outside doWrite's try), which the
+                    // drain worker can't tell apart from a local SQLite buffer error (also
+                    // null). Stamp it as a connection failure so the worker can refresh its
+                    // connection-failure clock on every failed batch of a sustained outage.
+                    if ($this->lastWriteError === null && $this->isConnectionError($retry)) {
+                        $this->lastWriteError = ['sqlstate' => null, 'table' => null, 'connection' => true];
+                    }
+
+                    throw $retry;
+                }
             } else {
                 throw $e;
             }
@@ -231,6 +271,7 @@ final class RecordWriter
         // Clear last-error state; a null value after write() returns means success.
         $this->lastWriteError = null;
         $this->currentWriteTarget = null;
+        $this->pendingWrittenTables = [];
 
         $grouped = [];
         foreach ($records as $record) {
@@ -278,6 +319,9 @@ final class RecordWriter
             }
 
             $pdo->commit();
+            // All writes in this batch committed — publish the landed tables so the
+            // drain worker can clear those tables' poison-breaker streaks.
+            $this->lastWrittenTables = array_keys($this->pendingWrittenTables);
         } catch (\Throwable $e) {
             $this->notifier->clearPending(); // Discard — data was rolled back
             if ($pdo->inTransaction()) {
@@ -287,10 +331,11 @@ final class RecordWriter
             // INSERT/upsert failures (PDOException) are captured here, where the
             // failing table is known via currentWriteTarget.
             if ($this->lastWriteError === null) {
+                $sqlstate = $this->sqlStateOf($e);
                 $this->lastWriteError = [
-                    'sqlstate' => $this->sqlStateOf($e),
+                    'sqlstate' => $sqlstate,
                     'table' => $this->currentWriteTarget,
-                    'connection' => $this->isConnectionError($e),
+                    'connection' => $this->isConnectionError($e, $sqlstate),
                 ];
             }
             throw $e;
@@ -300,13 +345,80 @@ final class RecordWriter
         $this->notifier->flushNotifications($pdo);
     }
 
-    private function isConnectionError(\Throwable $e): bool
+    /**
+     * Stamp the table currently being written: the fallback name for an INSERT/upsert
+     * failure (currentWriteTarget) AND a member of the set promoted to lastWrittenTables
+     * on commit (used to clear the per-table poison breaker on success).
+     */
+    private function markWriteTarget(string $table): void
     {
+        $this->currentWriteTarget = $table;
+        $this->pendingWrittenTables[$table] = true;
+    }
+
+    /**
+     * Take a SHARED transaction-scoped advisory lock on a rollup table before the
+     * additive UPSERT, coordinating with nightowl:backfill-rollups (which takes the
+     * EXCLUSIVE lock around its DELETE-then-recompute). Without it, a backfill whose
+     * recompute snapshot straddles this drain's commit overwrites the drain's just-
+     * committed rows with a stale (lower) count — a silent rollup undercount. With it
+     * the two serialize and COMMUTE: whichever commits first, the other sees/adds the
+     * full set (the UPSERT is additive; the backfill recompute reads committed raw).
+     * Shared, so concurrent drain workers never block each other — only an active
+     * backfill on the SAME table briefly blocks them. Released at commit/rollback.
+     *
+     * hashtext()'s int4 result implicitly widens to the bigint advisory-lock key
+     * (works on every supported Postgres). The key string must match the backfill's.
+     */
+    private function lockRollupForWriteShared(string $table): void
+    {
+        $stmt = $this->pdo()->prepare('SELECT pg_advisory_xact_lock_shared(hashtext(?))');
+        $stmt->execute(['nightowl_rollup:'.$table]);
+    }
+
+    private function isConnectionError(\Throwable $e, ?string $sqlstate = null): bool
+    {
+        // SQLSTATE is AUTHORITATIVE when present. Class 08 = "connection exception":
+        // libpq labels nearly every connect-phase failure 08006 — including wrong password
+        // (28P01), wrong dbname (3D000), pg_hba rejection — which only surface as their
+        // specific code once CONNECTED, so the most common first-run failure lands here.
+        // The caller passes the code explicitly on the COPY path, whose RuntimeException
+        // doesn't carry it (errorInfo lives on the discarded PDO handle).
+        $sqlstate ??= $this->sqlStateOf($e);
+        if (is_string($sqlstate) && str_starts_with($sqlstate, '08')) {
+            return true;
+        }
+        // Any OTHER definite SQLSTATE is a write/data/config error, NOT a connection
+        // failure — return false WITHOUT scanning the raw message. A write error's
+        // DETAIL/CONTEXT echoes the offending customer ROW VALUE, which for a monitoring
+        // agent storing other apps' telemetry routinely IS connection-error text
+        // ("could not connect to server", "Operation timed out"). Scanning it would
+        // misclassify a poison row as a connection failure → defer-forever instead of
+        // quarantine → head-of-line-block the whole drain. The classifier must NEVER
+        // depend on customer row content.
+        if (is_string($sqlstate) && $sqlstate !== '') {
+            return false;
+        }
+
+        // No SQLSTATE exposed: an OS-level connect failure (DNS / routing / timeout) or a
+        // libpq drop PDO didn't tag. There is no statement / row-value context at connect
+        // phase, so the message is safe to scan.
         $message = strtolower($e->getMessage());
         $prev = $e->getPrevious();
         $prevMessage = $prev ? strtolower($prev->getMessage()) : '';
 
-        $patterns = ['server closed', 'connection reset', 'broken pipe', 'gone away', 'no connection', 'connection refused', 'connection timed out', 'eof detected', 'ssl syscall', 'already an active transaction', 'ssl error'];
+        if (str_contains($message, 'sqlstate[08') || str_contains($prevMessage, 'sqlstate[08')) {
+            return true;
+        }
+
+        $patterns = [
+            'server closed', 'connection reset', 'broken pipe', 'gone away', 'no connection',
+            'connection refused', 'connection timed out', 'eof detected', 'ssl syscall',
+            'already an active transaction', 'ssl error',
+            'connection to server', 'could not connect to server', 'could not translate host name',
+            'name or service not known', 'no route to host', 'host is unreachable',
+            'operation timed out', 'timeout expired', 'could not receive data',
+        ];
         foreach ($patterns as $pattern) {
             if (str_contains($message, $pattern) || str_contains($prevMessage, $pattern)) {
                 return true;
@@ -353,7 +465,7 @@ final class RecordWriter
             return;
         }
 
-        $this->currentWriteTarget = $table;
+        $this->markWriteTarget($table);
 
         // Swoole/OpenSwoole's PDO-pgsql coroutine hook reimplements
         // pgsqlCopyFromArray() and busy-loops on COPY (100% CPU, never returns)
@@ -454,7 +566,10 @@ final class RecordWriter
             $this->lastWriteError = [
                 'sqlstate' => $sqlstate,
                 'table' => $table,
-                'connection' => $this->isConnectionError($exception),
+                // Pass the captured SQLSTATE — $exception is a RuntimeException whose
+                // message echoes customer row values; classifying off it would misread a
+                // poison row as a connection failure.
+                'connection' => $this->isConnectionError($exception, $sqlstate),
             ];
 
             throw $exception;
@@ -500,10 +615,10 @@ final class RecordWriter
 
     private function writeRequests(array $records): void
     {
-        // One clock per batch: written to created_at AND used for the rollup
-        // bucket so live drain and the read path bucket on the same value.
+        // created_at and the rollup bucket come from each event's OWN timestamp
+        // (eventCreatedAt/eventBucket), so the read path filters/buckets on event
+        // time; $nowTs is only the fallback clock for rows with no numeric timestamp.
         $nowTs = time();
-        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -561,7 +676,7 @@ final class RecordWriter
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
                 is_string($r['headers'] ?? null) ? $r['headers'] : json_encode($r['headers'] ?? null),
                 is_string($r['payload'] ?? null) ? $r['payload'] : json_encode($r['payload'] ?? null),
-                $now,
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
@@ -576,13 +691,11 @@ final class RecordWriter
 
     private function writeQueries(array $records): void
     {
-        // One clock for the whole batch: written to created_at AND used for the
-        // rollup bucket, so live drain and the read path (which filters on
-        // created_at) bucket on the identical value. created_at was previously
-        // left to the column's useCurrent() (DB insert time); setting it
-        // explicitly makes the agent clock authoritative — fine when NTP-synced.
+        // created_at and the rollup bucket come from each event's OWN timestamp
+        // (eventCreatedAt/eventBucket) — the same value the read path filters on —
+        // stamped in UTC. $nowTs is only the fallback for rows with no numeric
+        // timestamp (created_at was previously left to the column's useCurrent()).
         $nowTs = time();
-        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -611,7 +724,7 @@ final class RecordWriter
                 $r['duration'] ?? null,
                 $r['connection'] ?? null,
                 $r['connection_type'] ?? null,
-                $now,
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
@@ -652,25 +765,71 @@ final class RecordWriter
     }
 
     /**
+     * created_at for a telemetry row: the EVENT's own time (from its `timestamp`),
+     * so a backdated or delayed drain dates the row when the event happened — not
+     * when it drained. The read path filters/buckets on created_at, so this keeps
+     * time-range charts honest. Falls back to the batch clock for rows that carry no
+     * numeric timestamp.
+     */
+    // Plausible event-time window. A malformed payload (e.g. a millisecond-scaled or
+    // garbage timestamp) would otherwise stamp a row tens of thousands of years out —
+    // invisible to every filter/bucket AND rejected by Postgres (datetime overflow,
+    // 22008), which with quarantine off head-of-line-blocks the whole drain. Anything
+    // outside the window falls back to the drain clock.
+    private const EVENT_TS_MAX_PAST_SECONDS = 31622400; // ~366d, beyond any backfill/retention window
+
+    private const EVENT_TS_MAX_FUTURE_SECONDS = 86400;  // 1d of clock skew
+
+    /** The event's own epoch, range-guarded; falls back to the drain clock when absent
+     *  or implausible so a poison timestamp can never freeze the drain. */
+    private function eventEpoch(array $r, int $nowTs): int
+    {
+        $ts = $r['timestamp'] ?? null;
+        if (is_numeric($ts)) {
+            $ts = (int) $ts;
+            if ($ts >= $nowTs - self::EVENT_TS_MAX_PAST_SECONDS && $ts <= $nowTs + self::EVENT_TS_MAX_FUTURE_SECONDS) {
+                return $ts;
+            }
+        }
+
+        return $nowTs;
+    }
+
+    private function eventCreatedAt(array $r, int $nowTs): string
+    {
+        return gmdate('Y-m-d H:i:s', $this->eventEpoch($r, $nowTs));
+    }
+
+    /** The event's minute bucket (same clock as eventCreatedAt) for rollups. */
+    private function eventBucket(array $r, int $nowTs): string
+    {
+        return gmdate('Y-m-d H:i:s', intdiv($this->eventEpoch($r, $nowTs), 60) * 60);
+    }
+
+    /**
      * Generic, spec-driven rollup writer — the engine behind every non-query
      * rollup (requests/jobs/outgoing/cache). Groups the batch in PHP by the
-     * spec's group columns, accumulates call_count + additive counters + (when
-     * the spec carries duration) totals/min/max and histogram bins + first-seen
-     * representatives, then one additive UPSERT per group. Same transaction as
-     * the COPY (atomic with raw), same concurrency-safety as the query rollup.
+     * spec's group columns PLUS the event minute-bucket, accumulates call_count +
+     * additive counters + (when the spec carries duration) totals/min/max and
+     * histogram bins + first-seen representatives, then one additive UPSERT per
+     * (group, bucket). Same transaction as the COPY (atomic with raw), same
+     * concurrency-safety as the query rollup.
      */
     private function writeRollup(array $records, RollupSpec $spec, int $nowTs): void
     {
-        $this->currentWriteTarget = $spec->table;
-        $bucketStart = gmdate('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
+        $this->markWriteTarget($spec->table);
+        $this->lockRollupForWriteShared($spec->table);
         $histColumns = $spec->hasHistogram ? QueryHistogram::columns() : [];
         $counterCols = $spec->counterColumns();
         $repCols = $spec->representativeColumns();
 
         $groups = [];
         foreach ($records as $r) {
+            // Bucket on the event's own time (matching created_at), so a backdated or
+            // delayed drain lands in the correct minute instead of "now".
+            $bucket = $this->eventBucket($r, $nowTs);
             $groupVals = [];
-            $keyParts = [];
+            $keyParts = [$bucket];
             foreach ($spec->groupColumns as $col => $def) {
                 $value = (string) ($def['php'])($r);
                 $groupVals[$col] = $value;
@@ -681,6 +840,7 @@ final class RecordWriter
             if (! isset($groups[$key])) {
                 $groups[$key] = [
                     'group' => $groupVals,
+                    'bucket_start' => $bucket,
                     'call_count' => 0,
                     'counters' => array_fill_keys($counterCols, 0),
                     'total_duration' => 0,
@@ -697,7 +857,8 @@ final class RecordWriter
                     $groups[$key]['counters'][$cc]++;
                 }
             }
-            if ($spec->hasDuration) {
+            $durationOk = $spec->durationPredicate === null || ($spec->durationPredicate['php'])($r);
+            if ($spec->hasDuration && $durationOk) {
                 $duration = $r[$spec->durationField] ?? null;
                 if ($duration !== null) {
                     $duration = (int) $duration;
@@ -729,7 +890,7 @@ final class RecordWriter
 
         foreach ($groups as $g) {
             $params = $g['group'];
-            $params['bucket_start'] = $bucketStart;
+            $params['bucket_start'] = $g['bucket_start'];
             $params['environment'] = $this->environment;
             $params['call_count'] = $g['call_count'];
             foreach ($g['counters'] as $cc => $value) {
@@ -820,17 +981,18 @@ final class RecordWriter
      */
     private function writeQueryRollups(array $records, int $nowTs): void
     {
-        $this->currentWriteTarget = 'nightowl_query_rollups';
-        // Bucket on the SAME clock written to created_at, truncated to 60s.
-        $bucketStart = gmdate('Y-m-d H:i:s', intdiv($nowTs, 60) * 60);
-
+        $this->markWriteTarget('nightowl_query_rollups');
+        $this->lockRollupForWriteShared('nightowl_query_rollups');
+        // Bucket per-record on the event's own time (same clock as created_at), so a
+        // backdated/delayed drain spreads across the right minutes instead of "now".
         $histColumns = QueryHistogram::columns();
 
         $groups = [];
         foreach ($records as $r) {
+            $bucket = $this->eventBucket($r, $nowTs);
             $groupHash = (string) ($r['_group'] ?? '');
             $connection = (string) ($r['connection'] ?? ''); // '' sentinel (see migration)
-            $key = $groupHash."\0".$connection;
+            $key = $bucket."\0".$groupHash."\0".$connection;
 
             $duration = $r['duration'] ?? null;
             $duration = $duration === null ? null : (int) $duration;
@@ -839,6 +1001,7 @@ final class RecordWriter
                 $groups[$key] = [
                     'group_hash' => $groupHash,
                     'connection' => $connection,
+                    'bucket_start' => $bucket,
                     'call_count' => 0,
                     'total_duration' => 0,
                     'min_duration' => null,
@@ -871,7 +1034,7 @@ final class RecordWriter
         foreach ($groups as $g) {
             $params = [
                 'group_hash' => $g['group_hash'],
-                'bucket_start' => $bucketStart,
+                'bucket_start' => $g['bucket_start'],
                 'environment' => $this->environment,
                 'connection' => $g['connection'],
                 'call_count' => $g['call_count'],
@@ -928,7 +1091,7 @@ final class RecordWriter
 
     private function writeExceptions(array $records): void
     {
-        $this->currentWriteTarget = 'nightowl_exceptions';
+        $this->markWriteTarget('nightowl_exceptions');
         $stmt = $this->pdo()->prepare('INSERT INTO nightowl_exceptions (
             v, trace_id, timestamp, deploy, environment, server, group_hash,
             execution_source, execution_id, execution_stage, execution_preview, user_id,
@@ -946,7 +1109,7 @@ final class RecordWriter
         // PostgreSQL session timezone, so on a non-UTC tenant DB it stored local
         // wall-clock and the dashboard read it back as UTC (future-dated rows).
         // Matches writeRequests()/writeQueries().
-        $now = gmdate('Y-m-d H:i:s', time());
+        $nowTs = time();
 
         $issueGroups = [];
 
@@ -985,7 +1148,7 @@ final class RecordWriter
                 'laravel_version' => $r['laravel_version'] ?? null,
                 'handled' => filter_var($r['handled'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
                 'fingerprint' => $fingerprint,
-                'created_at' => $now,
+                'created_at' => $this->eventCreatedAt($r, $nowTs),
             ]);
 
             if (! isset($issueGroups[$groupKey])) {
@@ -1085,7 +1248,7 @@ final class RecordWriter
     {
         // Stamp created_at in UTC instead of leaning on the column's useCurrent()
         // default, which resolves in the tenant DB's session timezone. See writeExceptions().
-        $now = gmdate('Y-m-d H:i:s', time());
+        $nowTs = time();
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1108,7 +1271,7 @@ final class RecordWriter
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
                 $r['cache_events'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
-                $now,
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
@@ -1120,7 +1283,6 @@ final class RecordWriter
     private function writeJobs(array $records): void
     {
         $nowTs = time();
-        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1146,7 +1308,7 @@ final class RecordWriter
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
                 $r['cache_events'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
-                $now,
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
@@ -1162,7 +1324,6 @@ final class RecordWriter
     private function writeCacheEvents(array $records): void
     {
         $nowTs = time();
-        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1177,7 +1338,7 @@ final class RecordWriter
                 $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment, $r['server'] ?? null, $r['_group'] ?? null,
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['type'] ?? 'unknown', $r['key'] ?? '', $r['store'] ?? null, $r['ttl'] ?? null, $r['duration'] ?? null,
-                $now,
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
@@ -1194,7 +1355,7 @@ final class RecordWriter
     {
         // Stamp created_at in UTC instead of leaning on the column's useCurrent()
         // default, which resolves in the tenant DB's session timezone. See writeExceptions().
-        $now = gmdate('Y-m-d H:i:s', time());
+        $nowTs = time();
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1212,7 +1373,7 @@ final class RecordWriter
                 $r['cc'] ?? 0, $r['bcc'] ?? 0, $r['attachments'] ?? 0,
                 $r['subject'] ?? null, $r['class'] ?? $r['mailable'] ?? null, $r['duration'] ?? null,
                 ($r['failed'] ?? false) ? 't' : 'f', ($r['queued'] ?? false) ? 't' : 'f',
-                $now,
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
@@ -1225,7 +1386,7 @@ final class RecordWriter
     {
         // Stamp created_at in UTC instead of leaning on the column's useCurrent()
         // default, which resolves in the tenant DB's session timezone. See writeExceptions().
-        $now = gmdate('Y-m-d H:i:s', time());
+        $nowTs = time();
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1241,7 +1402,7 @@ final class RecordWriter
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['class'] ?? $r['notification'] ?? null, $r['channel'] ?? null, $r['notifiable_type'] ?? null, $r['notifiable_id'] ?? null,
                 $r['duration'] ?? null, ($r['failed'] ?? false) ? 't' : 'f', ($r['queued'] ?? false) ? 't' : 'f',
-                $now,
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
@@ -1253,7 +1414,6 @@ final class RecordWriter
     private function writeOutgoingRequests(array $records): void
     {
         $nowTs = time();
-        $now = gmdate('Y-m-d H:i:s', $nowTs);
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1270,7 +1430,7 @@ final class RecordWriter
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['host'] ?? null, $r['method'] ?? 'GET', $r['url'] ?? '', $r['status_code'] ?? null, $r['duration'] ?? null,
                 $r['request_size'] ?? null, $r['response_size'] ?? null, $r['request_headers'] ?? null,
-                $now,
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
@@ -1310,7 +1470,7 @@ final class RecordWriter
 
     private function writeUsers(array $records): void
     {
-        $this->currentWriteTarget = 'nightowl_users';
+        $this->markWriteTarget('nightowl_users');
         // created_at is set on first insert only (DO UPDATE leaves it untouched),
         // stamped in UTC rather than via the column's session-tz useCurrent() default.
         $stmt = $this->pdo()->prepare('
@@ -1348,7 +1508,7 @@ final class RecordWriter
     {
         // Stamp created_at in UTC instead of leaning on the column's useCurrent()
         // default, which resolves in the tenant DB's session timezone. See writeExceptions().
-        $now = gmdate('Y-m-d H:i:s', time());
+        $nowTs = time();
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
@@ -1375,7 +1535,7 @@ final class RecordWriter
                 $r['jobs_queued'] ?? 0, $r['mail'] ?? 0, $r['notifications'] ?? 0, $r['outgoing_requests'] ?? 0,
                 $r['cache_events'] ?? 0, $r['peak_memory_usage'] ?? 0, $r['exception_preview'] ?? null,
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
-                $now,
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 

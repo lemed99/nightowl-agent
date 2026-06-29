@@ -42,9 +42,16 @@
     },
     "minimum-stability": "stable",
     "prefer-stable": true,
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/lemed99/nightowl-agent-simulator"
+        }
+    ],
     "require-dev": {
         "laravel/boost": "^2.3",
         "mockery/mockery": "^1.6",
+        "nightowl/agent-simulator": "^0.1",
         "phpunit/phpunit": "^11.5"
     }
 }

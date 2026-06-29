@@ -17,7 +17,7 @@ require_once __DIR__ . '/../../vendor/autoload.php';
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
-use NightOwl\Tests\Simulator\NightwatchSimulator;
+use NightOwl\Simulator\NightwatchSimulator;
 
 if (! function_exists('pcntl_fork')) {
     fwrite(STDERR, "Error: pcntl extension required.\n");

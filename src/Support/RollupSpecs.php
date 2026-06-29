@@ -83,8 +83,11 @@ final class RollupSpecs
             counters: [
                 // total = attempts (a queued job has no attempt_id); duration/p95
                 // are over attempts only, so attempts_count is the avg denominator.
-                'attempts_count' => ['php' => static fn (array $r): bool => ! empty($r['attempt_id']), 'sql' => 'attempt_id IS NOT NULL'],
-                'queued_count' => ['php' => static fn (array $r): bool => empty($r['attempt_id']), 'sql' => 'attempt_id IS NULL'],
+                // NULL-check (not empty()) so PHP matches the SQL `IS [NOT] NULL` —
+                // empty() would also drop attempt_id '' / '0', diverging the live and
+                // backfill write paths for those (malformed) values.
+                'attempts_count' => ['php' => static fn (array $r): bool => ($r['attempt_id'] ?? null) !== null, 'sql' => 'attempt_id IS NOT NULL'],
+                'queued_count' => ['php' => static fn (array $r): bool => ($r['attempt_id'] ?? null) === null, 'sql' => 'attempt_id IS NULL'],
                 'processed_count' => ['php' => static fn (array $r): bool => ($r['status'] ?? '') === 'processed', 'sql' => "status = 'processed'"],
                 'released_count' => ['php' => static fn (array $r): bool => ($r['status'] ?? '') === 'released', 'sql' => "status = 'released'"],
                 'failed_count' => ['php' => static fn (array $r): bool => ($r['status'] ?? '') === 'failed', 'sql' => "status = 'failed'"],
@@ -95,6 +98,10 @@ final class RollupSpecs
             ],
             hasDuration: true,
             hasHistogram: true,
+            // Duration metrics over ATTEMPT rows only — a queued-job (dispatch) row's
+            // duration is enqueue overhead, not execution time, so folding it in drags
+            // min ~280x low and skews p95.
+            durationPredicate: ['php' => static fn (array $r): bool => ($r['attempt_id'] ?? null) !== null, 'sql' => 'attempt_id IS NOT NULL'],
         );
     }
 

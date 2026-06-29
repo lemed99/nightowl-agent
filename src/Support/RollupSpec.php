@@ -41,6 +41,15 @@ final class RollupSpec
         public bool $hasDuration,
         public bool $hasHistogram,
         public string $durationField = 'duration',
+        /**
+         * Optional {php: closure, sql: string} gating which rows contribute to the
+         * duration total/min/max + histogram. Jobs use it to count ATTEMPT rows only
+         * — a queued-job (dispatch) row carries enqueue overhead, not execution time,
+         * so folding it in drags min ~280x low and skews p95. null = all rows.
+         *
+         * @var array{php: callable, sql: string}|null
+         */
+        public ?array $durationPredicate = null,
     ) {}
 
     /** @return list<string> counter column names */
@@ -85,17 +94,21 @@ final class RollupSpec
             $selects[] = "SUM(CASE WHEN {$def['sql']} THEN 1 ELSE 0 END)";
         }
 
+        // Restrict duration + histogram to the predicate's rows (e.g. job attempts),
+        // matching the live drain — a Postgres FILTER on each aggregate.
+        $filter = $this->durationPredicate ? ' FILTER (WHERE '.$this->durationPredicate['sql'].')' : '';
+
         if ($this->hasDuration) {
             $columns = [...$columns, 'total_duration', 'min_duration', 'max_duration'];
-            $selects[] = 'COALESCE(SUM('.$this->durationField.'), 0)';
-            $selects[] = 'MIN('.$this->durationField.')';
-            $selects[] = 'MAX('.$this->durationField.')';
+            $selects[] = 'COALESCE(SUM('.$this->durationField.')'.$filter.', 0)';
+            $selects[] = 'MIN('.$this->durationField.')'.$filter;
+            $selects[] = 'MAX('.$this->durationField.')'.$filter;
         }
 
         if ($this->hasHistogram) {
             $columns = [...$columns, ...array_keys($histCase)];
             foreach ($histCase as $expr) {
-                $selects[] = $expr;
+                $selects[] = $expr.$filter;
             }
         }
 

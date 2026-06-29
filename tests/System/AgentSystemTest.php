@@ -3,7 +3,7 @@
 namespace NightOwl\Tests\System;
 
 use NightOwl\Tests\Integration\MigrationRunner;
-use NightOwl\Tests\Simulator\NightwatchSimulator;
+use NightOwl\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
 

@@ -5,7 +5,7 @@ namespace NightOwl\Tests\Integration;
 use NightOwl\Agent\ConnectionHandler;
 use NightOwl\Agent\PayloadParser;
 use NightOwl\Agent\RecordWriter;
-use NightOwl\Tests\Simulator\NightwatchSimulator;
+use NightOwl\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
 

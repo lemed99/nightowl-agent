@@ -5,7 +5,7 @@ namespace NightOwl\Tests\Integration;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\RecordWriter;
 use NightOwl\Agent\SqliteBuffer;
-use NightOwl\Tests\Simulator\NightwatchSimulator;
+use NightOwl\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use ReflectionMethod;

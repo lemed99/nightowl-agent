@@ -5,6 +5,64 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.5] - 2026-06-29
+
+### Added
+
+- **Telemetry is now dated by when the event happened, not when it drained.**
+  `created_at` and every per-minute rollup bucket are stamped from each row's own
+  event timestamp (range-guarded to a plausible window). After a PostgreSQL
+  outage the catch-up drain now lands rows in the minutes they actually occurred
+  instead of bunching them all at "now", so time-range charts stay honest across
+  a recovery.
+- **New `DRAIN_UNREACHABLE` diagnosis.** When the drain genuinely can't connect
+  to PostgreSQL (host/port/credentials/network/firewall), the health report says
+  so directly — distinct from `DRAIN_WRITE_FAILING` (PG reachable but rejecting
+  writes) and from a stuck/crashed worker. Telemetry keeps buffering and drains
+  automatically once the connection recovers.
+- **Friendly "port already in use" startup error.** If the agent can't bind its
+  ingest port it now prints a clear message with the fix — including the common
+  case where Nightwatch's own agent already holds the shared default port 2407
+  and how to run the two in parallel — instead of a raw stack trace.
+- **`nightowl:prune --hours`** for sub-day retention (overrides `--days`), and
+  all prune cutoffs are now computed in UTC to match the UTC-stamped `created_at`.
+- **Index on `nightowl_jobs.attempt_id`** (added by `nightowl:migrate`), so the
+  dashboard's parent-label / group-hash lookups for job-sourced rows stop running
+  as sequential scans on detail-list pages.
+
+### Changed
+
+- **Job duration metrics are computed over attempt rows only.** A queued-job
+  (dispatch) row carries enqueue overhead, not execution time; folding it into
+  the job rollup dragged the reported minimum ~280× low and skewed p95. The live
+  drain and the backfill now both restrict duration/histogram to attempts.
+- **`DRAIN_QUARANTINE` now reflects the cumulative count of dropped rows**, not
+  the prunable live buffer gauge (which decayed to zero after the retention
+  window, silently clearing a critical that had lost real telemetry). The
+  poison-row circuit breaker is now tracked per table, so a genuine per-table
+  schema mismatch trips it while unrelated tables keep draining.
+- **Connection-vs-write error classification is SQLSTATE-authoritative** and
+  never inspects raw libpq message text (which can echo a customer row value),
+  removing a class of misclassification where a poison row read as a connection
+  failure (or vice versa).
+- **The synthetic-traffic simulator moved to a separate dev-only package**
+  (`nightowl/agent-simulator`, `require-dev`) — it is never shipped to a customer
+  install.
+
+### Fixed
+
+- **No more duplicate telemetry / double-counted rollups after a post-commit
+  SQLite fault.** The local `markSynced()` bookkeeping now runs outside the
+  PostgreSQL write transaction, so a SQLite error after the rows already
+  committed no longer triggers a bisection storm that re-`COPY`s committed rows.
+- **Transient PostgreSQL failures (serialization / deadlock / lock) now defer the
+  whole batch** for the next loop instead of recursively bisecting to a single
+  row — no wasted load while the condition clears.
+- **Rollups can no longer be under-counted when `nightowl:backfill-rollups` runs
+  against a live drain.** The drain's additive rollup UPSERT and the backfill's
+  recompute now coordinate through matching advisory locks, so neither clobbers
+  the other with a stale value.
+
 ## [1.2.4] - 2026-06-26
 
 ### Added

@@ -35,6 +35,13 @@ final class MetricsCollector
 
     private const DRAIN_METRICS_STALE_SECONDS = 15;
 
+    // How long a connection failure stays "live" for DRAIN_UNREACHABLE. Must exceed
+    // MIN_TICKS_FOR_RESOLVE × the ~10s diagnosis tick (30s) so that a single blip which
+    // crosses the DEBOUNCE_TICKS alert threshold also reaches the resolve threshold —
+    // otherwise it would alert with no all-clear. A sustained outage re-stamps every
+    // failed batch, so this window only governs the post-last-failure decay.
+    private const DRAIN_CONN_FAIL_FRESH_SECONDS = 45;
+
     // Defensive emit ceilings — keep these two gauges within the API's decimal
     // columns (pg_latency_ms decimal(12,2), buffer_utilization_pct decimal(8,2))
     // so a stalled PG or a misconfigured max_pending_rows can never overflow the
@@ -86,6 +93,10 @@ final class MetricsCollector
     private float $lastDrainErrorAt = 0.0;
 
     private float $lastDrainOkAt = 0.0;
+
+    // Most recent PG connection failure across workers (Phase 3). Drives the
+    // DRAIN_UNREACHABLE critical and decays the write-rejection latch.
+    private float $lastConnFailAt = 0.0;
 
     // Poison-payload quarantine (Phase 2): cumulative dropped-row count summed
     // across workers, with the most recent SQLSTATE + table. Drives DRAIN_QUARANTINE.
@@ -267,7 +278,8 @@ final class MetricsCollector
         $mostRecentErrSqlstate = null;
         $mostRecentErrTable = null;
         $mostRecentOkAt = 0.0;
-        $quarantinedLive = 0;
+        $mostRecentConnFailAt = 0.0;
+        $quarantinedTotal = 0;
         $mostRecentQuarAt = 0.0;
         $mostRecentQuarSqlstate = null;
         $mostRecentQuarTable = null;
@@ -314,10 +326,18 @@ final class MetricsCollector
                 $mostRecentErrTable = is_string($data['last_write_table'] ?? null) ? $data['last_write_table'] : null;
             }
             $mostRecentOkAt = max($mostRecentOkAt, (float) ($data['last_write_ok_at'] ?? 0.0));
+            // Connection failure: most recent across workers. MAX is correct — if any
+            // one worker drained successfully more recently than its connection blip,
+            // the shared PG is reachable, so the newer lastDrainOkAt suppresses the alarm.
+            $mostRecentConnFailAt = max($mostRecentConnFailAt, (float) ($data['last_conn_fail_at'] ?? 0.0));
 
-            // Quarantine: live dead-letter count is the same buffer file for every
-            // worker, so take MAX (not sum); keep the most recent SQLSTATE.
-            $quarantinedLive = max($quarantinedLive, (int) ($data['quarantined_live'] ?? 0));
+            // Quarantine: quarantined_total is a per-worker cumulative counter (each
+            // worker counts the rows IT dead-lettered), so SUM across workers. It is
+            // the monotonic "stays visible after the fact" count that drives the
+            // DRAIN_QUARANTINE diagnosis — NOT quarantined_live (the prunable buffer
+            // gauge that decays to 0 once pruneQuarantined() clears the retention
+            // window, silently clearing a critical that lost real telemetry).
+            $quarantinedTotal += (int) ($data['quarantined_total'] ?? 0);
             $quarAt = (float) ($data['last_quarantine_at'] ?? 0.0);
             if ($quarAt > $mostRecentQuarAt) {
                 $mostRecentQuarAt = $quarAt;
@@ -364,7 +384,8 @@ final class MetricsCollector
         $this->lastDrainErrorSqlstate = $mostRecentErrSqlstate;
         $this->lastDrainErrorTable = $mostRecentErrTable;
         $this->lastDrainOkAt = $mostRecentOkAt;
-        $this->drainQuarantinedTotal = $quarantinedLive;
+        $this->lastConnFailAt = $mostRecentConnFailAt;
+        $this->drainQuarantinedTotal = $quarantinedTotal;
         $this->lastQuarantineSqlstate = $mostRecentQuarSqlstate;
         $this->lastQuarantineTable = $mostRecentQuarTable;
         $this->appRequestsTotal = $appRequests;
@@ -394,17 +415,48 @@ final class MetricsCollector
         $totalTraffic = $ingestRate + $rejectRate;
         $rejectPct = $totalTraffic > 0 ? ($rejectRate / $totalTraffic) * 100 : 0.0;
 
-        // Writes are being REJECTED — PostgreSQL is reachable but refusing the
-        // batch — when the most recent drain outcome was a non-connection failure
-        // with no later success. Distinct from "unreachable" (DRAIN_STOPPED) and
-        // "slow" (PG_LATENCY).
-        $writeFailing = $this->lastDrainErrorAt > 0.0
-            && $this->lastDrainErrorAt > $this->lastDrainOkAt;
+        // Postgres is UNREACHABLE — the drain can't connect — when there's a recent
+        // connection failure that is the MOST RECENT drain outcome (newer than the last
+        // success AND the last write-rejection). Independent of backlog size and lifetime
+        // drain volume, which is the gap DRAIN_STOPPED's pendingRows>100 guard and
+        // DRAIN_ERRORS' lifetime-diluted failRate both miss (a low-traffic established app
+        // going dark would otherwise report healthy). The `> lastDrainErrorAt` term makes
+        // this mutually exclusive with DRAIN_WRITE_FAILING below (which requires
+        // errAt >= connFailAt), so a PG-bounce-then-rejection can't fire both criticals.
+        // The freshness window — not just errAt>okAt — is load-bearing: it lets the signal
+        // DECAY rather than latch once failures stop. The worker re-stamps lastConnFailAt
+        // on every failed batch, so it stays fresh only while connections are failing.
+        $connUnreachable = $this->lastConnFailAt > 0.0
+            && $this->lastConnFailAt > $this->lastDrainOkAt
+            && $this->lastConnFailAt > $this->lastDrainErrorAt
+            && (microtime(true) - $this->lastConnFailAt) < self::DRAIN_CONN_FAIL_FRESH_SECONDS;
 
-        // DRAIN_STOPPED — suppressed when writes are being rejected, because
-        // DRAIN_WRITE_FAILING below names the real cause (the connection is fine;
-        // saying "Postgres may be unreachable" would send the operator the wrong way).
-        if ($drainRate == 0 && $pendingRows > 100 && ! $writeFailing) {
+        // Writes are being REJECTED — PostgreSQL is reachable but refusing the batch —
+        // when the most recent drain outcome was a non-connection failure with no later
+        // success. A NEWER connection failure clears this latch: once the DB goes fully
+        // down, the cause is connectivity, not a rejection, so we must stop saying "run
+        // migrate" and let DRAIN_UNREACHABLE take over. Distinct from "slow" (PG_LATENCY).
+        $writeFailing = $this->lastDrainErrorAt > 0.0
+            && $this->lastDrainErrorAt > $this->lastDrainOkAt
+            && $this->lastDrainErrorAt >= $this->lastConnFailAt;
+
+        // DRAIN_UNREACHABLE — critical; owns the connectivity story and suppresses both
+        // DRAIN_STOPPED ("may be unreachable") and the DRAIN_ERRORS warning.
+        if ($connUnreachable) {
+            $diagnoses[] = [
+                'code' => 'DRAIN_UNREACHABLE',
+                'level' => 'critical',
+                'message' => 'The drain cannot connect to PostgreSQL.',
+                'recommendation' => 'Check that PostgreSQL is running and reachable from the agent (host/port/credentials/network/firewall). Telemetry is buffered and drains automatically once the connection recovers.',
+                'value' => $pendingRows,
+            ];
+        }
+
+        // DRAIN_STOPPED — suppressed when writes are being rejected (DRAIN_WRITE_FAILING
+        // names the real cause) or when DRAIN_UNREACHABLE already owns the connectivity
+        // story; what's left is the worker-crash / stuck case.
+        $drainStopped = $drainRate == 0 && $pendingRows > 100 && ! $writeFailing && ! $connUnreachable;
+        if ($drainStopped) {
             $diagnoses[] = [
                 'code' => 'DRAIN_STOPPED',
                 'level' => 'critical',
@@ -506,11 +558,18 @@ final class MetricsCollector
             ];
         }
 
-        // DRAIN_ERRORS — un-gated from drainTotal>0 so a first-batch failure (fresh
-        // app whose schema isn't migrated yet) still warns instead of staying
-        // silent. Suppressed when the more specific DRAIN_WRITE_FAILING is firing.
+        // DRAIN_ERRORS — suppressed ONLY when DRAIN_STOPPED already fires for the same
+        // root cause (a non-draining backlog), so we don't double-report. Deliberately
+        // un-gated from drainTotal>0 (a Phase-1 belt-and-suspenders): a FRESH app (no
+        // successful drain yet) hitting a connectivity failure with a small backlog
+        // (pendingRows<=100, below DRAIN_STOPPED's guard) and no write-rejection signal
+        // would otherwise surface no diagnosis at all. NOTE: this does NOT cover the
+        // same stall on an ESTABLISHED, high-volume worker — failRate's denominator
+        // dilutes with lifetime drainTotal, so it stays under the threshold. Closing
+        // that needs a dedicated fresh-connection-failure signal in the IPC (tracked:
+        // DRAIN_ROBUSTNESS_IMPL_PLAN Phase 3, shared root cause with the writeFailing latch).
         $totalBatches = $this->drainTotal > 0 ? ($this->drainTotal / 1000) : 0; // rough batch estimate
-        if ($this->drainBatchesFailed > 0 && ! $writeFailing) {
+        if ($this->drainBatchesFailed > 0 && ! $writeFailing && ! $drainStopped && ! $connUnreachable) {
             $failRate = ($this->drainBatchesFailed / ($this->drainBatchesFailed + $totalBatches)) * 100;
             if ($failRate > self::DRAIN_ERROR_RATE_PCT) {
                 $diagnoses[] = [

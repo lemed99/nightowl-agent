@@ -202,7 +202,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
     protected function registerCommands(): void
     {
         if ($this->app->runningInConsole()) {
-            $this->commands([
+            $commands = [
                 AgentCommand::class,
                 DrainWorkerCommand::class,
                 InstallCommand::class,
@@ -210,7 +210,13 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 PruneCommand::class,
                 BackfillRollupsCommand::class,
                 ClearCommand::class,
-            ]);
+            ];
+
+            // The synthetic-traffic feeder commands (simulator-loop/backfill) live in
+            // the SEPARATE nightowl/agent-simulator package — never shipped to a customer
+            // install — and are registered by ITS service provider when present + enabled.
+
+            $this->commands($commands);
         }
     }
 

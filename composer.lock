@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "3f03e6b7d95c6d10fce6ec7d816489d0",
+    "content-hash": "ade41e1e42f1c435b6fed6d5f77c2bff",
     "packages": [
         {
             "name": "brick/math",
@@ -6874,6 +6874,55 @@
                 }
             ],
             "time": "2025-08-01T08:46:24+00:00"
+        },
+        {
+            "name": "nightowl/agent-simulator",
+            "version": "v0.1.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/lemed99/nightowl-agent-simulator.git",
+                "reference": "803a1eb14602dbd7c42c3dd1adf1e100d965871d"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/lemed99/nightowl-agent-simulator/zipball/803a1eb14602dbd7c42c3dd1adf1e100d965871d",
+                "reference": "803a1eb14602dbd7c42c3dd1adf1e100d965871d",
+                "shasum": ""
+            },
+            "require": {
+                "illuminate/console": "^11.0|^12.0|^13.0",
+                "illuminate/support": "^11.0|^12.0|^13.0",
+                "php": "^8.2"
+            },
+            "type": "library",
+            "extra": {
+                "laravel": {
+                    "providers": [
+                        "NightOwl\\Simulator\\SimulatorServiceProvider"
+                    ]
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "NightOwl\\Simulator\\": "src/"
+                }
+            },
+            "license": [
+                "MIT"
+            ],
+            "description": "Synthetic Nightwatch-shaped telemetry generator + feeder commands for the NightOwl Tier-1 demo and the agent's own pipeline tests. NOT installed into customer agents — it is a require-dev of nightowl/agent (for its Integration/System tests) and a require of the demo app only.",
+            "keywords": [
+                "demo",
+                "nightowl",
+                "simulator",
+                "telemetry",
+                "testing"
+            ],
+            "support": {
+                "source": "https://github.com/lemed99/nightowl-agent-simulator/tree/v0.1.0",
+                "issues": "https://github.com/lemed99/nightowl-agent-simulator/issues"
+            },
+            "time": "2026-06-28T17:58:55+00:00"
         },
         {
             "name": "nikic/php-parser",

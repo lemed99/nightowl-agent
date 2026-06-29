@@ -3,7 +3,7 @@
 namespace NightOwl\Tests\Integration;
 
 use NightOwl\Agent\PayloadParser;
-use NightOwl\Tests\Simulator\NightwatchSimulator;
+use NightOwl\Simulator\NightwatchSimulator;
 use PHPUnit\Framework\TestCase;
 
 /**

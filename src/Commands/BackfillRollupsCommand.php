@@ -114,6 +114,23 @@ class BackfillRollupsCommand extends Command
     /**
      * Replace-per-bucket for one source chunk, transactionally: DELETE the
      * chunk's bucket range, then INSERT recomputed aggregates. Idempotent.
+     *
+     * The INSERT is ON CONFLICT … DO UPDATE (replace) rather than a plain INSERT:
+     * the live drain now buckets each row on its own EVENT timestamp, so a catch-up
+     * drain after a PG outage can write rollups into buckets older than the safety
+     * margin — i.e. inside this chunk's range. A concurrent drain UPSERT in the gap
+     * between this DELETE and INSERT would otherwise abort the whole chunk on the
+     * (group, bucket, env) unique key; instead we overwrite with the backfill's
+     * freshly-computed value (the same replace semantics this command already has).
+     *
+     * To stop that replace from CLOBBERING a concurrent catch-up drain's rows with a
+     * stale count (the backfill's recompute snapshot can straddle the drain's commit),
+     * the chunk takes an EXCLUSIVE advisory lock on the rollup table; the drain takes
+     * the matching SHARED lock around its additive UPSERT (RecordWriter::
+     * lockRollupForWriteShared). The two then serialize and commute: drain-first →
+     * our recompute reads its committed rows; backfill-first → its additive UPSERT
+     * adds on top of our value. Shared locks don't block each other, so multi-worker
+     * drains are unaffected except while a backfill on the same table is running.
      */
     private function backfillChunk($conn, RollupSpec $spec, string $columns, string $selects, string $groupBy, string $start, string $end): int
     {
@@ -122,7 +139,17 @@ class BackfillRollupsCommand extends Command
         // stale partial-minute bucket from an earlier run.
         $bucketLow = Carbon::parse($start)->startOfMinute()->toDateTimeString();
 
-        return $conn->transaction(function () use ($conn, $spec, $columns, $selects, $groupBy, $start, $end, $bucketLow): int {
+        $pk = [...$spec->groupColumnNames(), 'bucket_start', 'environment'];
+        $updateCols = array_values(array_diff(array_map('trim', explode(',', $columns)), $pk));
+        $onConflict = 'ON CONFLICT ('.implode(', ', $pk).') DO UPDATE SET '
+            .implode(', ', array_map(static fn (string $c): string => "{$c} = EXCLUDED.{$c}", $updateCols));
+
+        return $conn->transaction(function () use ($conn, $spec, $columns, $selects, $groupBy, $start, $end, $bucketLow, $onConflict): int {
+            // EXCLUSIVE advisory lock paired with the drain's SHARED lock (same key),
+            // so this DELETE+recompute can't interleave with a concurrent additive
+            // drain UPSERT and overwrite it with a stale count. Released at commit.
+            $conn->statement('SELECT pg_advisory_xact_lock(hashtext(?))', ['nightowl_rollup:'.$spec->table]);
+
             $conn->table($spec->table)
                 ->where('bucket_start', '>=', $bucketLow)
                 ->where('bucket_start', '<', $end)
@@ -133,7 +160,8 @@ class BackfillRollupsCommand extends Command
                  SELECT {$selects}
                  FROM {$spec->source}
                  WHERE created_at >= ? AND created_at < ?
-                 GROUP BY {$groupBy}",
+                 GROUP BY {$groupBy}
+                 {$onConflict}",
                 [$start, $end]
             );
 
