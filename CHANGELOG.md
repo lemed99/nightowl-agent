@@ -5,6 +5,20 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.6] - unreleased
+
+### Fixed
+
+- **Job attempt detail pages no longer time out.** Opening a job attempt walks
+  the job family by filtering `nightowl_jobs` on `job_id` — the dispatch-pair
+  lookup plus the ancestor and descendant BFS — but `job_id` was never indexed,
+  so each of those ~15–25 lookups ran as a sequential scan of the whole table.
+  On a job-heavy app the scans summed past PHP's 30s request limit and the page
+  died with an uncatchable "Maximum execution time exceeded". A new
+  `nightowl:migrate` index on `nightowl_jobs.job_id` collapses each lookup to an
+  index scan. The same index also speeds command, scheduled-task and request
+  detail pages, which resolve their child jobs through the same path.
+
 ## [1.2.5] - 2026-06-29
 
 ### Added
