@@ -5,7 +5,7 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
-## [1.2.6] - unreleased
+## [1.2.6] - 2026-07-02
 
 ### Fixed
 
