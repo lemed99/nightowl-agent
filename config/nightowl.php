@@ -77,8 +77,38 @@ return [
     |
     */
     'agent' => [
+        // Where the AGENT BINDS/LISTENS. Leave at loopback for a co-located
+        // agent; set to 0.0.0.0 (or an LB VIP) to accept payloads from other
+        // hosts. This is the listener address — NOT where your app transmits.
         'host' => env('NIGHTOWL_AGENT_HOST', '127.0.0.1'),
         'port' => env('NIGHTOWL_AGENT_PORT', 2407),
+
+        // Where the INSTRUMENTED APP TRANSMITS telemetry — the agent's address
+        // as seen from your app. Defaults to the loopback listener, matching
+        // the co-located single-host deployment. Set it to the agent's private
+        // host:port when the app and agent run on different machines — the
+        // supported path for serverless hosts that can't run the long-lived
+        // agent in-process. On Laravel Vapor, AWS Lambda is stateless and
+        // short-lived, so you run the agent on a long-running box (EC2/Forge)
+        // in the same VPC and point the Vapor app at it:
+        //   NIGHTOWL_INGEST_URI=10.0.0.5:2407
+        // Mirrors laravel/nightwatch's NIGHTWATCH_INGEST_URI. A bare host with
+        // no port falls back to NIGHTOWL_AGENT_PORT. host:port, no scheme;
+        // bracket IPv6 literals as [::1]:2407.
+        //
+        // Left unset (null) by default on purpose: the service provider then
+        // derives the loopback default from the RESOLVED agent.port config, so
+        // an install that sets the port via the published config file (not the
+        // NIGHTOWL_AGENT_PORT env var) still transmits to the port the agent
+        // actually binds. Hardcoding env('NIGHTOWL_AGENT_PORT') here would send
+        // to 2407 while the listener bound the config port — silent record loss.
+        'ingest_uri' => env('NIGHTOWL_INGEST_URI'),
+
+        // Connect + write timeout (seconds) for transmitting to the agent. The
+        // 0.5s default is tuned for a loopback agent; raise it when the agent
+        // is a network hop away (e.g. Vapor → EC2) so a slower connect doesn't
+        // silently drop records.
+        'ingest_timeout' => env('NIGHTOWL_INGEST_TIMEOUT', 0.5),
         // NightOwl SaaS API base URL — destination for health reports. Override
         // for self-hosted dashboards or staging environments.
         'api_url' => env('NIGHTOWL_API_URL', 'https://api.usenightowl.com'),

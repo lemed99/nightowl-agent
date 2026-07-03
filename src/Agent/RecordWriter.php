@@ -26,6 +26,9 @@ final class RecordWriter
     /** Cached per rollup table: whether it exists on the target DB. */
     private array $rollupTableChecked = [];
 
+    /** Cached per rollup table: whether it carries every column the spec's upsert writes. */
+    private array $rollupColumnsChecked = [];
+
     /** Built once: the queries rollup upsert SQL (includes the generated hist_NN columns). */
     private ?string $rollupUpsertSql = null;
 
@@ -686,6 +689,12 @@ final class RecordWriter
             $this->writeRollup($records, RollupSpecs::requests(), $nowTs);
         }
 
+        // Per-user rollup keyed on user_id (not route group_hash) — powers the
+        // users list, which nightowl_request_rollups can't serve.
+        if ($this->rollupEnabled('nightowl_user_rollups')) {
+            $this->writeRollup($records, RollupSpecs::requestUsers(), $nowTs);
+        }
+
         $this->checkRouteThresholds($records);
     }
 
@@ -765,6 +774,59 @@ final class RecordWriter
     }
 
     /**
+     * A rollup table can EXIST while lacking a column the spec's upsert writes —
+     * a partial/failed migration, or an agent running ahead of a migration that
+     * adds a column to an already-created rollup table. That would raise
+     * SQLSTATE 42703 (undefined_column) from the prepared upsert INSIDE the drain
+     * transaction, rolling the raw write back too and — because a prepared-
+     * statement failure can't be bisected by poison-row quarantine — head-of-line-
+     * blocking the whole drain forever. So verify the full written column set once
+     * per table (same order rollupSql() builds it) BEFORE issuing any upsert;
+     * disable the rollup and keep draining raw if a column is missing. Probed via
+     * information_schema (a plain read, safe inside the transaction) and cached.
+     *
+     * @param  list<string>  $histColumns
+     */
+    private function rollupColumnsPresent(RollupSpec $spec, array $histColumns): bool
+    {
+        $table = $spec->table;
+        if (array_key_exists($table, $this->rollupColumnsChecked)) {
+            return $this->rollupColumnsChecked[$table];
+        }
+
+        // Mirror rollupSql()'s insert column set so the probe matches what we write.
+        $expected = [...$spec->groupColumnNames(), 'bucket_start', 'environment', 'call_count', ...$spec->counterColumns()];
+        if ($spec->hasDuration) {
+            $expected = [...$expected, 'total_duration', 'min_duration', 'max_duration'];
+        }
+        if ($spec->hasHistogram) {
+            $expected = [...$expected, ...$histColumns];
+        }
+        $expected = [...$expected, ...$spec->representativeColumns()];
+
+        try {
+            $stmt = $this->pdo()->prepare(
+                'SELECT column_name FROM information_schema.columns WHERE table_schema = \'public\' AND table_name = ?'
+            );
+            $stmt->execute([$table]);
+            $present = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+        } catch (\Throwable) {
+            // Probe itself failed — the table-existence gate already passed, so
+            // stay permissive rather than silently dropping every rollup.
+            return $this->rollupColumnsChecked[$table] = true;
+        }
+
+        $missing = array_diff($expected, $present);
+        if (! empty($missing)) {
+            error_log('[NightOwl Agent] '.$table.' missing column(s) '.implode(', ', $missing).' — rollups for it disabled until nightowl:migrate runs (restart the agent afterward)');
+
+            return $this->rollupColumnsChecked[$table] = false;
+        }
+
+        return $this->rollupColumnsChecked[$table] = true;
+    }
+
+    /**
      * created_at for a telemetry row: the EVENT's own time (from its `timestamp`),
      * so a backdated or delayed drain dates the row when the event happened — not
      * when it drained. The read path filters/buckets on created_at, so this keeps
@@ -817,9 +879,17 @@ final class RecordWriter
      */
     private function writeRollup(array $records, RollupSpec $spec, int $nowTs): void
     {
+        $histColumns = $spec->hasHistogram ? QueryHistogram::columns() : [];
+
+        // Guard against a table that exists but is missing a written column: a
+        // failing upsert would poison the shared drain transaction. Probe before
+        // taking the write lock or issuing any upsert.
+        if (! $this->rollupColumnsPresent($spec, $histColumns)) {
+            return;
+        }
+
         $this->markWriteTarget($spec->table);
         $this->lockRollupForWriteShared($spec->table);
-        $histColumns = $spec->hasHistogram ? QueryHistogram::columns() : [];
         $counterCols = $spec->counterColumns();
         $repCols = $spec->representativeColumns();
 
@@ -1175,6 +1245,19 @@ final class RecordWriter
         $snapshot = $this->notifier->snapshotExistingIssues($this->pdo(), $issueGroups, 'exception');
         $this->syncIssuesToExceptions($issueGroups, $snapshot['reopen'] ?? []);
         $this->notifier->queueIssueNotifications($this->appName, $issueGroups, 'exception', $snapshot);
+
+        // Exception rollups — written LAST (after the issues upsert) so they don't
+        // leave currentWriteTarget pointing at a rollup table: an issues-upsert
+        // failure must still be attributed to nightowl_exceptions. Both share the
+        // drain transaction, committing/rolling back atomically with the INSERT.
+        // Per-user (users list "exceptions" column):
+        if ($this->rollupEnabled('nightowl_user_exception_rollups')) {
+            $this->writeRollup($records, RollupSpecs::exceptionUsers(), $nowTs);
+        }
+        // Per-fingerprint (Exceptions section list/overview/chart + dashboard):
+        if ($this->rollupEnabled('nightowl_exception_rollups')) {
+            $this->writeRollup($records, RollupSpecs::exceptionGroups(), $nowTs);
+        }
     }
 
     /**
@@ -1318,6 +1401,11 @@ final class RecordWriter
             $this->writeRollup($records, RollupSpecs::jobs(), $nowTs);
         }
 
+        // Per-user job-attempt rollup — enriches the users list's "queued jobs" count.
+        if ($this->rollupEnabled('nightowl_user_job_rollups')) {
+            $this->writeRollup($records, RollupSpecs::jobUsers(), $nowTs);
+        }
+
         $this->checkThresholds('job', $records, ['name', 'job_class']);
     }
 
@@ -1372,12 +1460,16 @@ final class RecordWriter
                 $r['mailer'] ?? null, is_array($r['to'] ?? null) ? json_encode($r['to']) : ($r['to'] ?? null),
                 $r['cc'] ?? 0, $r['bcc'] ?? 0, $r['attachments'] ?? 0,
                 $r['subject'] ?? null, $r['class'] ?? $r['mailable'] ?? null, $r['duration'] ?? null,
-                ($r['failed'] ?? false) ? 't' : 'f', ($r['queued'] ?? false) ? 't' : 'f',
+                filter_var($r['failed'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f', filter_var($r['queued'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
                 $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
         $this->copyBatch('nightowl_mail', $columns, $rows);
+
+        if ($this->rollupEnabled('nightowl_mail_rollups')) {
+            $this->writeRollup($records, RollupSpecs::mail(), $nowTs);
+        }
 
         $this->checkThresholds('mail', $records, ['class', 'mailable']);
     }
@@ -1401,12 +1493,16 @@ final class RecordWriter
                 $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment, $r['server'] ?? null, $r['_group'] ?? null,
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['class'] ?? $r['notification'] ?? null, $r['channel'] ?? null, $r['notifiable_type'] ?? null, $r['notifiable_id'] ?? null,
-                $r['duration'] ?? null, ($r['failed'] ?? false) ? 't' : 'f', ($r['queued'] ?? false) ? 't' : 'f',
+                $r['duration'] ?? null, filter_var($r['failed'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f', filter_var($r['queued'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
                 $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
         $this->copyBatch('nightowl_notifications', $columns, $rows);
+
+        if ($this->rollupEnabled('nightowl_notification_rollups')) {
+            $this->writeRollup($records, RollupSpecs::notifications(), $nowTs);
+        }
 
         $this->checkThresholds('notification', $records, ['class', 'notification']);
     }

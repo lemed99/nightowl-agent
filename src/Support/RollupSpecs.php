@@ -23,6 +23,12 @@ final class RollupSpecs
             self::jobs(),
             self::outgoingRequests(),
             self::cacheEvents(),
+            self::requestUsers(),
+            self::jobUsers(),
+            self::exceptionUsers(),
+            self::exceptionGroups(),
+            self::mail(),
+            self::notifications(),
         ];
     }
 
@@ -162,6 +168,162 @@ final class RollupSpecs
             representatives: [],
             hasDuration: true,
             hasHistogram: false,
+        );
+    }
+
+    /**
+     * nightowl_requests keyed by USER (not route group_hash) — powers the users
+     * list, which groups requests per user. call_count = requests; the status-band
+     * counters are byte-identical to requests() so the per-user counts reproduce
+     * the same status split. No duration/histogram (the list shows no per-user
+     * p95), so this stays a compact count rollup.
+     */
+    public static function requestUsers(): RollupSpec
+    {
+        return new RollupSpec(
+            table: 'nightowl_user_rollups',
+            source: 'nightowl_requests',
+            groupColumns: [
+                'user_id' => ['php' => static fn (array $r): string => (string) ($r['user'] ?? ''), 'sql' => "COALESCE(user_id, '')"],
+            ],
+            counters: [
+                'success_count' => ['php' => static fn (array $r): bool => (int) ($r['status_code'] ?? 200) < 400, 'sql' => 'status_code < 400'],
+                'client_error_count' => ['php' => static fn (array $r): bool => (int) ($r['status_code'] ?? 200) >= 400 && (int) ($r['status_code'] ?? 200) < 500, 'sql' => 'status_code >= 400 AND status_code < 500'],
+                'server_error_count' => ['php' => static fn (array $r): bool => (int) ($r['status_code'] ?? 200) >= 500, 'sql' => 'status_code >= 500'],
+            ],
+            representatives: [],
+            hasDuration: false,
+            hasHistogram: false,
+        );
+    }
+
+    /**
+     * nightowl_jobs keyed by USER — enriches the users list's "queued jobs"
+     * column, which counts job ATTEMPTS per user (attempt_id IS NOT NULL). The
+     * attempts_count predicate is byte-identical to jobs() so live drain and
+     * backfill agree. Count-only; the list shows a count, not per-user job latency.
+     */
+    public static function jobUsers(): RollupSpec
+    {
+        return new RollupSpec(
+            table: 'nightowl_user_job_rollups',
+            source: 'nightowl_jobs',
+            groupColumns: [
+                'user_id' => ['php' => static fn (array $r): string => (string) ($r['user'] ?? ''), 'sql' => "COALESCE(user_id, '')"],
+            ],
+            counters: [
+                // NULL-check (not empty()) so PHP matches SQL `IS NOT NULL` — mirrors jobs().
+                'attempts_count' => ['php' => static fn (array $r): bool => ($r['attempt_id'] ?? null) !== null, 'sql' => 'attempt_id IS NOT NULL'],
+            ],
+            representatives: [],
+            hasDuration: false,
+            hasHistogram: false,
+        );
+    }
+
+    /**
+     * nightowl_exceptions keyed by USER — enriches the users list's "exceptions"
+     * column (exceptions per user). Exceptions have no other rollup; the implicit
+     * call_count IS the exception count, so no explicit counters are needed.
+     */
+    public static function exceptionUsers(): RollupSpec
+    {
+        return new RollupSpec(
+            table: 'nightowl_user_exception_rollups',
+            source: 'nightowl_exceptions',
+            groupColumns: [
+                'user_id' => ['php' => static fn (array $r): string => (string) ($r['user'] ?? ''), 'sql' => "COALESCE(user_id, '')"],
+            ],
+            counters: [],
+            representatives: [],
+            hasDuration: false,
+            hasHistogram: false,
+        );
+    }
+
+    /**
+     * nightowl_exceptions keyed by FINGERPRINT (the exception group the Exceptions
+     * section + dashboard group by) — powers the exceptions list/overview/chart.
+     * call_count = occurrences; handled/unhandled bands match ExceptionController's
+     * raw SQL verbatim. The list's class/message/file/line + affected_users
+     * (non-additive COUNT DISTINCT) stay a bounded raw enrichment, so no
+     * representatives / duration here.
+     */
+    public static function exceptionGroups(): RollupSpec
+    {
+        // Must reproduce writeExceptions()'s fingerprint column exactly: the SDK
+        // `_group` when present, else a local hash of class|code|file|line.
+        $fingerprint = static fn (array $r): string => ! empty($r['_group'])
+            ? (string) $r['_group']
+            : md5(($r['class'] ?? '').'|'.($r['code'] ?? '').'|'.($r['file'] ?? '').'|'.($r['line'] ?? ''));
+
+        return new RollupSpec(
+            table: 'nightowl_exception_rollups',
+            source: 'nightowl_exceptions',
+            groupColumns: [
+                'fingerprint' => ['php' => $fingerprint, 'sql' => "COALESCE(fingerprint, '')"],
+            ],
+            counters: [
+                'handled_count' => ['php' => static fn (array $r): bool => filter_var($r['handled'] ?? false, FILTER_VALIDATE_BOOLEAN), 'sql' => 'handled = true'],
+                'unhandled_count' => ['php' => static fn (array $r): bool => ! filter_var($r['handled'] ?? false, FILTER_VALIDATE_BOOLEAN), 'sql' => 'handled != true OR handled IS NULL'],
+            ],
+            representatives: [],
+            hasDuration: false,
+            hasHistogram: false,
+        );
+    }
+
+    /**
+     * nightowl_mail keyed by group_hash (mailable class). Additive call_count +
+     * queued/failed counters + duration histogram (the mail list sorts by p95 and
+     * shows avg). mailable kept as first-seen representative for the list label.
+     */
+    public static function mail(): RollupSpec
+    {
+        return new RollupSpec(
+            table: 'nightowl_mail_rollups',
+            source: 'nightowl_mail',
+            groupColumns: [
+                'group_hash' => ['php' => static fn (array $r): string => (string) ($r['_group'] ?? ''), 'sql' => "COALESCE(group_hash, '')"],
+            ],
+            counters: [
+                'queued_count' => ['php' => static fn (array $r): bool => filter_var($r['queued'] ?? false, FILTER_VALIDATE_BOOLEAN), 'sql' => 'queued = true'],
+                'failed_count' => ['php' => static fn (array $r): bool => filter_var($r['failed'] ?? false, FILTER_VALIDATE_BOOLEAN), 'sql' => 'failed = true'],
+            ],
+            representatives: [
+                // writeMail maps $r['class'] ?? $r['mailable'] into the mailable column.
+                'mailable' => ['php' => static fn (array $r) => $r['class'] ?? $r['mailable'] ?? null, 'sql' => 'MIN(mailable)'],
+            ],
+            hasDuration: true,
+            hasHistogram: true,
+        );
+    }
+
+    /**
+     * nightowl_notifications keyed by (group_hash, channel) — the two-column
+     * grouping mirrors query_rollups' (group_hash, connection), so the list can
+     * rebuild its DISTINCT channel set additively from the rollup rows. call_count
+     * + queued/failed + duration histogram; notification class as representative.
+     */
+    public static function notifications(): RollupSpec
+    {
+        return new RollupSpec(
+            table: 'nightowl_notification_rollups',
+            source: 'nightowl_notifications',
+            groupColumns: [
+                'group_hash' => ['php' => static fn (array $r): string => (string) ($r['_group'] ?? ''), 'sql' => "COALESCE(group_hash, '')"],
+                'channel' => ['php' => static fn (array $r): string => (string) ($r['channel'] ?? ''), 'sql' => "COALESCE(channel, '')"],
+            ],
+            counters: [
+                'queued_count' => ['php' => static fn (array $r): bool => filter_var($r['queued'] ?? false, FILTER_VALIDATE_BOOLEAN), 'sql' => 'queued = true'],
+                'failed_count' => ['php' => static fn (array $r): bool => filter_var($r['failed'] ?? false, FILTER_VALIDATE_BOOLEAN), 'sql' => 'failed = true'],
+            ],
+            representatives: [
+                // writeNotifications maps $r['class'] ?? $r['notification'] into the notification column.
+                'notification' => ['php' => static fn (array $r) => $r['class'] ?? $r['notification'] ?? null, 'sql' => 'MIN(notification)'],
+            ],
+            hasDuration: true,
+            hasHistogram: true,
         );
     }
 }

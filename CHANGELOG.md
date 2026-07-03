@@ -5,7 +5,44 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
-## [1.2.6] - 2026-07-02
+## [1.2.7] - 2026-07-03
+
+### Added
+
+- **Remote agent support (`NIGHTOWL_INGEST_URI`) — run NightOwl on Laravel
+  Vapor.** The instrumented app previously always transmitted telemetry to a
+  co-located agent on `127.0.0.1`, so serverless hosts (Vapor/Lambda) that can't
+  run the long-lived agent in-process had no way to reach it. You can now point
+  the app at a remote agent by setting `NIGHTOWL_INGEST_URI=host:port` (mirrors
+  `laravel/nightwatch`'s `NIGHTWATCH_INGEST_URI`): run the agent on a
+  long-running box in the same private network and have the app ship to it. A
+  bare host with no port falls back to `NIGHTOWL_AGENT_PORT`. New
+  `NIGHTOWL_INGEST_TIMEOUT` (default `0.5`s) tunes the connect/write timeout for
+  the network hop. Both default to the loopback listener, so existing
+  single-host installs are unchanged. See the new [Laravel Vapor
+  guide](https://github.com/lemed99/nightowl-docs/blob/main/agent/vapor.mdx).
+
+- **Wider dashboard time ranges now serve from pre-aggregated rollups for more
+  sections.** The agent already maintained per-minute rollups for queries and
+  requests; it now also maintains them per-user (requests / jobs / exceptions),
+  per-exception-fingerprint, per-mailable, and per-notification. The dashboard's
+  Users, Mail, Notifications and Exceptions lists, overview stats and charts
+  serve wide time ranges (1h and up) from these compact summaries instead of
+  scanning raw telemetry, so they stay fast on high-volume apps. `nightowl:migrate`
+  creates the new tables and `nightowl:backfill-rollups` fills them from existing
+  telemetry; each is pruned on its own (longer) retention. A companion migration
+  adds composite indexes that speed the request / job / mail / notification /
+  exception detail pages.
+
+### Changed
+
+- **A rollup table that exists but is missing a column no longer stalls the
+  drain.** Before writing a rollup the drain now verifies the target table
+  carries every column it will write (guarding against a partial or not-yet-run
+  migration, or an agent running ahead of a schema change). If a column is
+  absent it disables just that rollup and keeps draining raw telemetry, instead
+  of failing the shared drain transaction and head-of-line-blocking the whole
+  pipeline.
 
 ### Fixed
 

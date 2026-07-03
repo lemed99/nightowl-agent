@@ -107,10 +107,39 @@ class NightOwlAgentServiceProvider extends ServiceProvider
             $nightowlToken = (string) config('nightowl.agent.token', config('nightwatch.token', ''));
             $tokenHash = substr(hash('xxh128', $nightowlToken), 0, 7);
 
+            // Where THIS app transmits telemetry. Defaults to the loopback
+            // listener (co-located agent) so existing single-host installs are
+            // unaffected. Set NIGHTOWL_INGEST_URI to the agent's private
+            // host:port to ship to a remote agent — the supported path for
+            // serverless hosts (Laravel Vapor) that can't run the long-lived
+            // agent in-process. A bare host with no port falls back to the
+            // configured agent port. Mirrors nightwatch's NIGHTWATCH_INGEST_URI.
+            $nightowlTransmitTo = trim((string) config('nightowl.agent.ingest_uri', "127.0.0.1:{$nightowlPort}"));
+            if ($nightowlTransmitTo === '') {
+                $nightowlTransmitTo = "127.0.0.1:{$nightowlPort}";
+            }
+            // Append the agent port when only a host was given (e.g.
+            // NIGHTOWL_INGEST_URI=10.0.0.5). IPv6 literals must be bracketed;
+            // for those the port is the ":NNNN" that FOLLOWS the closing "]",
+            // not the colons inside the address — so "[::1]" (no port) still
+            // gets the agent port while "[::1]:2407" passes through untouched.
+            if (str_starts_with($nightowlTransmitTo, '[')) {
+                $closingBracket = strpos($nightowlTransmitTo, ']');
+                $hasPort = $closingBracket !== false
+                    && ($nightowlTransmitTo[$closingBracket + 1] ?? '') === ':';
+            } else {
+                // Bare host / IPv4 — any colon delimits the port.
+                $hasPort = str_contains($nightowlTransmitTo, ':');
+            }
+            if (! $hasPort) {
+                $nightowlTransmitTo .= ":{$nightowlPort}";
+            }
+            $nightowlTimeout = (float) config('nightowl.agent.ingest_timeout', 0.5);
+
             $nightowlIngest = new Ingest(
-                transmitTo: "127.0.0.1:{$nightowlPort}",
-                connectionTimeout: 0.5,
-                timeout: 0.5,
+                transmitTo: $nightowlTransmitTo,
+                connectionTimeout: $nightowlTimeout,
+                timeout: $nightowlTimeout,
                 streamFactory: new SocketStreamFactory,
                 buffer: new RecordsBuffer(length: 500),
                 tokenHash: $tokenHash,

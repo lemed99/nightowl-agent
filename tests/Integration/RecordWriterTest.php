@@ -414,6 +414,262 @@ class RecordWriterTest extends TestCase
         $this->assertSame(4000, (int) $row['max_duration']);
     }
 
+    // ─── Per-user rollups (powers the users list) ──────────
+
+    /** @return array<string, array<string, string>> rollup rows indexed by user_id */
+    private function fetchUserRollup(string $table): array
+    {
+        $rows = self::$pdo->query("SELECT * FROM {$table}")->fetchAll(PDO::FETCH_ASSOC);
+        $byUser = [];
+        foreach ($rows as $r) {
+            $u = $r['user_id'];
+            // Sum across minute buckets so the assertions are immune to a test
+            // straddling a minute boundary.
+            foreach ($r as $col => $val) {
+                if ($col === 'user_id' || $col === 'bucket_start' || $col === 'environment') {
+                    continue;
+                }
+                $byUser[$u][$col] = (int) ($byUser[$u][$col] ?? 0) + (int) $val;
+            }
+        }
+
+        return $byUser;
+    }
+
+    public function test_drain_populates_per_user_request_rollup(): void
+    {
+        $this->writer->write([
+            $this->sim->makeRequest(['trace_id' => 'ur-1', 'user' => 'user-a', 'status_code' => 200]),
+            $this->sim->makeRequest(['trace_id' => 'ur-2', 'user' => 'user-a', 'status_code' => 200]),
+            $this->sim->makeRequest(['trace_id' => 'ur-3', 'user' => 'user-a', 'status_code' => 404]),
+            $this->sim->makeRequest(['trace_id' => 'ur-4', 'user' => 'user-a', 'status_code' => 500]),
+            $this->sim->makeRequest(['trace_id' => 'ur-5', 'user' => 'user-b', 'status_code' => 200]),
+            $this->sim->makeRequest(['trace_id' => 'ur-6', 'user' => null, 'status_code' => 200]), // anonymous → '' sentinel
+        ]);
+
+        $byUser = $this->fetchUserRollup('nightowl_user_rollups');
+
+        $this->assertSame(4, $byUser['user-a']['call_count']);
+        $this->assertSame(2, $byUser['user-a']['success_count']);
+        $this->assertSame(1, $byUser['user-a']['client_error_count']);
+        $this->assertSame(1, $byUser['user-a']['server_error_count']);
+        $this->assertSame(1, $byUser['user-b']['call_count']);
+        $this->assertSame(1, $byUser['user-b']['success_count']);
+        // Anonymous requests collapse into the '' group, kept out of the users
+        // list by the read side's `user_id != ''` filter, not dropped here.
+        $this->assertSame(1, $byUser['']['call_count']);
+    }
+
+    public function test_drain_populates_per_user_job_and_exception_rollups(): void
+    {
+        $this->writer->write([
+            $this->sim->makeJob(['trace_id' => 'uj-1', 'user' => 'user-a', 'attempt_id' => 'att-1']),
+            $this->sim->makeJob(['trace_id' => 'uj-2', 'user' => 'user-a', 'attempt_id' => 'att-2']),
+            $this->sim->makeJob(['trace_id' => 'uj-3', 'user' => 'user-a', 'attempt_id' => null]), // queued dispatch — not an attempt
+            $this->sim->makeJob(['trace_id' => 'uj-4', 'user' => 'user-b', 'attempt_id' => 'att-4']),
+        ]);
+        $this->writer->write([
+            $this->sim->makeException(['trace_id' => 'ue-1', 'user' => 'user-a']),
+            $this->sim->makeException(['trace_id' => 'ue-2', 'user' => 'user-a']),
+            $this->sim->makeException(['trace_id' => 'ue-3', 'user' => 'user-b']),
+        ]);
+
+        $jobs = $this->fetchUserRollup('nightowl_user_job_rollups');
+        // queued_jobs on the users list = attempts_count (attempt_id IS NOT NULL).
+        $this->assertSame(3, $jobs['user-a']['call_count']);
+        $this->assertSame(2, $jobs['user-a']['attempts_count']);
+        $this->assertSame(1, $jobs['user-b']['attempts_count']);
+
+        $exceptions = $this->fetchUserRollup('nightowl_user_exception_rollups');
+        // exceptions on the users list = the implicit call_count.
+        $this->assertSame(2, $exceptions['user-a']['call_count']);
+        $this->assertSame(1, $exceptions['user-b']['call_count']);
+    }
+
+    /**
+     * Drift guard: the per-user request rollup, summed across its buckets, must
+     * exactly reproduce a raw re-aggregation of nightowl_requests grouped by user.
+     * This is the single highest-value defense against the drain and the users-
+     * list read path diverging — any future change to the status bands trips it.
+     */
+    public function test_per_user_request_rollup_matches_raw_reaggregation(): void
+    {
+        $statuses = [200, 201, 404, 500];
+        $records = [];
+        for ($i = 1; $i <= 20; $i++) {
+            $records[] = $this->sim->makeRequest([
+                'trace_id' => "drift-u-{$i}",
+                'user' => $i % 5 === 0 ? null : 'u'.($i % 4), // mix real users + anonymous
+                'status_code' => $statuses[$i % 4],
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $rollup = self::$pdo->query(
+            "SELECT user_id,
+                    SUM(call_count) AS cc,
+                    SUM(success_count) AS sc,
+                    SUM(client_error_count) AS cec,
+                    SUM(server_error_count) AS sec
+             FROM nightowl_user_rollups
+             GROUP BY user_id ORDER BY user_id"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(user_id, '') AS user_id,
+                    COUNT(*) AS cc,
+                    SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) AS sc,
+                    SUM(CASE WHEN status_code >= 400 AND status_code < 500 THEN 1 ELSE 0 END) AS cec,
+                    SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END) AS sec
+             FROM nightowl_requests
+             GROUP BY COALESCE(user_id, '') ORDER BY user_id"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'per-user rollup must reproduce a raw re-aggregation of nightowl_requests');
+    }
+
+    /**
+     * Drift guard: nightowl_exception_rollups (keyed by fingerprint) summed across
+     * buckets must reproduce a raw re-aggregation of nightowl_exceptions, incl. the
+     * handled/unhandled bands ExceptionController's list/overview/chart read.
+     */
+    public function test_exception_group_rollup_matches_raw_reaggregation(): void
+    {
+        $records = [];
+        for ($i = 1; $i <= 20; $i++) {
+            $records[] = $this->sim->makeException([
+                'trace_id' => "drift-exc-{$i}",
+                'class' => 'App\\Exceptions\\E'.($i % 3),
+                'file' => '/app/E'.($i % 3).'.php',
+                'line' => 10 + ($i % 3),
+                'handled' => $i % 2 === 0, // mix handled / unhandled
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $rollup = self::$pdo->query(
+            "SELECT fingerprint,
+                    SUM(call_count) AS cc,
+                    SUM(handled_count) AS hc,
+                    SUM(unhandled_count) AS uc
+             FROM nightowl_exception_rollups
+             GROUP BY fingerprint ORDER BY fingerprint"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(fingerprint, '') AS fingerprint,
+                    COUNT(*) AS cc,
+                    SUM(CASE WHEN handled = true THEN 1 ELSE 0 END) AS hc,
+                    SUM(CASE WHEN handled != true OR handled IS NULL THEN 1 ELSE 0 END) AS uc
+             FROM nightowl_exceptions
+             GROUP BY COALESCE(fingerprint, '') ORDER BY fingerprint"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'exception fingerprint rollup must reproduce a raw re-aggregation of nightowl_exceptions');
+    }
+
+    /**
+     * Drift guard for nightowl_mail_rollups. Beyond the counters, it asserts the
+     * SUM of histogram bins equals COUNT(duration) — writeRollup bins exactly the
+     * non-null durations, so that sum is the avg denominator the read path uses
+     * (RollupReader::durationCountExpr) to keep mail's average correct when
+     * queued/failed rows carry a NULL duration. Half the batch has NULL duration.
+     */
+    public function test_mail_rollup_matches_raw_reaggregation(): void
+    {
+        $records = [];
+        for ($i = 1; $i <= 20; $i++) {
+            $records[] = $this->sim->makeMail([
+                'trace_id' => "drift-mail-{$i}",
+                '_group' => 'mg'.($i % 3),
+                'class' => 'App\\Mail\\M'.($i % 3),
+                'queued' => $i % 4 === 0,
+                'failed' => $i % 5 === 0,
+                'duration' => $i % 2 === 0 ? null : $i * 1000, // half NULL-duration
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $histSum = 'SUM('.implode(') + SUM(', \NightOwl\Support\QueryHistogram::columns()).')';
+
+        $rollup = self::$pdo->query(
+            "SELECT group_hash,
+                    SUM(call_count) AS cc,
+                    SUM(queued_count) AS qc,
+                    SUM(failed_count) AS fc,
+                    SUM(total_duration) AS td,
+                    {$histSum} AS dc
+             FROM nightowl_mail_rollups
+             GROUP BY group_hash ORDER BY group_hash"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(group_hash, '') AS group_hash,
+                    COUNT(*) AS cc,
+                    SUM(CASE WHEN queued = true THEN 1 ELSE 0 END) AS qc,
+                    SUM(CASE WHEN failed = true THEN 1 ELSE 0 END) AS fc,
+                    COALESCE(SUM(duration), 0) AS td,
+                    COUNT(duration) AS dc
+             FROM nightowl_mail
+             GROUP BY COALESCE(group_hash, '') ORDER BY group_hash"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'mail rollup must reproduce a raw re-aggregation of nightowl_mail (hist-bin sum == COUNT(duration))');
+    }
+
+    /**
+     * Drift guard for nightowl_notification_rollups at its (group_hash, channel)
+     * grain, incl. the hist-bin sum == COUNT(duration) invariant behind the avg
+     * denominator. Half the batch has NULL duration (queued/failed).
+     */
+    public function test_notification_rollup_matches_raw_reaggregation(): void
+    {
+        $records = [];
+        $channels = ['mail', 'database', 'slack'];
+        for ($i = 1; $i <= 24; $i++) {
+            $records[] = $this->sim->makeNotification([
+                'trace_id' => "drift-notif-{$i}",
+                '_group' => 'ng'.($i % 3),
+                'class' => 'App\\Notifications\\N'.($i % 3),
+                'channel' => $channels[$i % 3],
+                'queued' => $i % 4 === 0,
+                'failed' => $i % 5 === 0,
+                'duration' => $i % 2 === 0 ? null : $i * 500,
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $histSum = 'SUM('.implode(') + SUM(', \NightOwl\Support\QueryHistogram::columns()).')';
+
+        $rollup = self::$pdo->query(
+            "SELECT group_hash, channel,
+                    SUM(call_count) AS cc,
+                    SUM(queued_count) AS qc,
+                    SUM(failed_count) AS fc,
+                    SUM(total_duration) AS td,
+                    {$histSum} AS dc
+             FROM nightowl_notification_rollups
+             GROUP BY group_hash, channel ORDER BY group_hash, channel"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(group_hash, '') AS group_hash, COALESCE(channel, '') AS channel,
+                    COUNT(*) AS cc,
+                    SUM(CASE WHEN queued = true THEN 1 ELSE 0 END) AS qc,
+                    SUM(CASE WHEN failed = true THEN 1 ELSE 0 END) AS fc,
+                    COALESCE(SUM(duration), 0) AS td,
+                    COUNT(duration) AS dc
+             FROM nightowl_notifications
+             GROUP BY COALESCE(group_hash, ''), COALESCE(channel, '') ORDER BY group_hash, channel"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'notification (group_hash, channel) rollup must reproduce a raw re-aggregation of nightowl_notifications');
+    }
+
     /**
      * Drift guard: the rollup, summed across its keys, must exactly reproduce a
      * raw re-aggregation of nightowl_queries. This is the single highest-value
@@ -1294,7 +1550,9 @@ class RecordWriterTest extends TestCase
             'nightowl_scheduled_tasks', 'nightowl_logs', 'nightowl_users',
             'nightowl_settings', 'nightowl_alert_channels', 'nightowl_query_rollups',
             'nightowl_request_rollups', 'nightowl_job_rollups', 'nightowl_outgoing_request_rollups',
-            'nightowl_cache_rollups',
+            'nightowl_cache_rollups', 'nightowl_user_rollups', 'nightowl_user_job_rollups',
+            'nightowl_user_exception_rollups', 'nightowl_exception_rollups',
+            'nightowl_mail_rollups', 'nightowl_notification_rollups',
         ];
 
         foreach ($tables as $table) {
