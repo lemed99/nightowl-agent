@@ -20,7 +20,7 @@ in the git tags.
   `NIGHTOWL_INGEST_TIMEOUT` (default `0.5`s) tunes the connect/write timeout for
   the network hop. Both default to the loopback listener, so existing
   single-host installs are unchanged. See the new [Laravel Vapor
-  guide](https://github.com/lemed99/nightowl-docs/blob/main/agent/vapor.mdx).
+  guide](https://docs.usenightowl.com/agent/vapor).
 
 - **Wider dashboard time ranges now serve from pre-aggregated rollups for more
   sections.** The agent already maintained per-minute rollups for queries and
