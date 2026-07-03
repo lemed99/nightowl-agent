@@ -44,6 +44,8 @@ in the git tags.
   of failing the shared drain transaction and head-of-line-blocking the whole
   pipeline.
 
+## [1.2.6] - 2026-07-02
+
 ### Fixed
 
 - **Job attempt detail pages no longer time out.** Opening a job attempt walks
