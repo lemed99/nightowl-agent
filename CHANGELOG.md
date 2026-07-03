@@ -5,6 +5,20 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.8] - 2026-07-03
+
+### Fixed
+
+- **`nightowl:backfill-rollups` no longer aborts on a queued-only minute.** For a
+  minute bucket that contained only a queued job dispatch (or any duration-bearing
+  type with no duration-carrying rows in that bucket), the backfill's
+  `SUM(...) FILTER (...)` over zero matching rows returned `NULL`, which violated
+  the `hist_NN NOT NULL` constraint and killed the whole backfill with
+  `SQLSTATE[23502]`. The histogram selects are now `COALESCE(..., 0)` — matching
+  the live drain, which already writes `0` for such buckets. Affects the job,
+  mail and notification rollups; re-run `nightowl:backfill-rollups` after
+  upgrading.
+
 ## [1.2.7] - 2026-07-03
 
 ### Added

@@ -2,6 +2,7 @@
 
 namespace NightOwl\Tests\Unit;
 
+use NightOwl\Support\QueryHistogram;
 use NightOwl\Support\RollupSpecs;
 use PHPUnit\Framework\TestCase;
 
@@ -35,6 +36,24 @@ class RollupSpecTest extends TestCase
             implode(' ', $selects),
             'backfill duration aggregates must FILTER to attempt rows (exclude the dispatch row)',
         );
+    }
+
+    public function test_backfill_histogram_columns_are_coalesced_to_zero(): void
+    {
+        // A duration-predicate FILTER matching zero rows (a bucket with only a
+        // queued dispatch, no attempt) makes `SUM(...) FILTER (...)` return NULL,
+        // which violates the hist_NN NOT NULL constraint. Every hist select must be
+        // COALESCE(..., 0) so such buckets backfill 0, matching the live drain.
+        $spec = RollupSpecs::jobs();
+        $histCase = QueryHistogram::caseSql('duration');
+        ['selects' => $selects] = $spec->backfillSql($histCase);
+
+        $histSelects = array_values(array_filter($selects, fn (string $s): bool => str_contains($s, 'CASE WHEN duration')));
+        $this->assertNotEmpty($histSelects, 'the jobs backfill must emit histogram selects');
+        foreach ($histSelects as $s) {
+            $this->assertStringStartsWith('COALESCE(', $s, 'each hist backfill select must be COALESCE-wrapped so a zero-row FILTER yields 0, not NULL');
+            $this->assertStringEndsWith(', 0)', $s);
+        }
     }
 
     public function test_requests_spec_has_no_duration_predicate(): void

@@ -108,7 +108,12 @@ final class RollupSpec
         if ($this->hasHistogram) {
             $columns = [...$columns, ...array_keys($histCase)];
             foreach ($histCase as $expr) {
-                $selects[] = $expr.$filter;
+                // COALESCE to 0: a duration-predicate FILTER matching zero rows
+                // (e.g. a bucket with only a queued dispatch and no attempt) makes
+                // SUM(...) FILTER (...) return NULL, which violates the hist_NN
+                // NOT NULL constraint. The live drain writes 0 for such buckets, so
+                // the backfill must too. total_duration above is already coalesced.
+                $selects[] = 'COALESCE('.$expr.$filter.', 0)';
             }
         }
 
