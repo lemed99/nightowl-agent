@@ -571,6 +571,76 @@ class RecordWriterTest extends TestCase
     }
 
     /**
+     * Drift guard: COUNT(DISTINCT server) per fingerprint off nightowl_exception_
+     * server_rollups must reproduce the same distinct-server count over raw
+     * nightowl_exceptions — the exception detail "servers affected" stat.
+     */
+    public function test_exception_server_rollup_matches_raw_distinct_servers(): void
+    {
+        $servers = ['web-1', 'web-2', 'web-1', 'worker-1'];
+        $records = [];
+        for ($i = 0; $i < 12; $i++) {
+            $records[] = $this->sim->makeException([
+                'trace_id' => "svr-exc-{$i}",
+                'class' => 'App\\Exceptions\\SvrE'.($i % 2),
+                'file' => '/app/SvrE'.($i % 2).'.php',
+                'line' => 5 + ($i % 2),
+                'server' => $servers[$i % count($servers)],
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $rollup = self::$pdo->query(
+            "SELECT fingerprint, COUNT(DISTINCT server) AS servers
+             FROM nightowl_exception_server_rollups WHERE server <> ''
+             GROUP BY fingerprint ORDER BY fingerprint"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(fingerprint, '') AS fingerprint, COUNT(DISTINCT server) AS servers
+             FROM nightowl_exceptions WHERE server IS NOT NULL AND server <> ''
+             GROUP BY COALESCE(fingerprint, '') ORDER BY fingerprint"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'server rollup COUNT(DISTINCT server) per fingerprint must match raw');
+    }
+
+    /**
+     * Drift guard: SUM(authenticated_count) per fingerprint off nightowl_exception_
+     * rollups must equal the raw count of occurrences carrying a user_id — the
+     * detail page's authenticated-vs-guest split (guest = call_count - authenticated).
+     */
+    public function test_exception_rollup_authenticated_count_matches_raw(): void
+    {
+        $records = [];
+        for ($i = 0; $i < 12; $i++) {
+            $records[] = $this->sim->makeException([
+                'trace_id' => "auth-exc-{$i}",
+                'class' => 'App\\Exceptions\\AuthE'.($i % 2),
+                'file' => '/app/AuthE'.($i % 2).'.php',
+                'line' => 7 + ($i % 2),
+                'user' => $i % 3 === 0 ? null : 'user-'.$i, // ~1/3 guest (null user_id)
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $rollup = self::$pdo->query(
+            "SELECT fingerprint, SUM(call_count) AS cc, SUM(authenticated_count) AS ac
+             FROM nightowl_exception_rollups GROUP BY fingerprint ORDER BY fingerprint"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(fingerprint, '') AS fingerprint, COUNT(*) AS cc,
+                    SUM(CASE WHEN user_id IS NOT NULL AND user_id <> '' THEN 1 ELSE 0 END) AS ac
+             FROM nightowl_exceptions GROUP BY COALESCE(fingerprint, '') ORDER BY fingerprint"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'authenticated_count per fingerprint must match the raw count of user-present occurrences');
+    }
+
+    /**
      * Drift guard for nightowl_mail_rollups. Beyond the counters, it asserts the
      * SUM of histogram bins equals COUNT(duration) — writeRollup bins exactly the
      * non-null durations, so that sum is the avg denominator the read path uses
@@ -1552,6 +1622,7 @@ class RecordWriterTest extends TestCase
             'nightowl_request_rollups', 'nightowl_job_rollups', 'nightowl_outgoing_request_rollups',
             'nightowl_cache_rollups', 'nightowl_user_rollups', 'nightowl_user_job_rollups',
             'nightowl_user_exception_rollups', 'nightowl_exception_rollups',
+            'nightowl_exception_server_rollups',
             'nightowl_mail_rollups', 'nightowl_notification_rollups',
         ];
 

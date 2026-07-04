@@ -1258,6 +1258,10 @@ final class RecordWriter
         if ($this->rollupEnabled('nightowl_exception_rollups')) {
             $this->writeRollup($records, RollupSpecs::exceptionGroups(), $nowTs);
         }
+        // Distinct-server-per-fingerprint (exception detail "servers affected"):
+        if ($this->rollupEnabled('nightowl_exception_server_rollups')) {
+            $this->writeRollup($records, RollupSpecs::exceptionServers(), $nowTs);
+        }
     }
 
     /**

@@ -27,6 +27,7 @@ final class RollupSpecs
             self::jobUsers(),
             self::exceptionUsers(),
             self::exceptionGroups(),
+            self::exceptionServers(),
             self::mail(),
             self::notifications(),
         ];
@@ -251,26 +252,61 @@ final class RollupSpecs
      */
     public static function exceptionGroups(): RollupSpec
     {
-        // Must reproduce writeExceptions()'s fingerprint column exactly: the SDK
-        // `_group` when present, else a local hash of class|code|file|line.
-        $fingerprint = static fn (array $r): string => ! empty($r['_group'])
-            ? (string) $r['_group']
-            : md5(($r['class'] ?? '').'|'.($r['code'] ?? '').'|'.($r['file'] ?? '').'|'.($r['line'] ?? ''));
-
         return new RollupSpec(
             table: 'nightowl_exception_rollups',
             source: 'nightowl_exceptions',
             groupColumns: [
-                'fingerprint' => ['php' => $fingerprint, 'sql' => "COALESCE(fingerprint, '')"],
+                'fingerprint' => ['php' => self::exceptionFingerprint(), 'sql' => "COALESCE(fingerprint, '')"],
             ],
             counters: [
                 'handled_count' => ['php' => static fn (array $r): bool => filter_var($r['handled'] ?? false, FILTER_VALIDATE_BOOLEAN), 'sql' => 'handled = true'],
                 'unhandled_count' => ['php' => static fn (array $r): bool => ! filter_var($r['handled'] ?? false, FILTER_VALIDATE_BOOLEAN), 'sql' => 'handled != true OR handled IS NULL'],
+                // Occurrences with a user attached — powers the detail page's
+                // authenticated-vs-guest split (guest = call_count - authenticated_count).
+                // The '0' literal must count as authenticated, so test for a non-empty
+                // STRING (not empty(), which treats '0' as empty) to match the SQL side.
+                'authenticated_count' => ['php' => static fn (array $r): bool => isset($r['user']) && (string) $r['user'] !== '', 'sql' => "user_id IS NOT NULL AND user_id != ''"],
             ],
             representatives: [],
             hasDuration: false,
             hasHistogram: false,
         );
+    }
+
+    /**
+     * Distinct-server-per-fingerprint rollup keyed (fingerprint, server): powers the
+     * exception detail "servers affected" stat as COUNT(DISTINCT server) over the
+     * compact rollup instead of an unbounded distinct scan of raw nightowl_exceptions.
+     * Count-only — server presence is the signal (call_count rides along). Mirrors the
+     * queries/connection + notifications/channel two-dimension rollups.
+     */
+    public static function exceptionServers(): RollupSpec
+    {
+        return new RollupSpec(
+            table: 'nightowl_exception_server_rollups',
+            source: 'nightowl_exceptions',
+            groupColumns: [
+                'fingerprint' => ['php' => self::exceptionFingerprint(), 'sql' => "COALESCE(fingerprint, '')"],
+                'server' => ['php' => static fn (array $r): string => (string) ($r['server'] ?? ''), 'sql' => "COALESCE(server, '')"],
+            ],
+            counters: [],
+            representatives: [],
+            hasDuration: false,
+            hasHistogram: false,
+        );
+    }
+
+    /**
+     * The exception fingerprint extractor, shared by exceptionGroups() and
+     * exceptionServers() so their PK keys can never drift apart. MUST reproduce
+     * writeExceptions()'s fingerprint column exactly: the SDK `_group` when present,
+     * else a local hash of class|code|file|line.
+     */
+    private static function exceptionFingerprint(): callable
+    {
+        return static fn (array $r): string => ! empty($r['_group'])
+            ? (string) $r['_group']
+            : md5(($r['class'] ?? '').'|'.($r['code'] ?? '').'|'.($r['file'] ?? '').'|'.($r['line'] ?? ''));
     }
 
     /**

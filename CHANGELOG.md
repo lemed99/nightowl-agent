@@ -5,6 +5,25 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.9] - 2026-07-04
+
+### Added
+
+- **The exception detail page's "servers affected" and authenticated/guest counts
+  now come from rollups.** Two new pre-aggregated summaries back the exception
+  detail page so it no longer scans raw `nightowl_exceptions` for a high-volume
+  fingerprint — an unbounded `COUNT(DISTINCT server)` / `SUM(CASE WHEN user_id …)`
+  that could trip the tenant statement timeout (`SQLSTATE 57014`):
+  - a new **`nightowl_exception_server_rollups`** table (one row per
+    fingerprint × server × minute × environment) backs the distinct-server count, and
+  - a new **`authenticated_count`** column on `nightowl_exception_rollups` backs the
+    authenticated-vs-guest split (guest = `call_count − authenticated_count`).
+
+  Run `php artisan nightowl:migrate`, then `php artisan nightowl:backfill-rollups`,
+  after upgrading. Until the migration runs, the agent's column guard skips writing
+  `nightowl_exception_rollups` (so migrate promptly); until the backfill runs, the
+  new summaries only cover telemetry drained after the upgrade.
+
 ## [1.2.8] - 2026-07-03
 
 ### Fixed

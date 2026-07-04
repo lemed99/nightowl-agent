@@ -57,12 +57,48 @@ class RollupSpecsExpansionTest extends TestCase
         $this->assertSame('handled = true', $handled['sql']);
         $this->assertSame('handled != true OR handled IS NULL', $unhandled['sql']);
 
+        // authenticated_count: occurrences carrying a user_id (guest = call_count -
+        // authenticated_count). '0' is a valid user id, so the predicate tests for a
+        // non-empty string, not empty() (which would treat '0' as absent).
+        $authed = $spec->counters['authenticated_count'];
+        $this->assertTrue(($authed['php'])(['user' => 'u1']));
+        $this->assertTrue(($authed['php'])(['user' => '0']), "'0' is a real user id → authenticated");
+        $this->assertFalse(($authed['php'])(['user' => '']));
+        $this->assertFalse(($authed['php'])([]), 'missing user → guest');
+        $this->assertSame("user_id IS NOT NULL AND user_id != ''", $authed['sql']);
+
         // Count-only: no duration/histogram.
         $this->assertFalse($spec->hasDuration);
         $this->assertFalse($spec->hasHistogram);
         ['columns' => $columns, 'groupByCount' => $groupBy] = $spec->backfillSql([]);
-        $this->assertSame(['fingerprint', 'bucket_start', 'environment', 'call_count', 'handled_count', 'unhandled_count'], $columns);
+        $this->assertSame(['fingerprint', 'bucket_start', 'environment', 'call_count', 'handled_count', 'unhandled_count', 'authenticated_count'], $columns);
         $this->assertSame(3, $groupBy);
+    }
+
+    public function test_exception_servers_spec_is_fingerprint_server_keyed(): void
+    {
+        $spec = RollupSpecs::exceptionServers();
+        $this->assertSame('nightowl_exception_server_rollups', $spec->table);
+        $this->assertSame('nightowl_exceptions', $spec->source);
+        $this->assertSame(['fingerprint', 'server'], $spec->groupColumnNames());
+        $this->assertSame([], $spec->counterColumns(), 'count-only: server presence is the signal');
+        $this->assertFalse($spec->hasDuration);
+        $this->assertFalse($spec->hasHistogram);
+
+        // fingerprint matches exceptionGroups (byte-identical to writeExceptions).
+        $this->assertSame('grp-9', ($spec->groupColumns['fingerprint']['php'])(['_group' => 'grp-9']));
+        $this->assertSame(
+            md5('RuntimeException|42|/app/x.php|10'),
+            ($spec->groupColumns['fingerprint']['php'])(['class' => 'RuntimeException', 'code' => '42', 'file' => '/app/x.php', 'line' => 10]),
+        );
+        // server dimension.
+        $this->assertSame('web-1', ($spec->groupColumns['server']['php'])(['server' => 'web-1']));
+        $this->assertSame('', ($spec->groupColumns['server']['php'])([]));
+        $this->assertSame("COALESCE(server, '')", $spec->groupColumns['server']['sql']);
+
+        ['columns' => $columns, 'groupByCount' => $groupBy] = $spec->backfillSql([]);
+        $this->assertSame(['fingerprint', 'server', 'bucket_start', 'environment', 'call_count'], $columns);
+        $this->assertSame(4, $groupBy);
     }
 
     public function test_mail_spec_is_group_hash_with_duration_histogram(): void
