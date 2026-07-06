@@ -3,11 +3,14 @@
 namespace NightOwl\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use NightOwl\Support\RollupSpecs;
 
 class MigrateCommand extends Command
 {
-    protected $signature = 'nightowl:migrate';
+    protected $signature = 'nightowl:migrate
+        {--no-backfill : Skip auto-populating newly created rollup tables (backfill manually with nightowl:backfill-rollups)}';
 
     protected $description = 'Create or update the NightOwl tables (idempotent — safe to run on every environment and deploy)';
 
@@ -31,12 +34,71 @@ class MigrateCommand extends Command
 
         $this->baselineExistingSchema($path);
 
-        return $this->call('migrate', [
+        $exit = $this->call('migrate', [
             '--database' => 'nightowl',
             '--path' => $path,
             '--realpath' => true,
             '--force' => true,
         ]);
+
+        if ($exit === self::SUCCESS && ! $this->option('no-backfill')) {
+            $this->backfillEmptyRollups();
+        }
+
+        return $exit;
+    }
+
+    /**
+     * Populate any rollup table that exists but is empty from existing raw
+     * telemetry.
+     *
+     * This closes a trap the API's read path sets: it switches a section to its
+     * rollup table the moment that table EXISTS (a per-tenant `to_regclass`
+     * probe), falling back to raw only when the table is *absent*. So a rollup
+     * table that's been created but not yet populated makes wide-range views
+     * read zero — strictly worse than the raw fallback it replaced. That's
+     * exactly what a bare `nightowl:migrate` produced: it created the rollup
+     * tables and left them empty until someone remembered to run
+     * `nightowl:backfill-rollups`. Doing it here makes migrate self-healing.
+     *
+     * Scoped to *empty* tables so a routine re-deploy doesn't re-scan the raw
+     * history behind already-maintained rollups: a populated table is left to
+     * the live drain. An empty table on a no-traffic install is a cheap no-op
+     * (backfill finds no source rows). Backfill is idempotent (replace-per-
+     * bucket) and throttled, so this is safe to run on every deploy.
+     */
+    private function backfillEmptyRollups(): void
+    {
+        $schema = Schema::connection('nightowl');
+        $conn = DB::connection('nightowl');
+
+        $emptyTables = [];
+        foreach (RollupSpecs::all() as $spec) {
+            if ($schema->hasTable($spec->table) && ! $conn->table($spec->table)->exists()) {
+                $emptyTables[] = $spec->table;
+            }
+        }
+
+        if ($emptyTables === []) {
+            return;
+        }
+
+        $this->newLine();
+        $this->info(sprintf(
+            'Populating %d empty rollup table(s) from raw telemetry so wide-range views read correctly...',
+            count($emptyTables),
+        ));
+
+        foreach ($emptyTables as $table) {
+            $this->call('nightowl:backfill-rollups', ['--type' => $table]);
+        }
+
+        $this->newLine();
+        $this->warn(
+            'Rollup tables populated. If the agent daemon was already running before this migrate, '
+            .'restart it (nightowl:agent) so it starts writing rollups for new telemetry — it caches '
+            .'which rollup tables exist at boot.'
+        );
     }
 
     /**

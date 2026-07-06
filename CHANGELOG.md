@@ -5,6 +5,37 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.10] - 2026-07-06
+
+### Changed
+
+- **`nightowl:migrate` now auto-populates rollup tables it creates.** The dashboard's
+  read path switches a section to its rollup table the moment that table *exists*,
+  falling back to raw telemetry only when the table is *absent*. So a bare
+  `nightowl:migrate` — which created the rollup tables but left them empty until you
+  remembered to run `nightowl:backfill-rollups` — made wide-range views (jobs,
+  authenticated users, and the rest) read **0** even though the raw data was intact.
+  Migrate now backfills any rollup table it leaves existing-but-empty, straight from
+  existing raw telemetry, so the counts are right immediately. It's scoped to empty
+  tables, so a routine re-deploy over already-populated rollups is a no-op; pass
+  `--no-backfill` to skip and backfill manually. After migrating, restart a
+  long-running agent so it begins writing rollups for new telemetry (it caches which
+  rollup tables exist at boot).
+
+### Fixed
+
+- **The drain no longer duplicates committed telemetry when the local buffer goes
+  unwritable.** If a batch's `write()` committed to Postgres but the follow-up
+  `markSynced()` failed — the common cause being a full local disk, the very
+  condition that made the SQLite buffer back up — those rows stayed `synced=0` and
+  the next drain tick re-fetched and re-COPY'd data already durably in Postgres,
+  duplicating it without bound for as long as the disk stayed full. The drain now
+  holds the committed-but-unmarked ids and retries only the *mark* (never the write)
+  until the buffer accepts it again, and surfaces the stall in the drain metrics
+  (`buffer_mark_stalls`, `buffer_mark_stalled_since`, `committed_unmarked`) so a
+  paused-but-not-duplicating drain is visible rather than silent. The at-most-one-
+  batch-duplicate-on-hard-kill crash-safety tradeoff is unchanged.
+
 ## [1.2.9] - 2026-07-04
 
 ### Added

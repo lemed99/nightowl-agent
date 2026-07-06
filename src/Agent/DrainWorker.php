@@ -90,6 +90,27 @@ final class DrainWorker
     // shipped as quarantined_live for observability.
     private int $quarantinedLive = 0;
 
+    // Rows whose write() COMMITTED to Postgres but whose markSynced() then failed
+    // (the local SQLite buffer went unwritable — a full disk is the common cause,
+    // and the same condition that made the buffer back up in the first place).
+    // They are still synced=0, so re-fetching them (fetchPending selects synced=0)
+    // and re-writing would re-COPY data already durably in Postgres — an unbounded
+    // duplication storm for as long as the buffer stays unwritable. Instead we hold
+    // the ids and retry ONLY the mark (flushed at the top of drainBatch) — never
+    // the write — until the buffer accepts it again. Held in memory: a hard kill
+    // re-drains at most this one batch on restart (the documented
+    // at-most-one-batch-duplicate crash-safety tradeoff, unchanged).
+    /** @var int[] */
+    private array $committedUnmarkedIds = [];
+
+    // Observability for the buffer-unwritable stall: how many post-commit marks
+    // have failed, and when the current stall began (0.0 = not stalled). Shipped in
+    // the drain metrics so a stuck-but-not-duplicating drain is visible rather than
+    // silent. Distinct from lastWriteAt, which is a Postgres write rejection.
+    private int $bufferMarkStalls = 0;
+
+    private float $bufferMarkStalledSince = 0.0;
+
     private const EWMA_ALPHA = 0.3;
 
     public function __construct(
@@ -333,6 +354,21 @@ final class DrainWorker
         $writer->lastWriteError = null;
 
         try {
+            // A prior batch committed to Postgres but its markSynced() failed (the
+            // local buffer went unwritable, typically a full disk). Those rows are
+            // still synced=0, so fetching now would re-COPY data already durably in
+            // Postgres. Re-mark them FIRST, and never re-fetch/re-write until the
+            // buffer accepts the mark again — this is the guard against a
+            // duplication storm while the disk is full. If the mark still fails it
+            // throws to the catch below, the ids stay held, and the loop backs off.
+            if (! empty($this->committedUnmarkedIds)) {
+                $buffer->markSynced($this->committedUnmarkedIds);
+                $this->committedUnmarkedIds = [];
+                $this->bufferMarkStalledSince = 0.0;
+
+                return true;
+            }
+
             $rows = $this->totalWorkers > 1
                 ? $buffer->claimBatch($this->workerId, $this->batchSize)
                 : $buffer->fetchPending($this->batchSize);
@@ -385,7 +421,7 @@ final class DrainWorker
                     array_push($records, ...$u['records']);
                 }
                 $writer->write($records);
-                $buffer->markSynced(array_column($units, 'id'));
+                $this->markCommitted($buffer, array_column($units, 'id'));
                 $this->onDrainSuccess($writer);
                 $result = ['drained' => count($units), 'quarantined' => 0, 'deferred' => 0];
             }
@@ -500,9 +536,10 @@ final class DrainWorker
         // double-counted additive rollups). Keeping markSynced() outside the
         // write() try lets the fault propagate to drainBatch's catch, which sees
         // lastWriteError === null and records it as a local buffer error (no PG
-        // diagnosis); the unmarked rows re-drain next loop — the documented
-        // at-most-one-batch-duplicate crash-safety tradeoff, never a bisection storm.
-        $buffer->markSynced($ids);
+        // diagnosis). markCommitted holds the committed ids so they are re-marked,
+        // never re-written, next loop — the documented at-most-one-batch-duplicate
+        // crash-safety tradeoff, never a bisection storm and never a re-COPY loop.
+        $this->markCommitted($buffer, $ids);
         $this->onDrainSuccess($writer);
 
         return ['drained' => count($units), 'quarantined' => 0, 'deferred' => 0];
@@ -529,7 +566,7 @@ final class DrainWorker
 
         try {
             $writer->writeForceInsert($unit['records']);
-            $buffer->markSynced($ids);
+            $this->markCommitted($buffer, $ids);
             $this->onDrainSuccess($writer);
 
             return ['drained' => 1, 'quarantined' => 0, 'deferred' => 0];
@@ -576,6 +613,42 @@ final class DrainWorker
      * per-table schema mismatch still climbs to the threshold even while bisection
      * drains clean siblings of other tables (the bug the old blanket reset caused).
      */
+    /**
+     * Mark rows synced after their write() committed to Postgres, holding them for
+     * a mark-only retry if the local buffer write fails.
+     *
+     * markSynced() is a SQLite UPDATE. When the buffer is unwritable — a full local
+     * disk being the common cause, and the very condition that made the buffer back
+     * up — that UPDATE throws even though the rows are already durably in Postgres.
+     * Re-throwing WITHOUT remembering the ids lets the run loop re-fetch them (they
+     * are still synced=0) and re-COPY them next tick, and the next, duplicating
+     * committed telemetry without bound for as long as the disk stays full. So we
+     * stash the ids; drainBatch re-marks them (never re-writes) before fetching
+     * anything new, and only advances once the buffer accepts the mark again.
+     *
+     * @param  int[]  $ids
+     */
+    private function markCommitted(SqliteBuffer $buffer, array $ids): void
+    {
+        try {
+            $buffer->markSynced($ids);
+        } catch (\Throwable $e) {
+            $this->committedUnmarkedIds = array_values(
+                array_unique([...$this->committedUnmarkedIds, ...$ids])
+            );
+            $this->bufferMarkStalls++;
+            if ($this->bufferMarkStalledSince === 0.0) {
+                $this->bufferMarkStalledSince = microtime(true);
+            }
+            error_log(
+                '[NightOwl Drain] Buffer unwritable — '.count($ids).' rows committed to '
+                .'Postgres could not be marked synced (likely a full local disk). Draining '
+                .'paused to avoid duplicating committed data; resumes when the buffer is writable.'
+            );
+            throw $e;
+        }
+    }
+
     private function onDrainSuccess(RecordWriter $writer): void
     {
         $this->lastWriteOkAt = microtime(true);
@@ -667,6 +740,11 @@ final class DrainWorker
             'last_write_at' => $this->lastWriteAt,
             'last_write_ok_at' => $this->lastWriteOkAt,
             'last_conn_fail_at' => $this->lastConnFailAt,
+            // Buffer-unwritable stall (full local disk): the drain is paused, NOT
+            // duplicating. buffer_mark_stalled_since > 0 means a stall is in progress.
+            'buffer_mark_stalls' => $this->bufferMarkStalls,
+            'buffer_mark_stalled_since' => $this->bufferMarkStalledSince,
+            'committed_unmarked' => count($this->committedUnmarkedIds),
             'quarantined_live' => $this->quarantinedLive,
             // Cumulative since worker start (never decays). The DRAIN_QUARANTINE
             // diagnosis reads THIS, not quarantined_live (the prunable buffer gauge

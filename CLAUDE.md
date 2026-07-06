@@ -101,7 +101,7 @@ src/Commands/
 |---------|---------|
 | `nightowl:agent [--driver=async\|sync]` | Start agent (TCP + UDP + Health API) |
 | `nightowl:install` | Publish config, create/update schema (via `nightowl:migrate`), fork-safety probe |
-| `nightowl:migrate` | Idempotent schema sync — `migrate --database=nightowl` (history in the nightowl DB) + baseline adoption of an already-present schema. Run on each deploy. |
+| `nightowl:migrate` | Idempotent schema sync — `migrate --database=nightowl` (history in the nightowl DB) + baseline adoption of an already-present schema. Run on each deploy. **Auto-backfills** any rollup table it leaves existing-but-empty (the API read path serves zeros off an empty rollup, so migrate populates it from raw immediately); scoped to empty tables, so a re-deploy over populated rollups is a no-op. Skip with `--no-backfill`. |
 | `nightowl:prune` | Delete telemetry older than retention (14d default); query rollups pruned separately (90d default) |
 | `nightowl:backfill-rollups` | Backfill every `nightowl_*_rollups` table from raw telemetry (chunked, throttled, idempotent; skips the trailing 10min so it never races live drain; `--type=` restricts to one table) |
 | `nightowl:clear` | Truncate all NightOwl tables |
