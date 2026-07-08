@@ -66,6 +66,50 @@ final class SqliteBuffer
     }
 
     /**
+     * Verify the buffer file can actually be written, throwing a clear error if not.
+     *
+     * The buffer's whole job is to record drain progress (markSynced). If the file
+     * is readable but not writable — most often because the agent is running as a
+     * different user than owns agent-buffer.sqlite, or the disk/quota is full, or
+     * inodes are exhausted — the drain would commit rows to Postgres and then fail
+     * to mark them done, re-COPYing the same rows every loop: silent, unbounded
+     * telemetry duplication. The agent calls this at startup and refuses to run when
+     * it fails, turning that failure mode into an obvious error instead.
+     *
+     * The probe writes a real row to the on-disk table inside a rolled-back
+     * transaction (a TEMP table would not do — temp_store is MEMORY here, so it
+     * would never touch the file). INSERT is what surfaces a read-only file, wrong
+     * owner, full disk/quota, or exhausted inodes.
+     *
+     * @throws RuntimeException if the buffer cannot be written.
+     */
+    public function assertWritable(): void
+    {
+        try {
+            $this->pdo->beginTransaction();
+            $this->pdo->exec(
+                "INSERT INTO buffer (payload, record_count, created_at) VALUES ('__nightowl_write_probe__', 0, 0)"
+            );
+            $this->pdo->rollBack();
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                try {
+                    $this->pdo->rollBack();
+                } catch (\Throwable) {
+                    // The rollback can itself fail on an unwritable file; the
+                    // original error below is the one that matters.
+                }
+            }
+
+            throw new RuntimeException(
+                "SQLite buffer at {$this->path} is not writable: ".$e->getMessage(),
+                0,
+                $e
+            );
+        }
+    }
+
+    /**
      * Append a pre-validated JSON payload string directly to the buffer.
      * Skips json_encode — the raw string from the wire format is stored as-is.
      * This eliminates ~30-50us of json_encode overhead per payload on the hot path.
@@ -156,6 +200,16 @@ final class SqliteBuffer
     }
 
     /**
+     * SQLite caps host parameters per statement (SQLITE_MAX_VARIABLE_NUMBER — 999
+     * on builds before 3.32). markSynced()/quarantine() can carry a whole drain
+     * batch of ids (NIGHTOWL_DRAIN_BATCH_SIZE, default 5000), so their IN() lists
+     * are chunked well under that cap. Without it, a large batch's UPDATE throws
+     * "too many SQL variables", the mark never lands, and the committed batch
+     * re-drains every loop — silent, unbounded telemetry duplication.
+     */
+    private const ID_IN_CHUNK = 500;
+
+    /**
      * Mark the given row IDs as synced (fully drained).
      *
      * @param  int[]  $ids
@@ -166,9 +220,46 @@ final class SqliteBuffer
             return;
         }
 
-        $placeholders = implode(',', array_fill(0, count($ids), '?'));
-        $stmt = $this->pdo->prepare("UPDATE buffer SET synced = 1 WHERE id IN ({$placeholders})");
-        $stmt->execute(array_values($ids));
+        $this->chunkedIdUpdate('UPDATE buffer SET synced = 1 WHERE id IN (%s)', array_values($ids));
+    }
+
+    /**
+     * Run an UPDATE whose `id IN (...)` list is chunked under SQLite's host-parameter
+     * cap (ID_IN_CHUNK). Leading bound params (e.g. a created_at re-stamp) precede the
+     * id placeholders in the template's `?`s and are re-bound per chunk. When more than
+     * one chunk is needed they run in a single transaction so the update stays
+     * all-or-nothing (a half-marked batch would otherwise re-drain its unmarked tail).
+     *
+     * @param  string  $sqlTemplate  `UPDATE ... IN (%s)` — %s becomes the id placeholders
+     * @param  int[]  $ids
+     * @param  array<int, scalar>  $leadingParams  bound before the id placeholders
+     */
+    private function chunkedIdUpdate(string $sqlTemplate, array $ids, array $leadingParams = []): void
+    {
+        $chunks = array_chunk($ids, self::ID_IN_CHUNK);
+        $ownsTransaction = count($chunks) > 1 && ! $this->pdo->inTransaction();
+
+        if ($ownsTransaction) {
+            $this->pdo->beginTransaction();
+        }
+
+        try {
+            foreach ($chunks as $chunk) {
+                $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+                $stmt = $this->pdo->prepare(sprintf($sqlTemplate, $placeholders));
+                $stmt->execute([...$leadingParams, ...$chunk]);
+            }
+
+            if ($ownsTransaction) {
+                $this->pdo->commit();
+            }
+        } catch (\Throwable $e) {
+            if ($ownsTransaction && $this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+
+            throw $e;
+        }
     }
 
     /**
@@ -216,9 +307,11 @@ final class SqliteBuffer
         // row would otherwise be eligible for pruning immediately. (created_at is
         // only read by cleanup (synced=1) and pruneQuarantined (synced=-1), and a
         // row is only ever one of those, so re-stamping here is side-effect-free.)
-        $placeholders = implode(',', array_fill(0, count($ids), '?'));
-        $stmt = $this->pdo->prepare("UPDATE buffer SET synced = -1, created_at = ? WHERE id IN ({$placeholders})");
-        $stmt->execute([microtime(true), ...array_values($ids)]);
+        $this->chunkedIdUpdate(
+            'UPDATE buffer SET synced = -1, created_at = ? WHERE id IN (%s)',
+            array_values($ids),
+            [microtime(true)],
+        );
     }
 
     /**

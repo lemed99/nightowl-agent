@@ -53,6 +53,59 @@ class SqliteBufferTest extends TestCase
         $this->assertSame(0, $pending[0]['record_count']); // appendRaw sets count to 0
     }
 
+    // --- assertWritable (startup guard probe) ---
+
+    public function test_assert_writable_passes_on_a_healthy_buffer(): void
+    {
+        $this->buffer->assertWritable();
+
+        // The probe writes a real row inside a rolled-back transaction, so nothing
+        // is left behind.
+        $this->assertSame(0, $this->buffer->pendingCount(), 'the probe row must be rolled back');
+    }
+
+    public function test_assert_writable_throws_when_the_file_cannot_be_written(): void
+    {
+        // Make the buffer's own connection reject writes — stands in for a read-only
+        // file / wrong owner / full disk: SELECT still works, INSERT throws.
+        $prop = new \ReflectionProperty(SqliteBuffer::class, 'pdo');
+        $prop->setAccessible(true);
+        $prop->getValue($this->buffer)->exec('PRAGMA query_only = ON');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('is not writable');
+        $this->buffer->assertWritable();
+    }
+
+    public function test_mark_synced_handles_batches_larger_than_the_sql_variable_cap(): void
+    {
+        // 1200 ids > ID_IN_CHUNK (500) and > the old SQLITE_MAX_VARIABLE_NUMBER (999):
+        // the pre-chunk single-IN UPDATE would throw "too many SQL variables" on a
+        // pre-3.32 SQLite, the mark would fail, and the batch would re-drain forever.
+        for ($i = 0; $i < 1200; $i++) {
+            $this->buffer->appendRaw(json_encode(['i' => $i]));
+        }
+        $ids = array_column($this->buffer->fetchPending(2000), 'id');
+        $this->assertCount(1200, $ids);
+
+        $this->buffer->markSynced($ids);
+
+        $this->assertSame(0, $this->buffer->pendingCount(), 'every id in a large batch is marked synced');
+    }
+
+    public function test_quarantine_handles_batches_larger_than_the_sql_variable_cap(): void
+    {
+        for ($i = 0; $i < 1200; $i++) {
+            $this->buffer->appendRaw(json_encode(['i' => $i]));
+        }
+        $ids = array_column($this->buffer->fetchPending(2000), 'id');
+
+        $this->buffer->quarantine($ids);
+
+        $this->assertSame(0, $this->buffer->pendingCount());
+        $this->assertSame(1200, $this->buffer->quarantinedCount());
+    }
+
     public function testFetchPendingLimitsResults(): void
     {
         for ($i = 0; $i < 10; $i++) {

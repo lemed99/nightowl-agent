@@ -5,6 +5,38 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.11] - 2026-07-08
+
+### Fixed
+
+- **The drain no longer re-duplicates telemetry on large batches under older SQLite.**
+  After a batch drained to Postgres, the agent marked it done with a single
+  `UPDATE ... WHERE id IN (?, ? … )` carrying one bound variable per row. At the
+  default batch size (5,000) that exceeds SQLite's host-parameter cap
+  (`SQLITE_MAX_VARIABLE_NUMBER` = 999 on builds before 3.32), so the statement threw
+  "too many SQL variables" on every drain, the batch was never marked synced, and the
+  same rows were re-sent to Postgres each loop — duplicating request/query telemetry
+  without bound (observed as request counts inflated tens-to-hundreds of times over
+  reality). The mark now chunks its id list (500 per statement, in one transaction) so
+  it stays under the cap regardless of batch size or SQLite version. Drain batch size
+  and throughput are unchanged; `nightowl:clear` and poison-row quarantine use the same
+  safe path.
+- **`nightowl:clear` now truncates every telemetry *and* rollup table.** It previously
+  cleared only 10 raw tables, silently leaving `nightowl_logs` and all rollup tables
+  populated — so a "clear" left wide-range dashboard views reading from stale rollups.
+  The table set is now derived from the rollup registry, so a newly added rollup type
+  can never be missed again.
+
+### Added
+
+- **The agent refuses to start if it can't write its SQLite buffer.** On boot it probes
+  the buffer file with a real (rolled-back) write; if that fails — a full disk, an
+  exhausted quota or inode table, a read-only mount, or the agent running as a different
+  user than owns the buffer file — it exits with an actionable error instead of starting
+  and silently re-sending the same telemetry in a loop. Combined with the 1.2.10
+  buffer-unwritable guard, a buffer it can't write can no longer cause silent
+  duplication: the agent either won't start or pauses the drain, and says why.
+
 ## [1.2.10] - 2026-07-06
 
 ### Changed

@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Schema;
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\PortInUseException;
 use NightOwl\Agent\Server;
+use NightOwl\Agent\SqliteBuffer;
 
 class AgentCommand extends Command
 {
@@ -38,6 +39,10 @@ class AgentCommand extends Command
             config()->set('nightowl.agent.sqlite_path', $this->option('sqlite-path'));
         }
 
+        if (! $this->guardBufferWritable()) {
+            return self::FAILURE;
+        }
+
         $this->warnOnSchemaDrift();
 
         if ($driver === 'async') {
@@ -45,6 +50,50 @@ class AgentCommand extends Command
         }
 
         return $this->runSync($host, $port);
+    }
+
+    /**
+     * Refuse to start if the agent can't write its own SQLite buffer.
+     *
+     * markSynced() (recording drain progress) is a write to this file. If it's
+     * readable but not writable — the agent running as a different user than owns
+     * agent-buffer.sqlite is the classic cause, plus a full disk / account quota /
+     * exhausted inodes / read-only mount — the drain commits rows to Postgres and
+     * then can't mark them done, re-COPYing the same rows every loop: silent,
+     * unbounded telemetry duplication. Failing loudly here turns that into an
+     * obvious startup error. Constructing the buffer as the running user also
+     * creates the file with the right ownership on a fresh install.
+     */
+    private function guardBufferWritable(): bool
+    {
+        $path = (string) config('nightowl.agent.sqlite_path');
+
+        try {
+            $buffer = new SqliteBuffer($path);
+            $buffer->assertWritable();
+            unset($buffer); // close before any fork (WAL fork-safety invariant)
+
+            return true;
+        } catch (\Throwable $e) {
+            $dir = dirname($path);
+
+            $this->error('NightOwl agent cannot write its buffer database and will not start.');
+            $this->line('  Buffer: '.$path);
+            $this->line('  Reason: '.$e->getMessage());
+            $this->newLine();
+            $this->line('Most likely one of:');
+            $this->line("  • the agent is running as a different user than owns the buffer file");
+            $this->line("    (check `ls -l {$dir}` — run the agent as the file's owner, or delete the buffer to recreate it)");
+            $this->line('  • the disk or account quota is full, or inodes are exhausted (`df -h`, `df -i`, `quota`)');
+            $this->line('  • the filesystem is mounted read-only');
+            $this->newLine();
+            $this->line('Starting anyway would let the drain re-send the same rows in a loop (duplicated telemetry),');
+            $this->line("so the agent is stopping instead. Fix the above and restart; to reset the buffer, delete {$path}*");
+
+            error_log('[NightOwl Agent] Refusing to start — buffer not writable at '.$path.': '.$e->getMessage());
+
+            return false;
+        }
     }
 
     /**
