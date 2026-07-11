@@ -108,10 +108,10 @@ src/Commands/
 
 ## Database
 
-37 migrations, 22 tables (12 telemetry + 3 issues + alert_channels/settings + 5 rollups):
+39 migrations, 31 tables (12 telemetry + 3 issues + alert_channels/settings + 14 rollups):
 
 - **Telemetry**: requests, queries, exceptions, commands, jobs, cache_events, mail, notifications, outgoing_requests, scheduled_tasks, logs, users
-- **Rollups**: query_rollups, request_rollups, job_rollups, outgoing_request_rollups, cache_rollups — pre-aggregated per-minute summaries maintained at drain time. Driven by a declarative `RollupSpec` per type (`src/Support/RollupSpecs.php`) consumed by the generic `RecordWriter::writeRollup`, `nightowl:backfill-rollups`, and `PruneCommand`. Duration-bearing types carry √2-spaced `hist_NN` histogram bins for approximate windowed percentiles (`src/Support/QueryHistogram.php`); cache groups by `(key, store)` with no histogram. Queries keeps a bespoke drain path (`writeQueryRollups`) but shares the generic backfill/prune. See `specs/query_rollups.md`.
+- **Rollups** (14): query, request, job, outgoing_request, cache, mail, notification, command, scheduled_task (group_hash-keyed, duration + histogram); user, user_job, user_exception (per-user counts, no duration); exception, exception_server (fingerprint-keyed counts). Pre-aggregated per-minute summaries maintained at drain time. Driven by a declarative `RollupSpec` per type (`src/Support/RollupSpecs.php`) consumed by the generic `RecordWriter::writeRollup`, `nightowl:backfill-rollups`, `PruneCommand`, and `ClearCommand` — all iterate `RollupSpecs::all()`, so adding a spec (+ migration + one `writeRollup` call in the type's `writeX`) auto-propagates. Duration-bearing types carry √2-spaced `hist_NN` histogram bins for approximate windowed percentiles (`src/Support/QueryHistogram.php`); cache groups by `(key, store)` with no histogram. Queries keeps a bespoke drain path (`writeQueryRollups`) but shares the generic backfill/prune. See `specs/query_rollups.md`.
 - **Issues**: issues (fingerprint upsert, subtype: exception/performance/health, threshold_metrics, deploy), issue_activity (with `actor_type`/`actor_meta` for MCP), issue_comments (with actor columns)
 - **Alerts**: alert_channels, settings
 

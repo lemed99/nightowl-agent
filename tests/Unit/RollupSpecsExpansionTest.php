@@ -139,4 +139,73 @@ class RollupSpecsExpansionTest extends TestCase
         ['groupByCount' => $groupBy] = $spec->backfillSql([]);
         $this->assertSame(4, $groupBy);
     }
+
+    public function test_new_command_and_scheduled_task_specs_registered(): void
+    {
+        $tables = array_map(static fn ($s) => $s->table, RollupSpecs::all());
+        $this->assertContains('nightowl_command_rollups', $tables);
+        $this->assertContains('nightowl_scheduled_task_rollups', $tables);
+    }
+
+    public function test_command_spec_bands_match_exit_code_and_handle_null(): void
+    {
+        $spec = RollupSpecs::commands();
+        $this->assertSame('nightowl_command_rollups', $spec->table);
+        $this->assertSame('nightowl_commands', $spec->source);
+        $this->assertSame(['group_hash'], $spec->groupColumnNames());
+        $this->assertSame(['successful_count', 'unsuccessful_count'], $spec->counterColumns());
+        $this->assertTrue($spec->hasDuration);
+        $this->assertTrue($spec->hasHistogram);
+
+        $successful = $spec->counters['successful_count'];
+        $unsuccessful = $spec->counters['unsuccessful_count'];
+
+        // SQL bands are `exit_code = 0` / `exit_code != 0`.
+        $this->assertSame('exit_code = 0', $successful['sql']);
+        $this->assertSame('exit_code != 0', $unsuccessful['sql']);
+
+        // exit_code = 0 → successful only.
+        $this->assertTrue(($successful['php'])(['exit_code' => 0]));
+        $this->assertFalse(($unsuccessful['php'])(['exit_code' => 0]));
+        // exit_code = 1 → unsuccessful only.
+        $this->assertFalse(($successful['php'])(['exit_code' => 1]));
+        $this->assertTrue(($unsuccessful['php'])(['exit_code' => 1]));
+        // NULL / absent exit_code → NEITHER, matching SQL three-valued logic.
+        $this->assertFalse(($successful['php'])(['exit_code' => null]));
+        $this->assertFalse(($unsuccessful['php'])(['exit_code' => null]));
+        $this->assertFalse(($successful['php'])([]));
+        $this->assertFalse(($unsuccessful['php'])([]));
+
+        ['columns' => $columns] = $spec->backfillSql(QueryHistogram::caseSql('duration'));
+        $this->assertContains('total_duration', $columns);
+        $this->assertContains('hist_38', $columns);
+        $this->assertContains('command', $columns);
+    }
+
+    public function test_scheduled_task_spec_folds_success_into_processed(): void
+    {
+        $spec = RollupSpecs::scheduledTasks();
+        $this->assertSame('nightowl_scheduled_task_rollups', $spec->table);
+        $this->assertSame('nightowl_scheduled_tasks', $spec->source);
+        $this->assertSame(['group_hash'], $spec->groupColumnNames());
+        $this->assertSame(['failed_count', 'processed_count', 'skipped_count'], $spec->counterColumns());
+        $this->assertTrue($spec->hasDuration);
+        $this->assertTrue($spec->hasHistogram);
+
+        $processed = $spec->counters['processed_count'];
+        // The processed band folds in the legacy 'success' alias — both PHP and SQL.
+        $this->assertSame("status = 'processed' OR status = 'success'", $processed['sql']);
+        $this->assertTrue(($processed['php'])(['status' => 'processed']));
+        $this->assertTrue(($processed['php'])(['status' => 'success']));
+        $this->assertFalse(($processed['php'])(['status' => 'failed']));
+        $this->assertFalse(($processed['php'])(['status' => 'skipped']));
+
+        $this->assertTrue(($spec->counters['failed_count']['php'])(['status' => 'failed']));
+        $this->assertTrue(($spec->counters['skipped_count']['php'])(['status' => 'skipped']));
+
+        ['columns' => $columns] = $spec->backfillSql(QueryHistogram::caseSql('duration'));
+        $this->assertContains('command', $columns);
+        $this->assertContains('expression', $columns);
+        $this->assertContains('repeat_seconds', $columns);
+    }
 }

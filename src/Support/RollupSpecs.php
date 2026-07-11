@@ -30,6 +30,8 @@ final class RollupSpecs
             self::exceptionServers(),
             self::mail(),
             self::notifications(),
+            self::commands(),
+            self::scheduledTasks(),
         ];
     }
 
@@ -357,6 +359,68 @@ final class RollupSpecs
             representatives: [
                 // writeNotifications maps $r['class'] ?? $r['notification'] into the notification column.
                 'notification' => ['php' => static fn (array $r) => $r['class'] ?? $r['notification'] ?? null, 'sql' => 'MIN(notification)'],
+            ],
+            hasDuration: true,
+            hasHistogram: true,
+        );
+    }
+
+    /**
+     * nightowl_commands keyed by group_hash (command class) — powers the commands
+     * list/overview/charts. Success is exit_code = 0; failure is exit_code != 0,
+     * matching CommandController's raw bands verbatim. A NULL exit_code (never in
+     * practice) satisfies neither, exactly like the SQL `= 0` / `!= 0`. Every row
+     * carries one execution duration (no queued/attempt split), so no
+     * durationPredicate — writeRollup's own null-duration guard is enough.
+     */
+    public static function commands(): RollupSpec
+    {
+        return new RollupSpec(
+            table: 'nightowl_command_rollups',
+            source: 'nightowl_commands',
+            groupColumns: [
+                'group_hash' => ['php' => static fn (array $r): string => (string) ($r['_group'] ?? ''), 'sql' => "COALESCE(group_hash, '')"],
+            ],
+            counters: [
+                // Match `exit_code = 0` / `exit_code != 0`: NULL/absent is neither.
+                'successful_count' => ['php' => static fn (array $r): bool => ($r['exit_code'] ?? null) !== null && (int) $r['exit_code'] === 0, 'sql' => 'exit_code = 0'],
+                'unsuccessful_count' => ['php' => static fn (array $r): bool => ($r['exit_code'] ?? null) !== null && (int) $r['exit_code'] !== 0, 'sql' => 'exit_code != 0'],
+            ],
+            representatives: [
+                // writeCommands writes `command` = $r['command'] ?? 'unknown'.
+                'command' => ['php' => static fn (array $r) => $r['command'] ?? 'unknown', 'sql' => 'MIN(command)'],
+            ],
+            hasDuration: true,
+            hasHistogram: true,
+        );
+    }
+
+    /**
+     * nightowl_scheduled_tasks keyed by group_hash (schedule identifier) — powers
+     * the scheduled-tasks list/overview/charts. Status bands match
+     * ScheduledTaskController verbatim: failed = 'failed', processed = 'processed'
+     * OR the legacy 'success' alias, skipped = 'skipped'. command + cron expression
+     * + the fixed cadence (repeat_seconds) are first-seen representatives.
+     */
+    public static function scheduledTasks(): RollupSpec
+    {
+        return new RollupSpec(
+            table: 'nightowl_scheduled_task_rollups',
+            source: 'nightowl_scheduled_tasks',
+            groupColumns: [
+                'group_hash' => ['php' => static fn (array $r): string => (string) ($r['_group'] ?? ''), 'sql' => "COALESCE(group_hash, '')"],
+            ],
+            counters: [
+                'failed_count' => ['php' => static fn (array $r): bool => ($r['status'] ?? '') === 'failed', 'sql' => "status = 'failed'"],
+                'processed_count' => ['php' => static fn (array $r): bool => in_array($r['status'] ?? '', ['processed', 'success'], true), 'sql' => "status = 'processed' OR status = 'success'"],
+                'skipped_count' => ['php' => static fn (array $r): bool => ($r['status'] ?? '') === 'skipped', 'sql' => "status = 'skipped'"],
+            ],
+            representatives: [
+                // writeScheduledTasks writes command = $r['name'] ?? $r['command'] ?? 'unknown',
+                // expression = $r['cron'] ?? $r['expression'], repeat_seconds = $r['repeat_seconds'] ?? 0.
+                'command' => ['php' => static fn (array $r) => $r['name'] ?? $r['command'] ?? 'unknown', 'sql' => 'MIN(command)'],
+                'expression' => ['php' => static fn (array $r) => $r['cron'] ?? $r['expression'] ?? null, 'sql' => 'MIN(expression)'],
+                'repeat_seconds' => ['php' => static fn (array $r) => $r['repeat_seconds'] ?? 0, 'sql' => 'MIN(repeat_seconds)'],
             ],
             hasDuration: true,
             hasHistogram: true,

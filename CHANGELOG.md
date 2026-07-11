@@ -5,6 +5,28 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.12] - 2026-07-11
+
+### Added
+
+- **Command and scheduled-task telemetry now roll up into per-minute summaries.**
+  `nightowl_command_rollups` and `nightowl_scheduled_task_rollups` join the existing
+  rollup tables, so the dashboard's Commands and Scheduled Tasks pages — success/failure
+  counts, duration charts, and percentiles — serve from compact aggregates instead of
+  scanning raw rows, and that history survives when the raw `nightowl_commands` /
+  `nightowl_scheduled_tasks` rows are pruned or cleared. Run `nightowl:migrate` after
+  upgrading to create the two tables, then `nightowl:backfill-rollups` to populate them
+  from existing telemetry.
+
+### Fixed
+
+- **Out-of-range log timestamps can no longer produce un-prunable log rows.**
+  `nightowl_logs.created_at` is a text column, so Postgres won't reject a malformed or
+  millisecond-scaled timestamp the way it does on the timestamp-typed tables. A log event
+  arriving with such a timestamp is now clamped to a valid `created_at` (falling back to
+  the drain clock), so `nightowl:prune`'s `created_at < cutoff` comparison can always
+  match it and the row stays prunable.
+
 ## [1.2.11] - 2026-07-08
 
 ### Fixed

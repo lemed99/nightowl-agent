@@ -741,6 +741,110 @@ class RecordWriterTest extends TestCase
     }
 
     /**
+     * Drift guard for nightowl_command_rollups: the live drain rollup must exactly
+     * reproduce a raw re-aggregation of nightowl_commands, incl. the exit_code
+     * three-valued split (NULL is neither successful nor unsuccessful) and the
+     * hist-bin sum == COUNT(duration) invariant behind the avg denominator.
+     */
+    public function test_command_rollup_matches_raw_reaggregation(): void
+    {
+        $records = [];
+        for ($i = 1; $i <= 20; $i++) {
+            $records[] = $this->sim->makeCommand([
+                'trace_id' => "drift-cmd-{$i}",
+                '_group' => 'cg'.($i % 3),
+                'command' => 'app:c'.($i % 3),
+                // 0, non-zero, and NULL exit codes so both bands + the NULL gap are exercised.
+                'exit_code' => $i % 3 === 0 ? null : ($i % 2),
+                'duration' => $i % 2 === 0 ? null : $i * 1000,
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $histSum = 'SUM('.implode(') + SUM(', \NightOwl\Support\QueryHistogram::columns()).')';
+
+        $rollup = self::$pdo->query(
+            "SELECT group_hash,
+                    SUM(call_count) AS cc,
+                    SUM(successful_count) AS sc,
+                    SUM(unsuccessful_count) AS uc,
+                    SUM(total_duration) AS td,
+                    {$histSum} AS dc
+             FROM nightowl_command_rollups
+             WHERE group_hash LIKE 'cg%'
+             GROUP BY group_hash ORDER BY group_hash"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(group_hash, '') AS group_hash,
+                    COUNT(*) AS cc,
+                    SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS sc,
+                    SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) AS uc,
+                    COALESCE(SUM(duration), 0) AS td,
+                    COUNT(duration) AS dc
+             FROM nightowl_commands
+             WHERE COALESCE(group_hash, '') LIKE 'cg%'
+             GROUP BY COALESCE(group_hash, '') ORDER BY group_hash"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'command rollup must reproduce a raw re-aggregation of nightowl_commands (NULL exit_code in neither band)');
+    }
+
+    /**
+     * Drift guard for nightowl_scheduled_task_rollups: the drain rollup must exactly
+     * reproduce a raw re-aggregation of nightowl_scheduled_tasks, incl. the
+     * processed band folding in the legacy 'success' alias.
+     */
+    public function test_scheduled_task_rollup_matches_raw_reaggregation(): void
+    {
+        $records = [];
+        $statuses = ['failed', 'processed', 'success', 'skipped'];
+        for ($i = 1; $i <= 24; $i++) {
+            $records[] = $this->sim->makeScheduledTask([
+                'trace_id' => "drift-sched-{$i}",
+                '_group' => 'sg'.($i % 3),
+                'name' => 'schedule:s'.($i % 3),
+                'status' => $statuses[$i % 4],
+                // skipped tasks carry NULL duration in reality; mix some in.
+                'duration' => $i % 2 === 0 ? null : $i * 500,
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $histSum = 'SUM('.implode(') + SUM(', \NightOwl\Support\QueryHistogram::columns()).')';
+
+        $rollup = self::$pdo->query(
+            "SELECT group_hash,
+                    SUM(call_count) AS cc,
+                    SUM(failed_count) AS fc,
+                    SUM(processed_count) AS pc,
+                    SUM(skipped_count) AS kc,
+                    SUM(total_duration) AS td,
+                    {$histSum} AS dc
+             FROM nightowl_scheduled_task_rollups
+             WHERE group_hash LIKE 'sg%'
+             GROUP BY group_hash ORDER BY group_hash"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $raw = self::$pdo->query(
+            "SELECT COALESCE(group_hash, '') AS group_hash,
+                    COUNT(*) AS cc,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS fc,
+                    SUM(CASE WHEN status = 'processed' OR status = 'success' THEN 1 ELSE 0 END) AS pc,
+                    SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS kc,
+                    COALESCE(SUM(duration), 0) AS td,
+                    COUNT(duration) AS dc
+             FROM nightowl_scheduled_tasks
+             WHERE COALESCE(group_hash, '') LIKE 'sg%'
+             GROUP BY COALESCE(group_hash, '') ORDER BY group_hash"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertEquals($raw, $rollup, 'scheduled-task rollup must reproduce a raw re-aggregation (processed folds in success)');
+    }
+
+    /**
      * Drift guard: the rollup, summed across its keys, must exactly reproduce a
      * raw re-aggregation of nightowl_queries. This is the single highest-value
      * defense against the rollup and raw paths diverging — any future change to
@@ -1624,6 +1728,7 @@ class RecordWriterTest extends TestCase
             'nightowl_user_exception_rollups', 'nightowl_exception_rollups',
             'nightowl_exception_server_rollups',
             'nightowl_mail_rollups', 'nightowl_notification_rollups',
+            'nightowl_command_rollups', 'nightowl_scheduled_task_rollups',
         ];
 
         foreach ($tables as $table) {

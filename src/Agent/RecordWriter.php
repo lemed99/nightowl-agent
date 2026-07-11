@@ -1364,6 +1364,10 @@ final class RecordWriter
 
         $this->copyBatch('nightowl_commands', $columns, $rows);
 
+        if ($this->rollupEnabled('nightowl_command_rollups')) {
+            $this->writeRollup($records, RollupSpecs::commands(), $nowTs);
+        }
+
         $this->checkThresholds('command', $records, 'command');
     }
 
@@ -1545,6 +1549,8 @@ final class RecordWriter
 
     private function writeLogs(array $records): void
     {
+        $nowTs = time();
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
@@ -1561,7 +1567,10 @@ final class RecordWriter
                 is_string($r['context'] ?? null) ? $r['context'] : json_encode($r['context'] ?? null),
                 is_string($r['extra'] ?? null) ? $r['extra'] : json_encode($r['extra'] ?? null),
                 $r['channel'] ?? null,
-                isset($r['timestamp']) ? gmdate('Y-m-d H:i:s', (int) $r['timestamp']) : gmdate('Y-m-d H:i:s'),
+                // nightowl_logs.created_at is a text column, so Postgres will not reject an
+                // out-of-range date the way it does on the timestamp-typed tables. An unguarded
+                // year > 9999 sorts above every prune cutoff and the row can never be deleted.
+                $this->eventCreatedAt($r, $nowTs),
             ];
         }
 
@@ -1640,6 +1649,10 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_scheduled_tasks', $columns, $rows);
+
+        if ($this->rollupEnabled('nightowl_scheduled_task_rollups')) {
+            $this->writeRollup($records, RollupSpecs::scheduledTasks(), $nowTs);
+        }
 
         $this->checkThresholds('scheduled_task', $records, ['name', 'command']);
     }
