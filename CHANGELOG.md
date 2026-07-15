@@ -5,7 +5,20 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
-## [1.2.12] - 2026-07-11
+## [1.2.13] - 2026-07-15
+
+### Added
+
+- **Covering index for the sidebar issues-badge counts.** A new migration adds a
+  composite index on `nightowl_issues (environment, status, type, assigned_to)`,
+  backing the `issues/counts` aggregate the dashboard polls for the sidebar badge.
+  Leading with `environment` (the sole filter) narrows the scan, and carrying
+  `status`, `type` and `assigned_to` lets the aggregate run index-only off a narrow
+  b-tree instead of scanning the wide heap (`exception_message` TEXT &c.) — the scan
+  that was timing out on large tenant tables (a 504, or a worker-killing 30s abort on
+  poolers that drop the statement timeout). The index is built `CONCURRENTLY` so it
+  never blocks the live drain, and a re-run self-heals any `INVALID` leftover from a
+  cancelled build. Run `nightowl:migrate` after upgrading to create it.
 
 ### Added
 
