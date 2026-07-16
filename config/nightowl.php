@@ -69,6 +69,61 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Drain Connection — network timeouts
+    |--------------------------------------------------------------------------
+    |
+    | Deliberately a TOP-LEVEL key, not part of 'database'. mergeConfigFrom() is a
+    | shallow array_merge, so an app that ran `vendor:publish` has a 'database'
+    | array that wholly REPLACES the package's — any new sub-key there would be
+    | silently invisible to it, and so would its env var. A new top-level key is
+    | preserved by array_merge for exactly the same reason.
+    |
+    | Without these, a TCP stall on the drain write path is bounded only by the
+    | kernel's tcp_retries2 (~15 min at the default), during which the drain is
+    | wedged, the buffer fills to max_pending_rows and ingest starts REFUSING
+    | payloads with '5:ERROR'.
+    |
+    */
+    'drain_connection' => [
+        // Master switch. false restores pre-1.2.14 NETWORK behaviour exactly: no
+        // socket options, no ATTR_TIMEOUT (PDO's 30s default returns), DSN
+        // connect_timeout=5. It does NOT revert the SET LOCAL scoping or the
+        // HY000 classification — those are bug fixes, not tunables.
+        'timeouts_enabled' => (bool) env('NIGHTOWL_DRAIN_CONN_TIMEOUTS', true),
+
+        // Connect bound. The pre-1.2.14 30s was an accident of PDO::ATTR_TIMEOUT's
+        // default; the DSN's connect_timeout never governed connect, because
+        // PDO_PGSQL appends its own derived from ATTR_TIMEOUT and libpq is
+        // last-key-wins. Never 0 — that hangs unbounded.
+        'connect_timeout' => (int) env('NIGHTOWL_DB_CONNECT_TIMEOUT', 10),
+
+        // Bounds a SEND-BLOCKED socket (drain mid-COPY). Counts only UNACKED time,
+        // so it cannot fire on a healthy-but-slow link. Measured against a true
+        // iptables partition: 5000 -> 5.22s, 20000 -> 20.32s, 40000 -> 40.64s;
+        // without it the same stall was still wedged at 111s.
+        // Requires libpq >= 12 — feature-detected, never concatenated on faith.
+        // 0 disables just this param.
+        'tcp_user_timeout_ms' => (int) env('NIGHTOWL_DB_TCP_USER_TIMEOUT_MS', 20000),
+
+        // Bounds an IDLE-READ socket (awaiting a result), where tcp_user_timeout is
+        // inert because nothing is unacked. idle + interval*count = 25s. libpq's own
+        // default idle is 7200s, i.e. no protection.
+        'keepalives_idle' => (int) env('NIGHTOWL_DB_KEEPALIVES_IDLE', 10),
+        'keepalives_interval' => (int) env('NIGHTOWL_DB_KEEPALIVES_INTERVAL', 5),
+        'keepalives_count' => (int) env('NIGHTOWL_DB_KEEPALIVES_COUNT', 3),
+
+        // Caps a blocked ON CONFLICT upsert (issues / rollups / users), which
+        // otherwise waits INDEFINITELY. A socket deadline cannot bound a lock wait —
+        // the connection is healthy and keepalives are answered throughout. Raises
+        // 55P03, which DrainWorker::isTransientFailure() already defers. 0 disables.
+        'lock_timeout_ms' => (int) env('NIGHTOWL_DB_LOCK_TIMEOUT_MS', 10000),
+
+        // Diagnosis-only wedge threshold (no kill in this release). 0 disables.
+        'wedge_warn_seconds' => (int) env('NIGHTOWL_DRAIN_WEDGE_WARN_SECONDS', 180),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Agent
     |--------------------------------------------------------------------------
     |

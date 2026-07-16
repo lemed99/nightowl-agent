@@ -83,6 +83,26 @@ final class MetricsCollector
 
     private float $drainMetricsUpdatedAt = 0.0;
 
+    /**
+     * Per-worker liveness from the DrainHeartbeat files.
+     *
+     * @var array<int, array{stale_seconds: float, phase: string}>
+     */
+    private array $workerLiveness = [];
+
+    /**
+     * DRAIN_WEDGED threshold in seconds; 0 disables. Not derived from batch duration —
+     * it cannot be, since the drain-metrics heartbeat only advances BETWEEN batches, so
+     * there a 90s legitimate COPY and a wedge are the same observation. It is derived
+     * from the worst legitimate SINGLE blocking call, which DrainHeartbeat isolates:
+     * the measured worst case is a healthy 286MB COPY over a 5mbit/50ms link at 90s+.
+     * The 180s default is 2x that, and ~9x the measured tcp_user_timeout bound (20.3s),
+     * so on a correctly-configured Linux host it is dormant by construction — it fires
+     * only where tcp_user_timeout is inert (macOS/Windows, libpq < 12), and its firing
+     * is ITSELF evidence that the connection has no client deadline.
+     */
+    private float $drainWedgeSeconds = 180.0;
+
     // Last NON-connection drain write rejection (reduced across workers by most
     // recent). SQLSTATE + table only — never the raw libpq message. Drives the
     // DRAIN_WRITE_FAILING diagnosis.
@@ -262,6 +282,89 @@ final class MetricsCollector
      * - pg_latency_ms: averaged
      * - updated_at: earliest (most conservative for staleness detection)
      */
+    /**
+     * Read per-worker liveness from the DrainHeartbeat files.
+     *
+     * Deliberately NOT folded into readDrainMetrics(), which REDUCES across workers
+     * (oldest updated_at) — right for a fleet-wide staleness gauge, useless for naming
+     * the ONE wedged worker and the call it is stuck in.
+     *
+     * @param  array<int, int>  $forkedAtMonoNs  workerId => the parent's hrtime(true) at
+     *                                           fork, for LIVE workers only.
+     * @return array<int, array{stale_seconds: float, phase: string}>
+     */
+    public function readWorkerLiveness(string $path, int $workerCount, array $forkedAtMonoNs): array
+    {
+        $nowNs = hrtime(true);
+        $out = [];
+
+        foreach ($forkedAtMonoNs as $w => $forkNs) {
+            $alivePath = $workerCount > 1
+                ? $path.".drain-alive-{$w}.json"
+                : $path.'.drain-alive.json';
+
+            $stampNs = 0;
+            $phase = 'startup (no heartbeat since fork)';
+
+            $json = @file_get_contents($alivePath);
+            if ($json !== false) {
+                try {
+                    $d = json_decode($json, true, 8, JSON_THROW_ON_ERROR);
+                    if (is_array($d)) {
+                        $candidate = (int) ($d['at_mono_ns'] ?? 0);
+                        // The alive file PERSISTS on disk across restarts, so a dead
+                        // worker's last stamp must never vouch for its replacement.
+                        // Monotonic on both sides: no NTP step can flip this.
+                        if ($candidate >= $forkNs) {
+                            $stampNs = $candidate;
+                            $phase = is_string($d['phase'] ?? null) ? $d['phase'] : 'unknown';
+                        }
+                    }
+                } catch (\JsonException) {
+                    // Torn read — treat as absent. One dropped 5s sample cannot flip a
+                    // 180s decision.
+                }
+            }
+
+            // Age from the FORK instant when the child has never stamped this
+            // incarnation. The parent always knows when it forked, so this needs no
+            // cooperation from a child that may have wedged before writing anything —
+            // closing the hole where a `> 0` gate reported healthy forever for a worker
+            // that never wrote a first file.
+            $basis = $stampNs > 0 ? $stampNs : $forkNs;
+            $out[$w] = [
+                'stale_seconds' => max(0.0, ($nowNs - $basis) / 1_000_000_000),
+                'phase' => $phase,
+            ];
+        }
+
+        $this->workerLiveness = $out;
+
+        return $out;
+    }
+
+    /**
+     * The worker blocked longest in a single call.
+     *
+     * @return array{worker: int|null, stale_seconds: float, phase: string}
+     */
+    public function worstWedge(): array
+    {
+        $worst = ['worker' => null, 'stale_seconds' => 0.0, 'phase' => ''];
+        foreach ($this->workerLiveness as $w => $l) {
+            if ($l['stale_seconds'] > $worst['stale_seconds']) {
+                $worst = ['worker' => $w, 'stale_seconds' => $l['stale_seconds'], 'phase' => $l['phase']];
+            }
+        }
+
+        return $worst;
+    }
+
+    public function setDrainWedgeSeconds(float $seconds): void
+    {
+        $this->drainWedgeSeconds = $seconds;
+    }
+
     public function readDrainMetrics(string $path, int $workerCount = 1): void
     {
         $totalRows = 0;
@@ -452,10 +555,20 @@ final class MetricsCollector
             ];
         }
 
+        // DRAIN_WEDGED — a worker blocked inside ONE database call. Computed before
+        // DRAIN_STOPPED so it can suppress it: both describe "no rows moving", but only
+        // this one names the blocking statement, so firing both would page with two
+        // criticals carrying contradictory advice.
+        $wedge = $this->worstWedge();
+        $wedged = $this->drainWedgeSeconds > 0
+            && $wedge['worker'] !== null
+            && $wedge['stale_seconds'] > $this->drainWedgeSeconds;
+
         // DRAIN_STOPPED — suppressed when writes are being rejected (DRAIN_WRITE_FAILING
-        // names the real cause) or when DRAIN_UNREACHABLE already owns the connectivity
-        // story; what's left is the worker-crash / stuck case.
-        $drainStopped = $drainRate == 0 && $pendingRows > 100 && ! $writeFailing && ! $connUnreachable;
+        // names the real cause), when DRAIN_UNREACHABLE already owns the connectivity
+        // story, or when DRAIN_WEDGED has named the exact blocking call; what's left is
+        // the worker-crash / stuck case.
+        $drainStopped = $drainRate == 0 && $pendingRows > 100 && ! $writeFailing && ! $connUnreachable && ! $wedged;
         if ($drainStopped) {
             $diagnoses[] = [
                 'code' => 'DRAIN_STOPPED',
@@ -463,6 +576,26 @@ final class MetricsCollector
                 'message' => 'Drain worker is not processing rows.',
                 'recommendation' => 'Check PostgreSQL connectivity and drain worker logs. The drain process may have crashed or Postgres may be unreachable.',
                 'value' => $pendingRows,
+            ];
+        }
+
+        if ($wedged) {
+            $diagnoses[] = [
+                'code' => 'DRAIN_WEDGED',
+                'level' => 'critical',
+                'message' => sprintf(
+                    'Drain worker #%d has been blocked in %s for %ds.',
+                    $wedge['worker'],
+                    $wedge['phase'],
+                    (int) $wedge['stale_seconds']
+                ),
+                'recommendation' => 'The worker is stuck inside a single database call — usually a network '
+                    .'path that dropped without closing the connection. Buffered telemetry is retained and '
+                    .'re-drained; nothing is lost. This should not happen when the client-side deadline is '
+                    .'active, so it usually means tcp_user_timeout is unavailable (needs libpq 12+) or inert '
+                    .'(non-Linux). Check the agent log for the startup warning, and see '
+                    .'NIGHTOWL_DB_TCP_USER_TIMEOUT_MS.',
+                'value' => round($wedge['stale_seconds'], 1),
             ];
         }
 

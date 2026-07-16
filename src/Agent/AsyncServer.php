@@ -31,6 +31,14 @@ final class AsyncServer
     /** @var float[] Last spawn time per worker ID */
     private array $lastChildSpawns = [];
 
+    /**
+     * workerId => hrtime(true) at fork. Monotonic, unlike lastChildSpawns' wall clock:
+     * it is compared against the child's own monotonic heartbeat stamps, so an NTP step
+     * can neither manufacture nor mask a wedge. Also the liveness basis for a child that
+     * wedges before ever writing a heartbeat.
+     */
+    private array $childForkedAtMonoNs = [];
+
     // Back-pressure state
     private bool $backPressure = false;
     private int $totalBufferBytes = 0;
@@ -72,12 +80,18 @@ final class AsyncServer
         // child runs the drain loop in-process — the original fork-only behavior.
         // Signature: fn (int $workerId, int $totalWorkers, string $sqlitePath): void
         private ?\Closure $drainSpawner = null,
+        // DRAIN_WEDGED threshold (seconds); 0 disables. Appended LAST on purpose:
+        // the service provider passes 16 positional args and only then switches to
+        // named, and several harnesses pass drainSpawner positionally, so inserting
+        // earlier would silently shift arguments with no type error.
+        float $drainWedgeSeconds = 180.0,
     ) {
         $this->expectedTokenHash = $token !== null
             ? substr(hash('xxh128', $token), 0, 7)
             : null;
         $this->loop = Loop::get();
         $this->metrics = new MetricsCollector($maxPendingRows, $maxBufferMemory);
+        $this->metrics->setDrainWedgeSeconds($drainWedgeSeconds);
     }
 
     public function listen(string $host, int $port): void
@@ -229,6 +243,14 @@ final class AsyncServer
             $pending = $this->buffer?->pendingCount() ?? 0;
             $walSize = $this->buffer?->walSize() ?? 0;
             $rss = memory_get_usage(true);
+            // Read liveness immediately before diagnosing, so read -> diagnose is one
+            // ordered pass and DRAIN_WEDGED never fires off a snapshot from a prior tick.
+            // Live workers only: a reaped worker's stale stamp must not diagnose.
+            $this->metrics->readWorkerLiveness(
+                $this->sqlitePath,
+                $this->drainWorkerCount,
+                array_intersect_key($this->childForkedAtMonoNs, $this->drainChildPids)
+            );
             $this->metrics->runDiagnosis($this->backPressure, $pending, $walSize, $rss);
 
             // Dispatch alerts for newly active or resolved diagnoses (rare —
@@ -373,6 +395,7 @@ final class AsyncServer
 
         $this->drainChildPids[$workerId] = $pid;
         $this->lastChildSpawns[$workerId] = microtime(true);
+        $this->childForkedAtMonoNs[$workerId] = hrtime(true);
         error_log("[NightOwl Agent] Drain worker #{$workerId} forked (pid: {$pid})");
     }
 

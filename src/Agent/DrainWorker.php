@@ -14,6 +14,12 @@ final class DrainWorker
 
     private bool $running = true;
 
+    /**
+     * Liveness channel to the parent, stamped at step boundaries inside a batch.
+     * Null until run() builds it, and outside run() (the sync fallback path).
+     */
+    private ?DrainHeartbeat $heartbeat = null;
+
     // Drain metrics for IPC with parent process
     private int $batchesDrained = 0;
 
@@ -176,6 +182,13 @@ final class DrainWorker
         pcntl_signal(SIGTERM, fn () => $this->running = false);
         pcntl_signal(SIGINT, fn () => $this->running = false);
 
+        // Liveness channel to the parent. Stamped at every step boundary inside a
+        // batch, unlike the drain metrics file, which only advances BETWEEN batches
+        // and so freezes for the whole of any batch — slow or wedged alike.
+        $heartbeat = new DrainHeartbeat($this->sqlitePath, $this->workerId, $this->totalWorkers);
+        $heartbeat->enter('starting');
+        $this->heartbeat = $heartbeat;
+
         // Create own connections — NOT inherited from parent
         $buffer = new SqliteBuffer($this->sqlitePath);
         $writer = new RecordWriter(
@@ -189,6 +202,17 @@ final class DrainWorker
             appName: $this->appName,
             environment: $this->environment,
             sslmode: $this->sslmode,
+            // Top-level 'drain_connection' — a published config's 'database' array
+            // wholly replaces the package's under mergeConfigFrom's shallow merge, so
+            // a nested knob (and its env var) would be invisible to most installs.
+            timeoutsEnabled: (bool) config('nightowl.drain_connection.timeouts_enabled', true),
+            connectTimeout: (int) config('nightowl.drain_connection.connect_timeout', 10),
+            tcpUserTimeoutMs: (int) config('nightowl.drain_connection.tcp_user_timeout_ms', 20000),
+            keepalivesIdle: (int) config('nightowl.drain_connection.keepalives_idle', 10),
+            keepalivesInterval: (int) config('nightowl.drain_connection.keepalives_interval', 5),
+            keepalivesCount: (int) config('nightowl.drain_connection.keepalives_count', 3),
+            lockTimeoutMs: (int) config('nightowl.drain_connection.lock_timeout_ms', 10000),
+            heartbeat: $heartbeat,
         );
 
         $workerLabel = $this->totalWorkers > 1
@@ -231,6 +255,9 @@ final class DrainWorker
             // path. Keep the last good value if the query fails (null).
             $now = microtime(true);
             if ($now - $lastIssueCount >= self::ISSUE_COUNT_INTERVAL) {
+                // An unguarded Postgres round trip in the run loop — labelled so a
+                // stall here is not misreported as a wedge in the previous phase.
+                $this->heartbeat?->enter('pg:count-open-issues');
                 $issues = $writer->countOpenIssues();
                 if ($issues !== null) {
                     $this->openIssues = $issues;
@@ -352,6 +379,8 @@ final class DrainWorker
         // misattributed to the previous batch's stale Postgres SQLSTATE. write()
         // re-clears this on entry, so this only matters for pre-write throws.
         $writer->lastWriteError = null;
+
+        $this->heartbeat?->enter('buffer:claim');
 
         try {
             // A prior batch committed to Postgres but its markSynced() failed (the

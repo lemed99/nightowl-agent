@@ -5,6 +5,89 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.2.14] - 2026-07-16
+
+### Fixed
+
+- **A network stall on the drain write path no longer wedges the drain.** The agent
+  had no working timeout on its Postgres writes. The `pcntl_alarm` backstop around
+  `pgsqlCopyFromArray` was never a deadline: PHP dispatches async signals only at VM
+  opcode boundaries and libpq retries `EINTR` internally, so a blocked libpq call
+  never yields one and the handler only ever ran the instant libpq returned on its
+  own. Measured against a true `iptables` partition: an alarm armed at 75s had **not
+  fired 233s later**, with the process blocked in libpq (`state=Ss`, 0.1% CPU) and the
+  kernel in retransmit backoff — bounded only by `net.ipv4.tcp_retries2`, ~15 minutes
+  at the default. With the drain wedged, the SQLite buffer fills to
+  `max_pending_rows` and the agent starts **refusing** payloads with `5:ERROR` rather
+  than queuing them, so telemetry is lost rather than delayed.
+
+  The deadline now comes from the socket, which bounds *every* statement on the
+  connection rather than only the `COPY` call sites. Measured through the config path
+  against the same partition: `tcp_user_timeout=5000` → 10.6s, `20000` (the default) →
+  31.1s, `40000` → 50.8s, versus a control still wedged past 233s. Both knobs ship
+  because they cover disjoint regimes — with unacked data in flight keepalives cannot
+  fire (the socket is not idle), and on an idle read `tcp_user_timeout` cannot fire
+  (nothing is unacked).
+
+- **`tcp_user_timeout` is feature-detected, never concatenated on faith.** libpq
+  rejects an unknown conninfo keyword *fatally*, and it needs libpq 12+ — verified
+  against a real libpq 11.22, where the parameter fails the connect outright. The
+  probe compares two errors against a socket path that cannot exist, so it never
+  touches the network and is locale-proof. The agent warns at startup on pre-12 libpq,
+  and on non-Linux, where the parameter is accepted but inert.
+
+- **`PDO::ATTR_TIMEOUT` is now set explicitly (10s).** It is the sole control of the
+  connect bound: `PDO_PGSQL` derives its own `connect_timeout` from it and libpq is
+  last-key-wins, so the DSN's `connect_timeout=5` was dead code and the effective 30s
+  bound was an accident of PDO's default. `0` hangs unbounded.
+
+- **`lock_timeout` (10s) on the drain transaction.** A blocked `ON CONFLICT` upsert
+  (issues, rollups, users) previously waited indefinitely; a socket deadline cannot
+  bound a lock wait, because the connection is healthy throughout. Raises `55P03`,
+  which the drain worker already treats as transient and defers.
+
+- **`synchronous_commit` no longer leaks onto pooled connections.** It ran as a plain
+  session `SET` at connect, so through a transaction-mode pooler it persisted onto the
+  shared server connection and silently weakened durability for whatever other
+  application borrowed it next. It is now `SET LOCAL` inside the drain transaction,
+  which still governs that transaction's own commit — throughput is unchanged.
+
+- **A stalled write is classified as a connection failure, not a write failure.**
+  `HY000` is PDO's generic code for a libpq transport error with no server-side error,
+  and it is exactly what the new deadline produces. It now falls through to the
+  connection-error scan, so a network stall reports as "Postgres unreachable" instead
+  of "your writes are being rejected". Other SQLSTATEs still short-circuit before the
+  message scan, so the classifier never depends on customer row content.
+
+- **`beginTransaction()` moved inside the drain transaction's `try`.** It is a network
+  round trip like any other, and measurement shows it is exactly where a stalled batch
+  blocks — BEGIN is first on the wire. Outside the `try`, that throw bypassed the catch
+  entirely and the health report lost the SQLSTATE and failing table.
+
+- **`rollBack()` can no longer mask the real error.** On a handle the deadline just
+  killed, `inTransaction()` reports true and `rollBack()` then throws, abandoning the
+  rest of the catch — so `lastWriteError` was never stamped and the rollback's
+  exception was classified instead of the real one. It is now stamped first and the
+  rollback is guarded.
+
+### Added
+
+- **`DRAIN_WEDGED` diagnosis.** Names the worker and the exact call it is blocked in
+  (e.g. `pg:copy:nightowl_requests`), via a heartbeat stamped at each step boundary
+  inside a batch — the drain-metrics file only advances *between* batches, so there a
+  slow batch and a wedge are the same observation. Diagnosis only; it does not kill.
+  Dormant by construction when the client deadline is active, so its firing is itself
+  evidence that `tcp_user_timeout` is unavailable or inert.
+
+- **`drain_connection` config block** (`NIGHTOWL_DRAIN_CONN_TIMEOUTS`,
+  `NIGHTOWL_DB_TCP_USER_TIMEOUT_MS`, `NIGHTOWL_DB_KEEPALIVES_*`,
+  `NIGHTOWL_DB_CONNECT_TIMEOUT`, `NIGHTOWL_DB_LOCK_TIMEOUT_MS`,
+  `NIGHTOWL_DRAIN_WEDGE_WARN_SECONDS`). Deliberately a **top-level** key rather than
+  part of `database`: `mergeConfigFrom` is a shallow `array_merge`, so a published
+  config's `database` array wholly replaces the package's and any new sub-key there
+  would be invisible to most installs, taking its env var with it.
+  `NIGHTOWL_DRAIN_CONN_TIMEOUTS=false` restores the pre-1.2.14 network behaviour.
+
 ## [1.2.13] - 2026-07-15
 
 ### Added

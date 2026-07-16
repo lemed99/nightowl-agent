@@ -177,7 +177,36 @@ NIGHTOWL_DRAIN_INTERVAL_MS=100           # Drain loop idle interval
 NIGHTOWL_MAX_PENDING_ROWS=100000         # Back-pressure threshold
 NIGHTOWL_MAX_BUFFER_MEMORY=268435456     # 256MB RSS limit
 NIGHTOWL_REOPEN_COOLDOWN_HOURS=0         # Hours to wait before flipping resolved → open on recurrence (0 = always reopen, Sentry-style)
+
+# Drain connection — network deadline (config key is TOP-LEVEL `drain_connection`,
+# NOT nested under `database`: mergeConfigFrom is a shallow array_merge, so a
+# published config's `database` array replaces the package's and would swallow any
+# new sub-key there along with its env var).
+NIGHTOWL_DRAIN_CONN_TIMEOUTS=true        # Master switch. false restores pre-1.2.14 network behaviour
+NIGHTOWL_DB_TCP_USER_TIMEOUT_MS=20000    # Bounds a SEND-BLOCKED socket (unacked data). libpq 12+, Linux-only, feature-detected
+NIGHTOWL_DB_KEEPALIVES_IDLE=10           # Bounds an IDLE-READ socket, where tcp_user_timeout cannot fire (nothing unacked)
+NIGHTOWL_DB_KEEPALIVES_INTERVAL=5        # idle + interval*count = 25s
+NIGHTOWL_DB_KEEPALIVES_COUNT=3
+NIGHTOWL_DB_CONNECT_TIMEOUT=10           # Sets PDO::ATTR_TIMEOUT — the SOLE control of the connect bound. Never 0 (hangs)
+NIGHTOWL_DB_LOCK_TIMEOUT_MS=10000        # Caps a blocked ON CONFLICT upsert (raises 55P03 → deferred + retried)
+NIGHTOWL_DRAIN_WEDGE_WARN_SECONDS=180    # DRAIN_WEDGED diagnosis threshold (no kill). 0 disables
 ```
+
+### Why the drain needs a socket deadline
+
+`pcntl_alarm` **cannot** bound a blocked libpq call: PHP dispatches async signals only
+at VM opcode boundaries, and libpq retries `EINTR` internally, so the handler runs only
+once libpq returns on its own. The old `COPY_TIMEOUT`/`CONNECT_TIMEOUT` backstops were
+therefore post-hoc log lines, not deadlines — measured against a true `iptables`
+partition, an alarm armed at 75s had not fired 233s later. Without a socket deadline a
+stall is bounded only by `net.ipv4.tcp_retries2` (~15 min), and a wedged drain fills the
+buffer until the agent **refuses** payloads with `5:ERROR`.
+
+`tcp_user_timeout` and the keepalives cover **disjoint** regimes and are both required:
+with unacked data in flight the socket is not idle so keepalives never fire, and on an
+idle read there is nothing unacked so `tcp_user_timeout` never fires. Both bound an
+*unreachable* peer, not an unresponsive one — a reachable-but-wedged backend or pooler
+is bounded by neither (that is `lock_timeout`'s job, and the operator's).
 
 ### Auto-reopen on recurrence
 

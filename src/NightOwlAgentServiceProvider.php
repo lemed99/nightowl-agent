@@ -171,6 +171,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 (array) config('nightowl.agent.health_report_intervals', []),
                 (string) config('nightowl.database.database', 'nightowl'),
                 drainSpawner: $this->makeDrainSpawner($app),
+                drainWedgeSeconds: (float) config('nightowl.drain_connection.wedge_warn_seconds', 180),
             );
         });
     }

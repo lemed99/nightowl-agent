@@ -89,46 +89,178 @@ final class RecordWriter
         private string $appName = 'NightOwl',
         private string $environment = 'production',
         private string $sslmode = 'prefer',
+        // Drain network deadline. New params sit at position 11+ so every existing
+        // positional call site (production and tests) is unaffected.
+        private bool $timeoutsEnabled = true,
+        private int $connectTimeout = 10,
+        private int $tcpUserTimeoutMs = 20000,
+        private int $keepalivesIdle = 10,
+        private int $keepalivesInterval = 5,
+        private int $keepalivesCount = 3,
+        private int $lockTimeoutMs = 10000,
+        private ?DrainHeartbeat $heartbeat = null,
     ) {
         $this->notifier = $notifier ?? new AlertNotifier;
     }
 
-    private const CONNECT_TIMEOUT = 5;
+    /**
+     * Pre-1.2.14 DSN connect_timeout. Kept ONLY for the kill-switch path: it never
+     * governed connect (PDO_PGSQL's ATTR_TIMEOUT-derived value wins, libpq being
+     * last-key-wins) but it DOES govern the SSL handshake, so the legacy DSN has to
+     * reproduce it byte-for-byte.
+     */
+    private const LEGACY_CONNECT_TIMEOUT = 5;
 
-    private const COPY_TIMEOUT = 60;
+    /**
+     * Whether THIS PROCESS's libpq understands `tcp_user_timeout` (libpq >= 12).
+     * Probed once; a property of the linked libpq, not of the host.
+     */
+    private static ?bool $tcpUserTimeoutSupported = null;
 
     private function connect(): void
     {
-        // connect_timeout in the DSN should cap the TCP+SSL handshake, but some
-        // libpq builds don't properly interrupt a hung SSL negotiation (the TCP
-        // connect() succeeds so the OS-level timer fires, but the SSL handshake
-        // stalls in userspace with no further timeout). SIGALRM + exit() is the
-        // guaranteed backstop: if the PDO constructor hasn't returned after 3×
-        // the DSN timeout, the child exits and the parent's SIGCHLD handler
-        // restarts it after the 2-second cooldown.
-        pcntl_signal(SIGALRM, static function () {
-            error_log('[NightOwl Drain] PostgreSQL connection timed out (SIGALRM backstop) — exiting for parent restart');
-            exit(1);
-        });
-        pcntl_alarm(self::CONNECT_TIMEOUT * 3);
+        $this->heartbeat?->enter('pg:connect');
 
-        try {
-            $this->pdo = new PDO(
-                "pgsql:host={$this->host};port={$this->port};dbname={$this->database};connect_timeout=".self::CONNECT_TIMEOUT.";sslmode={$this->sslmode}",
-                $this->username,
-                $this->password,
-            );
-            $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        } finally {
-            pcntl_alarm(0);
-            pcntl_signal(SIGALRM, SIG_DFL);
+        $options = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION];
+
+        if ($this->timeoutsEnabled) {
+            // The ONLY control over the connect bound. PDO_PGSQL appends its own
+            // connect_timeout derived from this and libpq is last-key-wins, so a
+            // connect_timeout in the DSN is dead code. Never leave it unset (the old
+            // 30s bound was an accident of PDO's default) and never 0 (hangs
+            // unbounded). It bounds connect ONLY — a pg_sleep(3) under
+            // ATTR_TIMEOUT=10 completes in 3.01s, so it cannot cut a live drain.
+            $options[PDO::ATTR_TIMEOUT] = max(1, $this->connectTimeout);
         }
 
-        // Disable synchronous commit — don't wait for WAL flush on each transaction.
-        // Trades ~10ms of data durability for 2-5x write throughput. Acceptable for
-        // monitoring data: a crash loses at most the last few milliseconds of events,
-        // which are still safe in the SQLite buffer and will be re-drained on restart.
-        $this->pdo->exec('SET synchronous_commit = off');
+        $this->pdo = new PDO($this->dsn(), $this->username, $this->password, $options);
+
+        // NOTE: `SET synchronous_commit = off` used to run HERE, session-scoped.
+        // A plain SET survives commit, so through a transaction-mode pooler it leaks
+        // onto the shared server connection and silently weakens durability for
+        // whatever OTHER application borrows it next. It now runs as SET LOCAL inside
+        // doWrite()'s transaction (applyTransactionGuards), which still governs this
+        // transaction's own commit, so the 2-5x write throughput is unchanged.
+    }
+
+    /**
+     * Client-side socket deadline.
+     *
+     * BOTH knobs are required; they cover disjoint regimes:
+     *   send-blocked (a COPY in flight, unacked data): keepalives do NOTHING,
+     *     because a socket with unacked data is not idle and the retransmit timer
+     *     governs. tcp_user_timeout reaps it.
+     *   idle-read (awaiting a result, nothing unacked): tcp_user_timeout does
+     *     NOTHING — it only counts unacked time. Keepalives reap it (~25s).
+     *
+     * Measured against a true iptables partition (packets DROPped, so nothing ACKs
+     * on the client's behalf — a frozen proxy cannot emulate this):
+     *   no knobs               still wedged at 111s, and the old in-process SIGALRM
+     *                          NEVER dispatched — it was never a deadline.
+     *   tcp_user_timeout=5000  -> 5.22s
+     *   tcp_user_timeout=20000 -> 20.32s   (the default)
+     *   tcp_user_timeout=40000 -> 40.64s
+     *
+     * SCOPE, honestly: this bounds an UNREACHABLE peer, not an unresponsive one.
+     * Keepalive probes are answered by the peer's KERNEL with no application
+     * involvement, and tcp_user_timeout needs unacked data — so a reachable-but-
+     * wedged backend or pooler is NOT bounded here. That regime belongs to
+     * lock_timeout and to the operator, not to this.
+     */
+    private function dsn(): string
+    {
+        if (! $this->timeoutsEnabled) {
+            // Kill switch: byte-identical to <= 1.2.13.
+            return 'pgsql:'."host={$this->host};port={$this->port};dbname={$this->database}"
+                .';connect_timeout='.self::LEGACY_CONNECT_TIMEOUT.";sslmode={$this->sslmode}";
+        }
+
+        $parts = [
+            'host='.$this->host,
+            'port='.$this->port,
+            'dbname='.$this->database,
+            'sslmode='.$this->sslmode,
+        ];
+
+        // Ancient libpq params — accepted by every libpq in support range, so they
+        // ship without detection.
+        if ($this->keepalivesIdle > 0 && $this->keepalivesInterval > 0 && $this->keepalivesCount > 0) {
+            $parts[] = 'keepalives=1';
+            $parts[] = 'keepalives_idle='.$this->keepalivesIdle;
+            $parts[] = 'keepalives_interval='.$this->keepalivesInterval;
+            $parts[] = 'keepalives_count='.$this->keepalivesCount;
+        }
+
+        if ($this->tcpUserTimeoutMs > 0 && self::libpqSupportsTcpUserTimeout()) {
+            $parts[] = 'tcp_user_timeout='.$this->tcpUserTimeoutMs;
+        }
+
+        return 'pgsql:'.implode(';', $parts);
+    }
+
+    /**
+     * Does THIS PROCESS's libpq understand `tcp_user_timeout` (libpq >= 12)?
+     *
+     * It must be feature-detected, never concatenated on faith: libpq rejects an
+     * unknown conninfo keyword FATALLY. Verified against a real libpq 11.22:
+     * `invalid connection option "tcp_user_timeout"` — connect fails outright, it
+     * does not degrade. composer.json pins php ^8.2 with no libpq floor, so an older
+     * client is a supported configuration.
+     *
+     * Ask libpq itself rather than a version number. libpq parses conninfo BEFORE
+     * opening any socket, so point two probes at a target that can NEVER connect — a
+     * Unix-socket directory that does not exist, so no DNS, no TCP, no firewall — and
+     * compare the errors:
+     *   same error => the keyword parsed; we failed at the socket, as the control
+     *                 did => supported
+     *   diff error => libpq rejected the keyword => unsupported
+     *
+     * Comparing two errors rather than matching message text keeps this locale-proof
+     * (libpq's "invalid connection option" is a libpq_gettext string), and because it
+     * never touches the real host, a Postgres outage can never mis-detect the flag off.
+     *
+     * Measured: false on libpq 11.22, true on 13.23 / 17.10 / 18.3; negative control
+     * `zzz_bogus=1` false on all four. 0.04-1.07ms, once per process.
+     */
+    private static function libpqSupportsTcpUserTimeout(): bool
+    {
+        if (self::$tcpUserTimeoutSupported !== null) {
+            return self::$tcpUserTimeoutSupported;
+        }
+
+        $probe = static function (string $extra): string {
+            try {
+                new PDO('pgsql:host=/nonexistent-nightowl-probe;dbname=nightowl_probe'.$extra, '', '');
+
+                return '<connected>'; // impossible against a nonexistent socket dir
+            } catch (\PDOException $e) {
+                return $e->getMessage();
+            }
+        };
+
+        try {
+            self::$tcpUserTimeoutSupported = $probe('') === $probe(';tcp_user_timeout=1000');
+        } catch (\Throwable) {
+            self::$tcpUserTimeoutSupported = false; // inconclusive -> pre-1.2.14 behaviour
+        }
+
+        if (! self::$tcpUserTimeoutSupported) {
+            error_log('[NightOwl Drain] libpq does not support tcp_user_timeout (needs libpq 12+) — '
+                .'a network stall while writing a batch will be bounded only by the kernel '
+                .'(net.ipv4.tcp_retries2, ~15 min by default), not by the agent. '
+                .'Upgrade libpq, or lower tcp_retries2 on this host.');
+        } elseif (PHP_OS_FAMILY !== 'Linux') {
+            // libpq's setsockopt sits inside #ifdef TCP_USER_TIMEOUT, so the param is
+            // ACCEPTED and INERT here (libpq 18.3 on macOS parses it and connects).
+            // Without this line the probe's `true` reads as "protected" and a local
+            // repro would look like the fix works.
+            error_log('[NightOwl Drain] tcp_user_timeout is accepted but INERT on '
+                .PHP_OS_FAMILY.' (Linux-only) — keepalives still bound an idle-read stall, '
+                .'but a send-blocked stall falls back to the kernel. Dev machines only; '
+                .'do not use this host to validate stall handling.');
+        }
+
+        return self::$tcpUserTimeoutSupported;
     }
 
     private function pdo(): PDO
@@ -160,6 +292,17 @@ final class RecordWriter
             // the config key so `php artisan config:cache` doesn't nuke it.
             config('nightowl.environment') ?: config('app.env', 'production'),
             config('nightowl.database.sslmode', 'prefer'),
+            // Top-level 'drain_connection', NOT nested under 'database':
+            // mergeConfigFrom() is a shallow array_merge, so a published config's
+            // 'database' array wholly replaces the package's and would silently
+            // swallow any new sub-key there (and its env var with it).
+            (bool) config('nightowl.drain_connection.timeouts_enabled', true),
+            (int) config('nightowl.drain_connection.connect_timeout', 10),
+            (int) config('nightowl.drain_connection.tcp_user_timeout_ms', 20000),
+            (int) config('nightowl.drain_connection.keepalives_idle', 10),
+            (int) config('nightowl.drain_connection.keepalives_interval', 5),
+            (int) config('nightowl.drain_connection.keepalives_count', 3),
+            (int) config('nightowl.drain_connection.lock_timeout_ms', 10000),
         );
     }
 
@@ -299,10 +442,23 @@ final class RecordWriter
 
         $pdo = $this->pdo();
 
-        $pdo->beginTransaction();
+        $this->heartbeat?->enter('pg:begin');
 
+        // beginTransaction() is INSIDE the try. It is a network round trip like any
+        // other, so a stall can land on it — measured against a true partition, that
+        // is exactly where a stalled batch blocks, because BEGIN is the first thing on
+        // the wire and the socket dies with only a few hundred bytes sent. With BEGIN
+        // outside the try, that throw bypassed this catch entirely: lastWriteError was
+        // never stamped, so the health report lost the SQLSTATE and the failing table
+        // and the drain worker had to fall back to scanning the raw message. The catch
+        // is safe for a BEGIN failure: inTransaction() is false, so the guarded
+        // rollBack() is skipped.
         try {
+            $pdo->beginTransaction();
+            $this->applyTransactionGuards($pdo);
+
             foreach ($grouped as $type => $typeRecords) {
+                $this->heartbeat?->enter("pg:write:{$type}");
                 match ($type) {
                     'request' => $this->writeRequests($typeRecords),
                     'query' => $this->writeQueries($typeRecords),
@@ -321,15 +477,25 @@ final class RecordWriter
                 };
             }
 
+            $this->heartbeat?->enter('pg:commit');
             $pdo->commit();
             // All writes in this batch committed — publish the landed tables so the
             // drain worker can clear those tables' poison-breaker streaks.
             $this->lastWrittenTables = array_keys($this->pendingWrittenTables);
         } catch (\Throwable $e) {
             $this->notifier->clearPending(); // Discard — data was rolled back
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
+
+            // Classify BEFORE touching the connection. rollBack() on a handle the
+            // socket deadline just killed THROWS (inTransaction() reports true, then
+            // PDOException SQLSTATE[HY000] "no connection to the server"), and an
+            // exception thrown inside a catch abandons the rest of the block — so
+            // with the old ordering lastWriteError was never assigned and `throw $e`
+            // never ran. write() then classified the ROLLBACK's exception instead of
+            // the real one, the health report lost the SQLSTATE and the failing
+            // table, and with quarantine enabled a null lastWriteError is neither
+            // whole-target nor transient, so the batch bisected and quarantined good
+            // rows.
+            //
             // COPY failures already recorded their SQLSTATE+table in copyBatch.
             // INSERT/upsert failures (PDOException) are captured here, where the
             // failing table is known via currentWriteTarget.
@@ -341,11 +507,59 @@ final class RecordWriter
                     'connection' => $this->isConnectionError($e, $sqlstate),
                 ];
             }
+
+            try {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+            } catch (\Throwable) {
+                // The handle is already dead — the server has reaped the backend and
+                // there is nothing to roll back. Never let this mask the real error.
+                // Mirrors reconnect()'s existing guard.
+            }
+
             throw $e;
         }
 
         // Dispatch notifications AFTER commit — no blocking I/O inside the transaction
         $this->notifier->flushNotifications($pdo);
+    }
+
+    /**
+     * Transaction-scoped guards. These apply to EVERY statement in the batch — the
+     * to_regclass probes, the settings SELECT, all 10 COPYs, the 14 rollup upserts,
+     * the issues/users upserts and the COMMIT — which is coverage the per-call-site
+     * SIGALRM never had.
+     *
+     * SET LOCAL, not SET, and for synchronous_commit that is a bugfix as much as
+     * hardening: the plain SET at connect() ran OUTSIDE any transaction, so through a
+     * TRANSACTION-MODE pooler it leaked onto the shared server connection and silently
+     * weakened durability for whatever OTHER application borrowed it next (PgBouncer
+     * only runs DISCARD ALL in session mode by default). SET LOCAL reverts at both
+     * COMMIT and ROLLBACK, so nothing escapes the batch, and it still governs this
+     * transaction's own commit — throughput is unchanged. One exec, one round trip.
+     *
+     * lock_timeout is deliberately NOT exempted around the rollup advisory lock. With
+     * a backfill chunk holding the paired EXCLUSIVE lock, the drain's shared lock
+     * aborts with 55P03 — and 55P03 hits DrainWorker::isTransientFailure(), checked
+     * before the bisect, which DEFERS the batch and leaves the rows in SQLite. That is
+     * already correct: a drain blocked on the lock and a drain deferring on 55P03 both
+     * land zero rows for the chunk's duration, but only the deferring one keeps its
+     * loop responsive. Exempting it (SET LOCAL lock_timeout = 0) would reintroduce an
+     * unbounded wait AND, via a finally-restore, throw 25P02 over the real exception —
+     * which is neither whole-target nor transient, so with quarantine on it would
+     * bisect and quarantine good rows.
+     */
+    private function applyTransactionGuards(PDO $pdo): void
+    {
+        // Unconditional: the pooler leak fix is a bug fix, not a tunable.
+        $sets = ['SET LOCAL synchronous_commit = off'];
+
+        if ($this->timeoutsEnabled && $this->lockTimeoutMs > 0) {
+            $sets[] = 'SET LOCAL lock_timeout = '.$this->lockTimeoutMs;
+        }
+
+        $pdo->exec(implode('; ', $sets));
     }
 
     /**
@@ -399,7 +613,25 @@ final class RecordWriter
         // misclassify a poison row as a connection failure → defer-forever instead of
         // quarantine → head-of-line-block the whole drain. The classifier must NEVER
         // depend on customer row content.
-        if (is_string($sqlstate) && $sqlstate !== '') {
+        //
+        // HY000 is the one exception, and it is load-bearing. It is PDO's GENERIC code,
+        // not a Postgres SQLSTATE — it is what pdo_pgsql reports for a libpq TRANSPORT
+        // failure with no server-side error, and it is exactly what the socket deadline
+        // produces: a tcp_user_timeout-killed COPY throws SQLSTATE[HY000] "could not
+        // receive data from server: Connection timed out", and rollBack() on that dead
+        // handle throws SQLSTATE[HY000] "no connection to the server". Both must fall
+        // through to the message scan below.
+        //
+        // Without this carve-out the deadline is WORSE than the wedge it replaces: the
+        // stall classifies as a write error, write() skips reconnect(), the dead handle
+        // stays cached (copyBatch's `$this->pdo = null` sits on the returns-false
+        // branch, which a THROWING COPY never takes) and every later batch reuses it —
+        // an infinite failure loop instead of an infinite wedge.
+        //
+        // The scan stays safe for HY000 specifically because a transport error carries
+        // no server-reported row context; anything with a real SQLSTATE still returns
+        // false here without ever touching the message.
+        if (is_string($sqlstate) && $sqlstate !== '' && $sqlstate !== 'HY000') {
             return false;
         }
 
@@ -468,6 +700,7 @@ final class RecordWriter
             return;
         }
 
+        $this->heartbeat?->enter("pg:copy:{$table}");
         $this->markWriteTarget($table);
 
         // Swoole/OpenSwoole's PDO-pgsql coroutine hook reimplements
@@ -510,37 +743,20 @@ final class RecordWriter
         // literal string "N" for non-text columns. The text COPY default
         // null marker is already `\N`.
         //
-        // pgsqlCopyFromArray can hang on a genuine libpq stall (mid-stream network
-        // stall against a remote/managed Postgres) — it never returns false, it
-        // just blocks. Wrap with the same SIGALRM backstop used in connect(): if
-        // the call doesn't return within COPY_TIMEOUT seconds the drain child exits
-        // so the parent SIGCHLD handler restarts it. pcntl_async_signals(true) is
-        // already set by DrainWorker before run().
-        //
-        // Note: this backstop CANNOT catch a Swoole pgsqlCopyFromArray spin — that
-        // busy-loops in swoole.so's C code without yielding to the PHP VM, so the
-        // pending signal never dispatches. That case is handled earlier by routing
-        // to insertBatch() when Swoole is loaded (see the top of this method).
+        // No SIGALRM backstop here. An async signal cannot preempt a blocked libpq
+        // call: PHP dispatches async signals only at VM opcode boundaries, and libpq
+        // retries EINTR internally, so the handler only ever ran the instant libpq
+        // returned on its own — it never timed anything out. Reproduced against a true
+        // partition: a 95s alarm around a stalled COPY NEVER dispatched, and the
+        // process was still blocked when killed externally at 111s. The deadline now
+        // comes from the socket (tcp_user_timeout + keepalives, see dsn()), which
+        // bounds this COPY *and* every other statement on the connection, and surfaces
+        // as a normal catchable exception.
         //
         // When pgsqlCopyFromArray does return, it returns false rather than
         // throwing (even under ERRMODE_EXCEPTION) on some errors. Convert to
         // an exception so the drain loop rolls back and retries the batch.
-        if (function_exists('pcntl_signal') && function_exists('pcntl_alarm')) {
-            pcntl_signal(SIGALRM, static function () use ($table) {
-                error_log('[NightOwl Drain] pgsqlCopyFromArray hung on '.$table.' (SIGALRM backstop) — exiting for parent restart');
-                exit(1);
-            });
-            pcntl_alarm(self::COPY_TIMEOUT);
-        }
-
-        try {
-            $ok = $this->pdo()->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
-        } finally {
-            if (function_exists('pcntl_alarm') && function_exists('pcntl_signal')) {
-                pcntl_alarm(0);
-                pcntl_signal(SIGALRM, SIG_DFL);
-            }
-        }
+        $ok = $this->pdo()->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
 
         if ($ok !== true) {
             // Capture the error before discarding the connection — errorInfo()
