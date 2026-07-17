@@ -156,6 +156,35 @@ class AgentCommand extends Command
         } catch (\Throwable $e) {
             error_log('[NightOwl Agent] Schema drift check skipped: '.$e->getMessage());
         }
+
+        $this->warnOnUnpartitionedTables();
+    }
+
+    /**
+     * Startup twin of MigrateCommand::warnIfUnpartitioned — populated tables
+     * never auto-partition, so surface the row-DELETE-forever state everywhere
+     * an operator might look (deploy log via migrate, daemon log here, and the
+     * Data Management panel in the dashboard).
+     */
+    private function warnOnUnpartitionedTables(): void
+    {
+        try {
+            $tables = \NightOwl\Support\RawPartitions::unpartitionedPopulated(
+                \Illuminate\Support\Facades\DB::connection('nightowl')->getPdo()
+            );
+        } catch (\Throwable) {
+            return;
+        }
+
+        if ($tables !== []) {
+            $message = sprintf(
+                '%d raw table(s) unpartitioned — prune row-deletes them (disk reused, never returned). '
+                .'Run `php artisan nightowl:partition` once to enable instant partition-drop pruning.',
+                count($tables),
+            );
+            error_log('[NightOwl Agent] '.$message);
+            $this->warn($message);
+        }
     }
 
     private function runAsync(string $host, int $port): int

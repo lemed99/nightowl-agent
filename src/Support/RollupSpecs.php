@@ -35,6 +35,7 @@ final class RollupSpecs
         ];
     }
 
+
     /**
      * Queries rollup spec. The live drain writes this table via the bespoke
      * RecordWriter::writeQueryRollups (kept for its proven path); this spec
@@ -334,6 +335,7 @@ final class RollupSpecs
             ],
             hasDuration: true,
             hasHistogram: true,
+            hasDurationCount: true,
         );
     }
 
@@ -362,6 +364,7 @@ final class RollupSpecs
             ],
             hasDuration: true,
             hasHistogram: true,
+            hasDurationCount: true,
         );
     }
 
@@ -392,6 +395,7 @@ final class RollupSpecs
             ],
             hasDuration: true,
             hasHistogram: true,
+            hasDurationCount: true,
         );
     }
 
@@ -424,6 +428,7 @@ final class RollupSpecs
             ],
             hasDuration: true,
             hasHistogram: true,
+            hasDurationCount: true,
         );
     }
 }

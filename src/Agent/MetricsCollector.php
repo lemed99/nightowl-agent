@@ -2,6 +2,8 @@
 
 namespace NightOwl\Agent;
 
+use Composer\InstalledVersions;
+
 /**
  * In-memory metrics collector for the agent parent process.
  *
@@ -11,7 +13,63 @@ namespace NightOwl\Agent;
  */
 final class MetricsCollector
 {
-    public const AGENT_VERSION = '1.0.0';
+    /**
+     * Wire ceiling for agent_version. The platform validates `max:16` and stores
+     * varchar(16) (nightowl-api: HealthReportController + migration
+     * 2026_03_18_000001), and an over-long value 422s the ENTIRE health report —
+     * a cosmetic field would take the whole report down with it. Cross-repo
+     * contract: do not widen one side alone.
+     */
+    private const AGENT_VERSION_MAX = 16;
+
+    /** Reported when Composer can't tell us — never a plausible-looking fake version. */
+    private const AGENT_VERSION_UNKNOWN = 'unknown';
+
+    private static ?string $agentVersion = null;
+
+    /**
+     * The agent's real installed version, resolved from Composer rather than a
+     * hand-maintained constant. The constant this replaced said '1.0.0' from the
+     * initial commit through v1.2.14 — never once bumped — so every health report
+     * ever sent carried a version that was not merely stale but fiction, and
+     * support could not tell what a customer was actually running.
+     *
+     * Memoized: the version cannot change without restarting the process.
+     */
+    public static function agentVersion(): string
+    {
+        if (self::$agentVersion !== null) {
+            return self::$agentVersion;
+        }
+
+        try {
+            if (! class_exists(InstalledVersions::class) || ! InstalledVersions::isInstalled('nightowl/agent')) {
+                return self::$agentVersion = self::AGENT_VERSION_UNKNOWN;
+            }
+
+            $version = InstalledVersions::getPrettyVersion('nightowl/agent');
+            if (! is_string($version) || $version === '') {
+                return self::$agentVersion = self::AGENT_VERSION_UNKNOWN;
+            }
+
+            // A branch install ("dev-main") names a moving target, so pin it to the
+            // commit — "which dev build?" is exactly the question support needs
+            // answered. Tagged installs ("v1.2.14") are already exact; leave them.
+            if (str_starts_with($version, 'dev-')) {
+                $ref = InstalledVersions::getReference('nightowl/agent');
+                if (is_string($ref) && $ref !== '') {
+                    $version .= '@'.substr($ref, 0, 7);
+                }
+            }
+
+            // Truncate rather than risk the 422: a long branch name
+            // ("dev-feature/x@abc1234") must not cost us the whole report.
+            return self::$agentVersion = mb_substr($version, 0, self::AGENT_VERSION_MAX, 'UTF-8');
+        } catch (\Throwable) {
+            // Version reporting is cosmetic; it must never take down the collector.
+            return self::$agentVersion = self::AGENT_VERSION_UNKNOWN;
+        }
+    }
 
     // Ring buffer for 1-minute rolling averages (1 slot per second)
     private const RING_SIZE = 60;
@@ -594,7 +652,9 @@ final class MetricsCollector
                     .'re-drained; nothing is lost. This should not happen when the client-side deadline is '
                     .'active, so it usually means tcp_user_timeout is unavailable (needs libpq 12+) or inert '
                     .'(non-Linux). Check the agent log for the startup warning, and see '
-                    .'NIGHTOWL_DB_TCP_USER_TIMEOUT_MS.',
+                    .'NIGHTOWL_DB_TCP_USER_TIMEOUT_MS. If it persists across agent restarts, the block is '
+                    .'server-side — check the database\'s free disk space and whether it has flipped to '
+                    .'read-only (a full disk is the usual cause).',
                 'value' => round($wedge['stale_seconds'], 1),
             ];
         }
@@ -948,7 +1008,7 @@ final class MetricsCollector
         return [
             'version' => 1,
             'schema_version' => '1.0',
-            'agent_version' => self::AGENT_VERSION,
+            'agent_version' => self::agentVersion(),
             'status' => $this->status,
             'health_score' => $this->healthScore,
             'uptime_seconds' => (int) (microtime(true) - $startTime),
@@ -1034,10 +1094,37 @@ final class MetricsCollector
                 'PostgreSQL has no free connection slots for the agent.',
                 'Lower NIGHTOWL_DRAIN_WORKERS or raise the database max_connections.',
             ],
+            '53100' => [
+                'Your database is out of disk space.',
+                'PostgreSQL rejected the write because the disk is full. Free space on the database volume '
+                    .'(or raise its size / lower retention with nightowl:prune) — telemetry is buffered and drains '
+                    .'automatically once writes are accepted again. On managed Postgres (Supabase/RDS) a full disk '
+                    .'also flips the instance to read-only until you free space.',
+            ],
+            '25006' => [
+                'Your database is in read-only mode and is refusing writes.',
+                'A read-only transaction state means the database itself is refusing writes — on managed Postgres '
+                    .'(Supabase/RDS) this is almost always disk-full enforcement. Free disk space or raise the plan/storage; '
+                    .'telemetry is buffered and drains automatically once writes are accepted again.',
+            ],
             default => (str_starts_with($sqlstate, '22') || str_starts_with($sqlstate, '23'))
                 ? [
-                    sprintf('A telemetry row was rejected by your database (SQLSTATE %s on %s).', $sqlstate, $table),
-                    'A record failed a column rule (e.g. value too long or wrong type). Check the agent log for the offending row.',
+                    sprintf('A telemetry row was rejected by your database (SQLSTATE %s on %s) and the drain is blocked.', $sqlstate, $table),
+                    // The previous text here said "check the agent log for the offending
+                    // row". It cannot be there: Postgres does not name the column or row
+                    // for a rejected COPY, and the agent only logs the libpq message. That
+                    // advice sent operators to an empty log during a live outage, and
+                    // never told them the drain was stuck rather than slow. Say both.
+                    sprintf(
+                        'A record failed a column rule (a value too long for its column, or a NOT NULL/type violation). '
+                        .'PostgreSQL does not name the offending column for a rejected COPY, so the agent log will not '
+                        .'identify it — the batch is retried intact instead, so the drain will NOT recover on its own and '
+                        .'buffered telemetry grows until back-pressure starts refusing payloads. If NIGHTOWL_DRAIN_QUARANTINE '
+                        .'is off (the default), set it to true and restart: the offending payload is isolated and dropped so '
+                        .'the rest of the stream drains. If it is already on, this rejection is systematic — every payload '
+                        .'touching %s fails — and the schema mismatch itself must be fixed.',
+                        $table
+                    ),
                 ]
                 : [
                     sprintf('Drain writes are failing (SQLSTATE %s on %s).', $sqlstate !== '' ? $sqlstate : 'unknown', $table),

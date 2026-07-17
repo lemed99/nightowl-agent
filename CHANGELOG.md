@@ -5,6 +5,150 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.3.0] - 2026-07-17
+
+### Added
+
+- **Minute→hour→day rollup tiers.** Every rollup table now has `_hourly_rollups`
+  and `_daily_rollups` siblings (migration 000054, `LIKE base INCLUDING ALL`),
+  written in the same drain pass by re-collapsing each batch's minute groups in
+  PHP. Wide-range dashboard reads pick the coarsest tier the chart interval
+  permits, so a 30-day chart scans days instead of every minute row — 60× / 1440×
+  fewer rows. Every rollup column is mergeable (counters and histogram bins sum,
+  min/max fold, representatives keep first-seen), so a coarser tier is a lossless
+  collapse of the finer one. The tiers keep history far past the minute tier's
+  retention: `NIGHTOWL_HOURLY_ROLLUP_RETENTION_DAYS` (366) /
+  `NIGHTOWL_DAILY_ROLLUP_RETENTION_DAYS` (1100), TOP-LEVEL `rollup_tier_retention`
+  config keys (never under `database`, where a published config's shallow merge
+  would swallow the new sub-keys). `nightowl:backfill-rollups` chains
+  raw→minute→hourly→daily.
+
+- **DDSketch v2 percentile sketches on duration rollups.** Duration-bearing
+  rollups (8 types × 3 tiers) now carry a sparse varint-packed `sketch` bytea plus
+  `sketch_version`, written alongside the v1 `hist_NN` bins (migration 000057,
+  dual-write transition — v1 stays readable for the whole rollup retention). The
+  DDSketch mapping (α = 1%) guarantees 1% relative percentile error versus the √2
+  histogram's ~2.8% worst case. Merging runs SQL-side inside the drain's
+  `ON CONFLICT` via `nightowl_ddsketch_merge`, so concurrent workers serialise on
+  the row lock with no PHP read-modify-write; `nightowl_ddsketch_agg` powers the
+  tier backfill's re-aggregation. `src/Support/DDSketchHistogram.php` stays
+  byte-identical to nightowl-api's twin (checksum-guarded on both sides). A managed
+  PostgreSQL that denies `CREATE FUNCTION` skips the sketch columns entirely and
+  keeps the v1 path — never worse than before. `nightowl:drop-v1-histograms`
+  (guarded — refuses until every rollup row is v2) removes the old bins once the
+  API ships hist-conditional reads.
+
+- **Raw-index diet and rollup-table storage tuning.** Every COPY row pays index
+  maintenance on 5–7 btrees per table; at high volume that tax, not the heap write,
+  dominates drain cost on the customer's PostgreSQL. A full reader audit
+  (2026-07-17) dropped 22 dead raw indexes (migration 000056 — the string
+  `timestamp` indexes no query reads, single-column prefixes already served by the
+  000044 composites, and unread `trace_id` / duration singles) plus 2 more once
+  their readers proved always `created_at`-co-bounded (000059); every drop carries
+  a documented no-reader verdict and the deliberately-kept indexes are listed
+  alongside. Rollup tables now run `fillfactor 70` (000053) and
+  `autovacuum_vacuum_scale_factor 0.02` (000055): the drain UPDATEs each hot
+  bucket's row dozens–hundreds of times over its minute, and the default packing
+  forced those updates non-HOT, bloating exactly the recent buckets the
+  narrow-window charts scan (the statement_timeout 504 incident, 2026-07-16). The
+  per-page headroom keeps those updates HOT; the aggressive autovacuum reclaims
+  what HOT can't.
+
+- **Drain transactions now reap their own orphans.** Every batch carries
+  `SET LOCAL idle_in_transaction_session_timeout` (default 30s, env
+  `NIGHTOWL_DB_IDLE_TXN_TIMEOUT_MS`, `0` disables). When an abandoned batch's
+  server-side session survives behind a pooler (Supavisor/PgBouncer) holding
+  uncommitted unique-index entries, the retry previously collided with its own
+  ghost and died on `55P03` (`while inserting index tuple ... "nightowl_issues"`)
+  until an operator intervened; now Postgres terminates the orphan itself and
+  the drain self-heals. Scoped to the agent's transactions only — other
+  applications on the customer's database are untouched, and a healthy drain
+  cannot trip it (only idle-between-statements time counts, measured ~27ms live).
+- **Disk-full and read-only databases are named plainly in health diagnoses.**
+  `DRAIN_WRITE_FAILING` now maps SQLSTATE `53100` to "Your database is out of
+  disk space" and `25006` to "Your database is in read-only mode" (managed-PG
+  disk-full enforcement), instead of the generic "PostgreSQL is rejecting
+  writes". `25006` is also classified whole-target so a read-only database
+  defers-and-retries instead of quarantining (dropping) good rows. The
+  `DRAIN_WEDGED` recommendation now points at server-side disk/read-only checks
+  when the wedge survives agent restarts.
+
+- **Raw telemetry tables are natively partitioned by day.** Fresh installs
+  partition at `nightowl:migrate`; existing tenants convert with
+  `php artisan nightowl:partition`. For 10 of the 11 tables the conversion
+  attaches the existing data as-is — no rows are copied, and the exclusive
+  locks last only for the rename/attach instants.
+
+  **Upgrade note — `nightowl_logs` is the exception.** Its legacy `created_at`
+  column is a nullable string, so converting it requires a full-table rewrite
+  under an `ACCESS EXCLUSIVE` lock: on a large logs table this locks the table
+  for the duration of the rewrite (minutes, proportional to row count). Ingest
+  is unaffected — the agent keeps buffering and drains once the lock clears —
+  but dashboard log reads will error until it finishes. Run `nightowl:partition`
+  in a quiet window if your logs table is large, or prune logs first to shrink
+  the rewrite. `NULL`/empty log dates become `1970-01-01` and age out with the
+  next prune.
+
+- **`duration_count` counter on the mail/notification/command/scheduled-task
+  rollups** (migration 000061, all tiers): the number of duration-bearing rows,
+  which is those types' average denominator (queued sends carry no duration and
+  must not dilute the average). The API previously derived it by summing the 39
+  v1 `hist_NN` bins; the dedicated column replaces that derivation so the bins
+  can eventually be dropped. Backfilled from the bins at `nightowl:migrate`,
+  written by the drain from then on — the writer probes for the column, so an
+  un-migrated tenant keeps its rollups minus the new counter.
+  `nightowl:drop-v1-histograms` refuses to run until the column exists.
+
+### Fixed
+
+- **One over-long field no longer stops the entire drain.** Reported from
+  production: the drain wedged with `SQLSTATE[22001]: value too long for type
+  character varying(255)`, repeating forever while the buffer climbed toward
+  back-pressure. `RecordWriter` passed every field straight through to Postgres,
+  but `$table->string()` is `varchar(255)` by default — `nightowl_requests` alone
+  has twelve such columns (only `url` is `text`) fed by unbounded upstream values
+  like `route_action` and `user_id`. With `drain_quarantine_enabled` off (the
+  default) the rejected batch is retried intact every loop, so a single row
+  head-of-line blocked all telemetry, silently and permanently.
+
+  Values are now clamped to each column's real width, introspected per table from
+  `information_schema` rather than hardcoded from the migrations — a tenant who
+  widened a column themselves (`varchar(n)` → `text`) is not clamped back to 255,
+  and `text` columns are never touched. Applied at every write path, not only the
+  reported one: the COPY tables, the `nightowl_exceptions`/`nightowl_users`
+  upserts, both issue upserts, and both rollup upserts (clamping a raw column but
+  not its rollup would only move the poison). Clamping counts characters, not
+  bytes, since `varchar(n)` does: a byte-prefix cut would sever a multibyte
+  sequence and hand Postgres invalid UTF-8 (`22021`), trading one poison row for
+  another. Truncation logs once per table+column, naming the column Postgres will
+  not.
+
+  This generalises the guard already on `eventEpoch()`, which range-clamps poison
+  timestamps for the same reason (a `22008` would block the drain identically).
+
+- **`agent_version` in health reports is now the real version.** It was a
+  hardcoded `'1.0.0'` from the initial commit through 1.2.14 — never bumped — so
+  every report ever sent misidentified the agent and support could not tell what a
+  customer was running. It now resolves from Composer (`InstalledVersions`), which
+  cannot drift, and pins branch installs to their commit (`dev-main@ce1fb23`). The
+  value is truncated to 16 characters because the platform validates `max:16` into
+  a `varchar(16)` and an over-long value would 422 the whole report.
+
+  The unit test covering this asserted the constant against itself and stayed
+  green for twelve releases of the version being wrong; it is replaced by tests
+  asserting the contract.
+
+### Changed
+
+- **The `DRAIN_WRITE_FAILING` advice for rejected rows no longer sends operators
+  to a log that cannot help them.** It said "check the agent log for the offending
+  row", but Postgres names neither the column nor the row for a rejected `COPY`
+  and the agent only logs the libpq message — so the advice sent a paying customer
+  to an empty log during a live outage, and never conveyed that the drain was
+  stuck rather than merely slow. It now says the drain will not recover on its own,
+  and points at `NIGHTOWL_DRAIN_QUARANTINE` (or, when that is already on, at the
+  systematic schema mismatch the breaker is reporting).
+
 ## [1.2.14] - 2026-07-16
 
 ### Fixed

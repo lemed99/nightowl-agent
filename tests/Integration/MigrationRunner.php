@@ -34,12 +34,33 @@ final class MigrationRunner
         }
 
         // Cross-process guard: the harness subprocess re-enters this method
-        // with its own static state. If the parent test process already
-        // migrated, the canonical first table exists.
-        if (Schema::connection('nightowl')->hasTable('nightowl_requests')) {
+        // with its own static state. Probe the NEWEST migration's observable
+        // effect — probing an early artifact would skip every migration added
+        // since the test DB was first provisioned. Update this probe whenever
+        // a migration is added (currently 000062's sketch sample counter).
+        if (Schema::connection('nightowl')->hasTable('nightowl_request_hourly_rollups')
+            && Schema::connection('nightowl')->hasColumn('nightowl_query_rollups', 'sketch')
+            && Schema::connection('nightowl')->hasTable('nightowl_logs_pdefault')
+            && Schema::connection('nightowl')->hasColumn('nightowl_mail_rollups', 'duration_count')
+            && Schema::connection('nightowl')->getConnection()->selectOne(
+                "SELECT to_regprocedure('nightowl_ddsketch_count(bytea)') IS NOT NULL AS present"
+            )->present) {
             self::$migrated = true;
 
             return;
+        }
+
+        // Stale schema from an older run: early migrations have no hasTable
+        // guards, so the chain can't be re-run over them. This is a throwaway
+        // test DB — drop every nightowl_* table and migrate fresh.
+        if (Schema::connection('nightowl')->hasTable('nightowl_requests')) {
+            $conn = Schema::connection('nightowl')->getConnection();
+            $tables = $conn->select(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE 'nightowl\\_%'"
+            );
+            foreach ($tables as $t) {
+                $conn->statement("DROP TABLE IF EXISTS {$t->tablename} CASCADE");
+            }
         }
 
         $migrationsDir = __DIR__.'/../../database/migrations';

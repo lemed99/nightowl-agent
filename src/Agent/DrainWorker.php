@@ -213,6 +213,7 @@ final class DrainWorker
             keepalivesCount: (int) config('nightowl.drain_connection.keepalives_count', 3),
             lockTimeoutMs: (int) config('nightowl.drain_connection.lock_timeout_ms', 10000),
             heartbeat: $heartbeat,
+            idleTxnTimeoutMs: (int) config('nightowl.drain_connection.idle_txn_timeout_ms', 30000),
         );
 
         $workerLabel = $this->totalWorkers > 1
@@ -224,6 +225,9 @@ final class DrainWorker
         $lastFlushTime = microtime(true);
         $lastMetricsWrite = 0.0;
         $lastIssueCount = 0.0;
+        // 0 = run partition maintenance on the FIRST cleanup tick after start,
+        // so a freshly-partitioned tenant doesn't wait an hour for children.
+        $lastPartitionCheck = 0;
 
         while ($this->running) {
             $drained = $this->drainBatch($buffer, $writer);
@@ -243,6 +247,14 @@ final class DrainWorker
                     // re-drained: fetchPending selects synced=0; never cleaned:
                     // cleanup targets synced=1). A no-op when no synced=-1 rows exist.
                     $buffer->pruneQuarantined($this->quarantineRetentionSeconds);
+
+                    // Hourly: keep future daily partitions pre-created so a
+                    // day rollover can never route rows to the DEFAULT child.
+                    // (No-op on unpartitioned tenants; advisory-locked.)
+                    if (time() - $lastPartitionCheck >= 3600) {
+                        $writer->maintainRawPartitions();
+                        $lastPartitionCheck = time();
+                    }
                     $this->checkpointWithEscalation($buffer);
                 } catch (\Throwable $e) {
                     error_log("[NightOwl Drain] Cleanup error: {$e->getMessage()}");
@@ -693,8 +705,11 @@ final class DrainWorker
      * A failure that hits the whole target rather than one payload — re-throw to
      * abort isolation and retry the whole batch (surfacing DRAIN_WRITE_FAILING):
      * connection drops, plus schema/syntax/privilege (42), auth (28), catalog (3D),
-     * resource (53), operator (57), system (58). An EMPTY SQLSTATE is NOT treated as
-     * whole-target — isolation proceeds so the per-payload INSERT can surface a code.
+     * resource (53), operator (57), system (58), and read-only mode (25006 — a
+     * managed DB flipped read-only, usually a full disk; every write fails, so
+     * quarantining rows would drop good data for a transient whole-target state).
+     * An EMPTY SQLSTATE is NOT treated as whole-target — isolation proceeds so the
+     * per-payload INSERT can surface a code.
      *
      * @param  mixed  $err  RecordWriter::$lastWriteError
      */
@@ -712,6 +727,7 @@ final class DrainWorker
         }
 
         return str_starts_with($sqlstate, '08')
+            || $sqlstate === '25006'
             || str_starts_with($sqlstate, '42')
             || str_starts_with($sqlstate, '28')
             || str_starts_with($sqlstate, '3D')

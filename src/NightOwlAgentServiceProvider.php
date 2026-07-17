@@ -17,8 +17,10 @@ use NightOwl\Commands\AgentCommand;
 use NightOwl\Commands\BackfillRollupsCommand;
 use NightOwl\Commands\ClearCommand;
 use NightOwl\Commands\DrainWorkerCommand;
+use NightOwl\Commands\DropV1HistogramsCommand;
 use NightOwl\Commands\InstallCommand;
 use NightOwl\Commands\MigrateCommand;
+use NightOwl\Commands\PartitionCommand;
 use NightOwl\Commands\PruneCommand;
 use NightOwl\Support\MultiIngest;
 
@@ -238,6 +240,8 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 InstallCommand::class,
                 MigrateCommand::class,
                 PruneCommand::class,
+                PartitionCommand::class,
+                DropV1HistogramsCommand::class,
                 BackfillRollupsCommand::class,
                 ClearCommand::class,
             ];

@@ -24,6 +24,86 @@ class MetricsCollectorTest extends TestCase
         $this->assertSame('healthy', $this->collector->getStatus());
     }
 
+    // --- agent_version ---
+
+    /**
+     * The version was a hardcoded '1.0.0' from the initial commit through v1.2.14,
+     * so every health report ever sent misidentified the agent. It must now come
+     * from Composer, which cannot drift.
+     */
+    public function testAgentVersionIsResolvedFromComposerNotHardcoded(): void
+    {
+        $version = MetricsCollector::agentVersion();
+
+        $this->assertNotSame('1.0.0', $version, 'agent_version must not be the old hardcoded fiction');
+        $this->assertNotSame('', $version);
+        // Running from the package repo itself, Composer reports the root package
+        // as a branch install and we pin it to the commit.
+        $this->assertMatchesRegularExpression('/^(dev-|v?\d+\.|unknown)/', $version);
+    }
+
+    /**
+     * Cross-repo contract with nightowl-api: POST /agent/health validates
+     * `agent_version` as max:16 into a varchar(16), and an over-long value 422s the
+     * WHOLE report. In this repo the value is 'dev-main@<7-char ref>' — exactly 16 —
+     * so this guards a real boundary, not a theoretical one.
+     */
+    public function testAgentVersionFitsThePlatformWireLimit(): void
+    {
+        $this->assertLessThanOrEqual(16, mb_strlen(MetricsCollector::agentVersion(), 'UTF-8'));
+    }
+
+    /**
+     * Cross-repo contract with nightowl-api: diagnoses.*.message and
+     * .recommendation are validated max:1024, and an over-long one 422s the whole
+     * health report — losing every diagnosis to say one of them too verbosely. The
+     * 22xxx/23xxx recommendation is long and interpolates a table name, so it is
+     * the realistic candidate to drift over.
+     */
+    public function testDrainWriteAdviceFitsThePlatformFieldCap(): void
+    {
+        $advice = new \ReflectionMethod(MetricsCollector::class, 'drainWriteAdvice');
+        $longestTable = 'nightowl_outgoing_request_hourly_rollups';
+
+        foreach (['22001', '22008', '23502', '42P01', '42501', '28P01', '28000', '3D000', '53100', '53300', '25006', 'XX000', ''] as $sqlstate) {
+            [$message, $recommendation] = $advice->invoke($this->collector, $sqlstate, $longestTable);
+
+            $this->assertLessThanOrEqual(1024, strlen($message), "message for SQLSTATE {$sqlstate}");
+            $this->assertLessThanOrEqual(1024, strlen($recommendation), "recommendation for SQLSTATE {$sqlstate}");
+        }
+    }
+
+    /**
+     * The old text told operators to "check the agent log for the offending row".
+     * Postgres names neither the column nor the row for a rejected COPY, so it was
+     * never there — it sent a paying customer to an empty log mid-outage.
+     */
+    public function testRowRejectionAdviceDoesNotSendOperatorsToTheLog(): void
+    {
+        $advice = new \ReflectionMethod(MetricsCollector::class, 'drainWriteAdvice');
+
+        [$message, $recommendation] = $advice->invoke($this->collector, '22001', 'nightowl_requests');
+
+        $this->assertStringNotContainsString('Check the agent log for the offending row', $recommendation);
+        // It must say the drain is stuck, not merely that a write failed.
+        $this->assertStringContainsString('blocked', $message);
+        $this->assertStringContainsString('NIGHTOWL_DRAIN_QUARANTINE', $recommendation);
+    }
+
+    public function testHealthReportCarriesTheResolvedAgentVersion(): void
+    {
+        $status = $this->collector->getFullStatus(
+            startTime: microtime(true),
+            backPressure: false,
+            pendingRows: 0,
+            walSize: 0,
+            drainWorkerPid: 0,
+        );
+
+        $this->assertSame(MetricsCollector::agentVersion(), $status['agent_version']);
+        $this->assertNotSame('1.0.0', $status['agent_version']);
+    }
+
     public function testRecordIngestAndTick(): void
     {
         // Record some ingests then tick to push to ring buffer
@@ -130,6 +210,68 @@ class MetricsCollectorTest extends TestCase
         $d = $this->activeDiagnosis($status, 'DRAIN_WRITE_FAILING');
         $this->assertNotFalse($d);
         $this->assertStringContainsString('nightowl:migrate', $d['recommendation']);
+    }
+
+    /**
+     * A full disk (SQLSTATE 53100) previously fell through to the generic "PostgreSQL
+     * is reachable but rejecting writes" line — a real incident cost hours because
+     * nothing pointed at the disk. The write-failing card must now name it plainly.
+     */
+    public function testDrainWriteFailingNamesDiskFull(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'last_write_sqlstate' => '53100',
+            'last_write_table' => 'nightowl_exceptions',
+            'last_write_at' => $now,
+            'batches_failed' => 5,
+        ]);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 500, 0, 0);
+        $d = $this->activeDiagnosis($status, 'DRAIN_WRITE_FAILING');
+
+        $this->assertNotFalse($d);
+        $this->assertStringContainsStringIgnoringCase('disk space', $d['message']);
+    }
+
+    /**
+     * Managed Postgres (Supabase/RDS) enforces a full disk by flipping the instance
+     * to read-only, which surfaces as 25006. That must read as read-only/disk, and it
+     * must be classified whole-target so good rows are retried, never quarantined.
+     */
+    public function testReadOnlyModeNamesReadOnlyAndIsWholeTarget(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'last_write_sqlstate' => '25006',
+            'last_write_table' => 'nightowl_requests',
+            'last_write_at' => $now,
+            'batches_failed' => 5,
+        ]);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+        $this->collector->runDiagnosis(false, 500, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 500, 0, 0);
+        $d = $this->activeDiagnosis($status, 'DRAIN_WRITE_FAILING');
+
+        $this->assertNotFalse($d);
+        $this->assertStringContainsStringIgnoringCase('read-only', $d['message']);
+
+        // 25006 must be a whole-target failure — otherwise the drain isolates and
+        // DROPS individual rows against a merely read-only DB (data loss).
+        $isWholeTarget = new \ReflectionMethod(\NightOwl\Agent\DrainWorker::class, 'isWholeTargetFailure');
+        $worker = (new \ReflectionClass(\NightOwl\Agent\DrainWorker::class))->newInstanceWithoutConstructor();
+        $this->assertTrue($isWholeTarget->invoke($worker, ['sqlstate' => '25006']));
     }
 
     public function testDrainErrorsCoversFreshAppConnectivityFailureWithSmallBacklog(): void
@@ -647,11 +789,12 @@ class MetricsCollectorTest extends TestCase
         $this->assertGreaterThan(100, $status['uptime_seconds']);
     }
 
-    public function testAgentVersion(): void
-    {
-        $status = $this->collector->getFullStatus(microtime(true), false, 0, 0, 0);
-        $this->assertSame('1.0.0', $status['agent_version']);
-    }
+    // testAgentVersion() lived here. It asserted $status['agent_version'] === '1.0.0'
+    // — the hardcoded constant compared against itself, which is true by
+    // construction and stayed green through twelve releases of the version being
+    // wrong. Superseded by the agent_version tests above, which assert the contract
+    // (resolved from Composer, within the platform's 16-char limit) rather than the
+    // implementation detail.
 
     // --- Multi-worker metrics aggregation ---
 

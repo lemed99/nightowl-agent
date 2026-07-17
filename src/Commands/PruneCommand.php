@@ -5,6 +5,8 @@ namespace NightOwl\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use NightOwl\Support\RollupSpecs;
+use NightOwl\Support\RawPartitions;
+use NightOwl\Support\RollupTiers;
 
 class PruneCommand extends Command
 {
@@ -55,11 +57,33 @@ class PruneCommand extends Command
         $totalDeleted = 0;
 
         foreach (self::TABLES as $table) {
+            // Partitioned tables: DROP fully-expired daily children first —
+            // instant, zero WAL amplification, zero vacuum debt — then let the
+            // row-DELETE below clean only the boundary/historic/default
+            // partitions. Unpartitioned tables take the DELETE path unchanged.
+            if (RawPartitions::isPartitioned($conn->getPdo(), $table)) {
+                foreach (RawPartitions::expiredChildren($conn->getPdo(), $table, $cutoff) as $child) {
+                    $rows = (int) $conn->table($child)->count();
+                    $conn->statement("DROP TABLE {$child}");
+                    $totalDeleted += $rows;
+                    $this->line("  {$table}: dropped partition {$child} ({$rows} records)");
+                }
+            }
+
             $deleted = $conn->table($table)->where('created_at', '<', $cutoff)->delete();
             $totalDeleted += $deleted;
 
             if ($deleted > 0) {
                 $this->line("  {$table}: {$deleted} records deleted");
+            }
+
+            // Once the row-DELETE above empties the historic partition (its
+            // range is frozen at conversion, so this happens on the first
+            // prune after retention passes it), drop it — the tenant's entire
+            // pre-conversion bloat returns to the OS in one unlink.
+            if (RawPartitions::isPartitioned($conn->getPdo(), $table)
+                && RawPartitions::dropEmptyHistoric($conn->getPdo(), $table)) {
+                $this->line("  {$table}: dropped empty historic partition (pre-conversion space reclaimed)");
             }
         }
 
@@ -89,8 +113,53 @@ class PruneCommand extends Command
             }
         }
 
+        // Hour/day tiers are 60× / 1440× sparser than the minute rollups, so
+        // they carry their own (much longer) retentions — that's what makes
+        // long-range trend views survive the minute tier's cutoff.
+        $tierDays = [
+            'hourly' => (int) config('nightowl.rollup_tier_retention.hourly_days', 366),
+            'daily' => (int) config('nightowl.rollup_tier_retention.daily_days', 1100),
+        ];
+
+        foreach ($tierDays as $tier => $days) {
+            $cutoff = now()->utc()->subDays($days)->toDateTimeString();
+
+            foreach (array_keys($rollupTables) as $base) {
+                $table = RollupTiers::table($base, $tier);
+                if (! $schema->hasTable($table)) {
+                    continue;
+                }
+
+                $deleted = $conn->table($table)->where('bucket_start', '<', $cutoff)->delete();
+                $totalDeleted += $deleted;
+
+                if ($deleted > 0) {
+                    $this->line("  {$table}: {$deleted} records deleted (older than {$days} days)");
+                }
+            }
+        }
+
         $this->newLine();
         $this->info("Pruned {$totalDeleted} records total.");
+
+        // THE moment the false expectation forms: "Pruned 24M records" reads
+        // as "disk freed", but on unpartitioned tables Postgres only reuses
+        // that space — it never returns it to the OS. Say so right here, in
+        // the output the operator is actually reading.
+        try {
+            $unpartitioned = RawPartitions::unpartitionedPopulated($conn->getPdo());
+            if ($unpartitioned !== []) {
+                $this->warn(sprintf(
+                    'Note: %d table(s) (%s…) are unpartitioned — the space just pruned is reused by new '
+                    .'telemetry, not returned to the OS. Run `php artisan nightowl:partition` once to make '
+                    .'future prunes drop whole day-partitions and reclaim disk instantly.',
+                    count($unpartitioned),
+                    $unpartitioned[0],
+                ));
+            }
+        } catch (\Throwable) {
+            // Advisory only — never fail a completed prune over it.
+        }
 
         return self::SUCCESS;
     }

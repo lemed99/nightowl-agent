@@ -45,7 +45,65 @@ class MigrateCommand extends Command
             $this->backfillEmptyRollups();
         }
 
+        if ($exit === self::SUCCESS) {
+            $this->warnIfSketchUnavailable();
+            $this->warnIfUnpartitioned();
+        }
+
         return $exit;
+    }
+
+    /**
+     * Populated tables never auto-partition (the conversion's CONCURRENTLY
+     * index build must not run inside a deploy pipeline that may kill it) — so
+     * upgraded tenants stay on the row-DELETE prune path, which reuses disk
+     * but never returns it, until an operator runs nightowl:partition. Say so
+     * loudly; the Data Management panel carries the same flag in the UI.
+     */
+    private function warnIfUnpartitioned(): void
+    {
+        try {
+            $tables = \NightOwl\Support\RawPartitions::unpartitionedPopulated(
+                DB::connection('nightowl')->getPdo()
+            );
+        } catch (\Throwable) {
+            return;
+        }
+
+        if ($tables !== []) {
+            $this->warn(sprintf(
+                '%d raw telemetry table(s) are not partitioned (%s…): prune row-deletes them, so disk is '
+                .'reused but never returned. Run `php artisan nightowl:partition` once (operator action; '
+                .'see docs) to switch prune to instant partition drops.',
+                count($tables),
+                $tables[0],
+            ));
+        }
+    }
+
+    /**
+     * Surface the CREATE-FUNCTION-denied condition (migration 000057 skips the
+     * DDSketch columns on such databases): percentiles silently stay on the v1
+     * √2 histogram (~2.8% worst-case vs ≤1%) — correct, but the operator
+     * should know why, and that granting CREATE + re-running migrate fixes it.
+     */
+    private function warnIfSketchUnavailable(): void
+    {
+        $conn = DB::connection('nightowl');
+        $schema = Schema::connection('nightowl');
+
+        if (! $schema->hasTable('nightowl_query_rollups')) {
+            return;
+        }
+
+        $fn = $conn->selectOne("SELECT to_regproc('nightowl_ddsketch_merge') IS NOT NULL AS present");
+        if ($fn !== null && ! $fn->present) {
+            $this->warn(
+                'DDSketch percentiles unavailable: this database denied CREATE FUNCTION, so the '
+                .'sketch columns were skipped and percentiles use the v1 histogram (~2.8% worst-case '
+                .'accuracy instead of ≤1%). Grant CREATE on the schema and re-run nightowl:migrate to enable.'
+            );
+        }
     }
 
     /**

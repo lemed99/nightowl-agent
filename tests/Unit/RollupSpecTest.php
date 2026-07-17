@@ -56,6 +56,52 @@ class RollupSpecTest extends TestCase
         }
     }
 
+    public function test_duration_count_flag_drives_backfill_and_tier_sql(): void
+    {
+        // The four hist-sum-denominator types carry duration_count (000061);
+        // its raw backfill is COUNT(duration) — non-null count, matching the
+        // live drain's fold exactly — and its tier backfill re-SUMs the column.
+        foreach ([RollupSpecs::mail(), RollupSpecs::notifications(), RollupSpecs::commands(), RollupSpecs::scheduledTasks()] as $spec) {
+            $this->assertTrue($spec->hasDurationCount, "{$spec->table} must carry duration_count");
+
+            ['columns' => $columns, 'selects' => $selects] = $spec->backfillSql([], withDurationCount: true);
+            $i = array_search('duration_count', $columns, true);
+            $this->assertNotFalse($i, "{$spec->table} backfill must include duration_count");
+            $this->assertSame('COUNT(duration)', $selects[$i]);
+
+            ['columns' => $tierCols, 'selects' => $tierSelects] = $spec->tierBackfillSql('hour', [], withDurationCount: true);
+            $ti = array_search('duration_count', $tierCols, true);
+            $this->assertNotFalse($ti, "{$spec->table} tier backfill must include duration_count");
+            $this->assertSame('SUM(duration_count)', $tierSelects[$ti]);
+        }
+
+        // Types with a call_count/attempts_count denominator don't pay for it.
+        foreach ([RollupSpecs::requests(), RollupSpecs::jobs()] as $spec) {
+            $this->assertFalse($spec->hasDurationCount);
+            $this->assertNotContains('duration_count', $spec->backfillSql([], withDurationCount: true)['columns']);
+        }
+    }
+
+    public function test_duration_count_is_omitted_when_the_column_is_absent(): void
+    {
+        // duration_count only exists once migration 000061 has run. Emitting it
+        // off the spec flag alone made `nightowl:backfill-rollups` before
+        // `nightowl:migrate` die with 42703 on the first of the four types,
+        // leaving the rest un-backfilled — so the column must follow the
+        // caller's probe, exactly as hist_NN and sketch already do.
+        foreach ([RollupSpecs::mail(), RollupSpecs::notifications(), RollupSpecs::commands(), RollupSpecs::scheduledTasks()] as $spec) {
+            ['columns' => $columns, 'selects' => $selects] = $spec->backfillSql([], withDurationCount: false);
+            $this->assertNotContains('duration_count', $columns, "{$spec->table} backfill must omit duration_count when the table lacks it");
+            $this->assertStringNotContainsString('duration_count', implode(' ', $selects));
+            $this->assertSameSize($columns, $selects);
+
+            ['columns' => $tierCols, 'selects' => $tierSelects] = $spec->tierBackfillSql('hour', [], withDurationCount: false);
+            $this->assertNotContains('duration_count', $tierCols, "{$spec->table} tier backfill must omit duration_count when the table lacks it");
+            $this->assertStringNotContainsString('duration_count', implode(' ', $tierSelects));
+            $this->assertSameSize($tierCols, $tierSelects);
+        }
+    }
+
     public function test_requests_spec_has_no_duration_predicate(): void
     {
         // Requests are single-row — duration covers every row, so no predicate and

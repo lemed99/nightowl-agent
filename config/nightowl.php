@@ -61,9 +61,12 @@ return [
         'password' => env('NIGHTOWL_DB_PASSWORD', 'nightowl'),
         'sslmode' => env('NIGHTOWL_DB_SSLMODE', 'prefer'),
         'retention_days' => env('NIGHTOWL_RETENTION_DAYS', 14),
-        // Query rollups (nightowl_query_rollups) are tiny pre-aggregated
-        // summaries, so they're kept far longer than raw telemetry — this is
-        // what powers long-range trend charts without retaining raw rows.
+        // Rollups are tiny pre-aggregated summaries, so they're kept far longer
+        // than raw telemetry — this is what powers long-range trend charts
+        // without retaining raw rows. Applies to the minute-granular tables.
+        // (Hour/day tier retentions are TOP-LEVEL 'rollup_tier_retention' — a
+        // published config's 'database' array replaces this one wholesale under
+        // mergeConfigFrom's shallow merge, which would swallow new sub-keys.)
         'rollup_retention_days' => env('NIGHTOWL_ROLLUP_RETENTION_DAYS', 90),
     ],
 
@@ -120,6 +123,33 @@ return [
 
         // Diagnosis-only wedge threshold (no kill in this release). 0 disables.
         'wedge_warn_seconds' => (int) env('NIGHTOWL_DRAIN_WEDGE_WARN_SECONDS', 180),
+
+        // Orphan reaper: SET LOCAL idle_in_transaction_session_timeout on every
+        // drain transaction, so a batch this process abandons mid-transaction (its
+        // server-side session surviving behind a pooler, holding uncommitted
+        // unique-index entries the retry then collides with — 55P03) is reaped by
+        // Postgres itself. Scoped to the agent's own transactions; other apps on
+        // the customer's database are untouched. Cannot fire on a healthy drain:
+        // counts only idle-between-statements time (~ms), never statement runtime.
+        // 0 disables.
+        'idle_txn_timeout_ms' => (int) env('NIGHTOWL_DB_IDLE_TXN_TIMEOUT_MS', 30000),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Rollup tier retention
+    |--------------------------------------------------------------------------
+    |
+    | TOP-LEVEL keys on purpose: mergeConfigFrom is a shallow array_merge, so a
+    | previously-published config's 'database' array would swallow any new
+    | sub-key added there — along with its env var.
+    |
+    | Hour/day rollup tiers are 60×/1440× sparser than the minute rollups, so
+    | they keep history far past the minute tier's retention cutoff.
+    */
+    'rollup_tier_retention' => [
+        'hourly_days' => (int) env('NIGHTOWL_HOURLY_ROLLUP_RETENTION_DAYS', 366),
+        'daily_days' => (int) env('NIGHTOWL_DAILY_ROLLUP_RETENTION_DAYS', 1100),
     ],
 
     /*

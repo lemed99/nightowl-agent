@@ -5,6 +5,7 @@ namespace NightOwl\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use NightOwl\Support\RollupSpecs;
+use NightOwl\Support\RollupTiers;
 
 class ClearCommand extends Command
 {
@@ -73,6 +74,9 @@ class ClearCommand extends Command
         $rollups = [];
         foreach (RollupSpecs::all() as $spec) {
             $rollups[$spec->table] = true;
+            foreach (RollupTiers::tierTables($spec->table) as $tierTable) {
+                $rollups[$tierTable] = true;
+            }
         }
 
         return array_values(array_unique([

@@ -2,9 +2,12 @@
 
 namespace NightOwl\Agent;
 
+use NightOwl\Support\DDSketchHistogram;
 use NightOwl\Support\QueryHistogram;
+use NightOwl\Support\RawPartitions;
 use NightOwl\Support\RollupSpec;
 use NightOwl\Support\RollupSpecs;
+use NightOwl\Support\RollupTiers;
 use PDO;
 
 final class RecordWriter
@@ -29,10 +32,35 @@ final class RecordWriter
     /** Cached per rollup table: whether it carries every column the spec's upsert writes. */
     private array $rollupColumnsChecked = [];
 
-    /** Built once: the queries rollup upsert SQL (includes the generated hist_NN columns). */
-    private ?string $rollupUpsertSql = null;
+    /** @var array<string, array<string, int>> Cached per table: column name => varchar character limit. */
+    private array $columnLimits = [];
 
-    /** Built once per rollup table: the generic spec-driven upsert SQL. */
+    /** @var array<string, true> Table.column pairs already warned about, so a repeat offender can't storm the log. */
+    private array $clampWarned = [];
+
+    /**
+     * Built once per table (base query rollup + its hour/day tiers): the queries
+     * rollup upsert's row-count-invariant parts — the VALUES tuple, and the text
+     * either side of the tuple list (which includes the generated hist_NN columns).
+     *
+     * Keyed on the table ALONE. array_chunk leaves a tail of any size from 1 to
+     * ROLLUP_UPSERT_CHUNK, so a row count in the key would cache one whole statement
+     * string (~75KB at 500 rows) per distinct tail size per table, for the life of a
+     * drain worker whose RSS is already back-pressure-gated. Only the tuple
+     * REPETITION varies with the row count, and repeating a cached string is cheap —
+     * the prepared statement was never cached anyway.
+     *
+     * @var array<string, array{tuple: string, prefix: string, suffix: string}>
+     */
+    private array $rollupUpsertSqlCache = [];
+
+    /**
+     * Built once per rollup table: the generic spec-driven upsert's
+     * row-count-invariant parts. Same shape and same table-only keying as
+     * rollupUpsertSqlCache.
+     *
+     * @var array<string, array{tuple: string, prefix: string, suffix: string}>
+     */
     private array $rollupSqlCache = [];
 
     /**
@@ -99,6 +127,7 @@ final class RecordWriter
         private int $keepalivesCount = 3,
         private int $lockTimeoutMs = 10000,
         private ?DrainHeartbeat $heartbeat = null,
+        private int $idleTxnTimeoutMs = 30000,
     ) {
         $this->notifier = $notifier ?? new AlertNotifier;
     }
@@ -396,6 +425,15 @@ final class RecordWriter
      * Ensures any stale transaction state is cleaned up before the
      * socket is discarded — critical for PgBouncer/Supavisor which
      * recycle server connections and may inherit dirty transaction state.
+     *
+     * Also drops the cached rollup upsert SQL. Each cached statement bakes in a
+     * column set derived from the sketch/hist probes, which fail OPEN and UNCACHED
+     * (see sketchEnabled/histEnabled) — so a statement built while a probe was
+     * momentarily failing can carry a column count that no longer matches the
+     * per-call flattened params once the probe recovers, and the cache is not
+     * transactional so a rolled-back batch leaves it populated. Rebuilding it
+     * against the fresh connection keeps the SQL and its bound params in lock-step.
+     * The probe caches store only SUCCESSFUL probes, so they stay valid and are kept.
      */
     private function reconnect(): void
     {
@@ -410,6 +448,8 @@ final class RecordWriter
         }
 
         $this->pdo = null;
+        $this->rollupSqlCache = [];
+        $this->rollupUpsertSqlCache = [];
     }
 
     private function doWrite(array $records): void
@@ -549,6 +589,20 @@ final class RecordWriter
      * unbounded wait AND, via a finally-restore, throw 25P02 over the real exception —
      * which is neither whole-target nor transient, so with quarantine on it would
      * bisect and quarantine good rows.
+     *
+     * idle_in_transaction_session_timeout is the ORPHAN reaper. When this process
+     * abandons a batch mid-transaction (reconnect after a false-dead verdict, a
+     * kill, a pooler blip), the server-side session can survive holding the batch's
+     * uncommitted inserts — and the retry then collides with its own ghost's unique-
+     * index entries and dies on 55P03 (observed live: nightowl_issues, index tuple
+     * (0,1), through Supavisor). SET LOCAL is sufficient AND the point: the timeout
+     * only ever fires while idle INSIDE a transaction, which is exactly SET LOCAL's
+     * scope — and an orphan never commits, so the LOCAL value governs it for life.
+     * Nothing leaks through transaction-mode poolers, and other applications on the
+     * customer's database are never touched. It cannot reap a HEALTHY drain: it
+     * counts only idle-between-statements time (measured ~27ms in a live batch),
+     * never time inside a slow statement — a stuck-active COPY is tcp_user_timeout's
+     * job, not this one's.
      */
     private function applyTransactionGuards(PDO $pdo): void
     {
@@ -557,6 +611,10 @@ final class RecordWriter
 
         if ($this->timeoutsEnabled && $this->lockTimeoutMs > 0) {
             $sets[] = 'SET LOCAL lock_timeout = '.$this->lockTimeoutMs;
+        }
+
+        if ($this->timeoutsEnabled && $this->idleTxnTimeoutMs > 0) {
+            $sets[] = 'SET LOCAL idle_in_transaction_session_timeout = '.$this->idleTxnTimeoutMs;
         }
 
         $pdo->exec(implode('; ', $sets));
@@ -694,6 +752,112 @@ final class RecordWriter
      * @param  string[]  $columns  Column names in order
      * @param  array[]  $rows  Each row is an array of values matching $columns order
      */
+    /**
+     * Character limits of $table's length-constrained columns, keyed by column name.
+     *
+     * Introspected from the live target rather than hardcoded from the migrations:
+     * the tenant owns their database, so a column they widened themselves (the
+     * documented varchar(n) → text unstick for a poison row) must not still be
+     * clamped to 255 by us. `text` columns have a NULL character_maximum_length and
+     * are absent from the map — i.e. never clamped.
+     *
+     * A SUCCESSFUL probe is cached for the process lifetime, mirroring
+     * rollupColumnsChecked: a column's width only changes under a migration, which
+     * restarts the agent. A cached empty map therefore means "this table genuinely
+     * has no length-constrained columns" and never "the probe failed".
+     *
+     * @return array<string, int>
+     */
+    private function columnLimits(string $table): array
+    {
+        if (array_key_exists($table, $this->columnLimits)) {
+            return $this->columnLimits[$table];
+        }
+
+        try {
+            $stmt = $this->pdo()->prepare(
+                'SELECT column_name, character_maximum_length FROM information_schema.columns
+                 WHERE table_schema = \'public\' AND table_name = ? AND character_maximum_length IS NOT NULL'
+            );
+            $stmt->execute([$table]);
+            $limits = [];
+            foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+                $limits[(string) $row['column_name']] = (int) $row['character_maximum_length'];
+            }
+        } catch (\Throwable) {
+            // Probe failed — clamp nothing rather than guessing a width and
+            // silently mangling good data. A genuine overflow still surfaces as
+            // SQLSTATE 22001, which is the pre-clamping behaviour, not a regression.
+            //
+            // Never cached. This probe rides the drain connection, so a PG restart or
+            // a network blip fails it; caching that would leave clamping off for the
+            // rest of the process and hand the next over-long value a 22001 that
+            // head-of-line-blocks the drain. Fails open UNCACHED, the same contract as
+            // the api's TenantTableProbe::exists().
+            return [];
+        }
+
+        return $this->columnLimits[$table] = $limits;
+    }
+
+    /**
+     * Clamp one value to its column's width, or return it untouched.
+     *
+     * Postgres counts varchar(n) in CHARACTERS, not bytes, so the authoritative
+     * check is mb_strlen. strlen() is the fast path: UTF-8 never uses fewer bytes
+     * than characters, so strlen() <= $max proves the value fits and lets the
+     * overwhelming majority of values skip mb_* entirely — this runs on every
+     * string of every row of every batch (~250k values at drain_batch_size 5000).
+     */
+    private function clampToColumn(string $table, string $column, mixed $value, int $max): mixed
+    {
+        if (! is_string($value) || strlen($value) <= $max) {
+            return $value;
+        }
+
+        if (mb_strlen($value, 'UTF-8') <= $max) {
+            return $value;
+        }
+
+        $key = $table.'.'.$column;
+        if (! isset($this->clampWarned[$key])) {
+            $this->clampWarned[$key] = true;
+            // Length only — never the value, which is customer data (the same
+            // reason lastWriteError withholds the raw libpq message).
+            error_log(sprintf(
+                '[NightOwl Agent] %s exceeds its varchar(%d) width — truncating to fit. '.
+                'Widen it (ALTER TABLE %s ALTER COLUMN %s TYPE text) to store the full value.',
+                $key, $max, $table, $column
+            ));
+        }
+
+        return mb_substr($value, 0, $max, 'UTF-8');
+    }
+
+    /**
+     * Clamp every length-constrained column in a named-parameter bind array.
+     * Keys with no matching column (e.g. the upserts' `should_reopen` flag) are
+     * left alone, so this is safe to drop over any execute() payload.
+     *
+     * @param  array<string, mixed>  $params
+     * @return array<string, mixed>
+     */
+    private function clampParams(string $table, array $params): array
+    {
+        $limits = $this->columnLimits($table);
+        if (empty($limits)) {
+            return $params;
+        }
+
+        foreach ($params as $column => $value) {
+            if (isset($limits[$column])) {
+                $params[$column] = $this->clampToColumn($table, (string) $column, $value, $limits[$column]);
+            }
+        }
+
+        return $params;
+    }
+
     private function copyBatch(string $table, array $columns, array $rows): void
     {
         if (empty($rows)) {
@@ -702,6 +866,38 @@ final class RecordWriter
 
         $this->heartbeat?->enter("pg:copy:{$table}");
         $this->markWriteTarget($table);
+
+        // Clamp before the forceInsert/Swoole branch below so the COPY and INSERT
+        // paths write byte-identical values. An over-long field is otherwise
+        // rejected with SQLSTATE 22001, and with quarantine off (the default) that
+        // rejection head-of-line-blocks the ENTIRE drain forever: the batch is
+        // retried intact every loop, the poison row fails again, and the buffer
+        // fills until back-pressure starts refusing payloads. Truncating one field
+        // is a far smaller loss than losing the pipeline. Same rationale as
+        // eventEpoch()'s range guard on poison timestamps.
+        //
+        // Kept inside the heartbeat window: columnLimits() is a (once-per-table)
+        // round trip on the drain connection, so a stall there must count against
+        // the same wedge detector as the COPY itself.
+        $limits = $this->columnLimits($table);
+        $limited = [];
+        foreach ($columns as $i => $column) {
+            if (isset($limits[$column])) {
+                $limited[$i] = $limits[$column];
+            }
+        }
+
+        if (! empty($limited)) {
+            foreach ($rows as &$row) {
+                foreach ($limited as $i => $max) {
+                    // isset() skips nulls, which need no clamping.
+                    if (isset($row[$i])) {
+                        $row[$i] = $this->clampToColumn($table, (string) $columns[$i], $row[$i], $max);
+                    }
+                }
+            }
+            unset($row);
+        }
 
         // Swoole/OpenSwoole's PDO-pgsql coroutine hook reimplements
         // pgsqlCopyFromArray() and busy-loops on COPY (100% CPU, never returns)
@@ -963,6 +1159,78 @@ final class RecordWriter
     }
 
     /**
+     * Keep future daily partitions pre-created on partitioned raw tables.
+     * Called from the drain's maintenance tick; a non-blocking advisory lock
+     * makes concurrent workers skip rather than queue, and any failure is
+     * logged, never allowed to break draining. No-op on unpartitioned tenants.
+     *
+     * The lock is TRANSACTION-scoped (like lockRollupForWriteShared's, and the
+     * backfill's), and the transaction spans the sweep it guards. A SESSION-scoped
+     * pg_try_advisory_lock cannot be used here: the agent supports transaction-mode
+     * poolers, where the lock and its pg_advisory_unlock can land on DIFFERENT server
+     * connections, stranding the lock on a shared one forever. Every later tick would
+     * then fail to acquire, maintenance would stop silently, and after DAYS_AHEAD days
+     * every drained row would route to {t}_pdefault — which prune can only row-DELETE,
+     * never DROP.
+     *
+     * A sweep that fails on some tables still COMMITS the children the others got.
+     * RawPartitions savepoint-isolates each table and sweeps the rest, so those children
+     * are real work: discarding them strands those tables' rows in {t}_pdefault exactly
+     * as above, and one persistently failing table would do it on every tick, forever.
+     * ensureFutureChildren therefore RETURNS its per-table failures (already isolated and
+     * logged) rather than throwing, so the commit lands the healthy children and this tick
+     * only logs the summary. The outer catch is for a failure that ESCAPES isolation — a
+     * dead connection, or a BEGIN/guard/commit fault — which aborts the transaction, and
+     * Postgres degrades the commit to a rollback on its own.
+     *
+     * The guards carry lock_timeout, which matters more here than on a write batch:
+     * CREATE ... PARTITION OF takes ACCESS EXCLUSIVE on the parent, so a sweep queued
+     * behind a long COPY would stall every reader that queues behind IT. Timing out one
+     * table instead costs that table an hour (isolated, reported, retried next tick).
+     */
+    public function maintainRawPartitions(): void
+    {
+        $pdo = null;
+
+        try {
+            $pdo = $this->pdo();
+            $pdo->beginTransaction();
+            $this->applyTransactionGuards($pdo);
+
+            $failures = [];
+            $got = (bool) $pdo
+                ->query("SELECT pg_try_advisory_xact_lock(hashtext('nightowl_partition_maintenance'))")
+                ->fetchColumn();
+
+            if ($got) {
+                // Returns (never throws) the per-table failures it already isolated and
+                // logged; the commit still lands every healthy table's children.
+                $failures = RawPartitions::ensureFutureChildren($pdo);
+            }
+
+            $pdo->commit();
+
+            if ($failures !== []) {
+                error_log(sprintf(
+                    '[NightOwl Drain] partition maintenance incomplete: %d partition(s) not created (will retry next tick)',
+                    count($failures),
+                ));
+            }
+        } catch (\Throwable $e) {
+            try {
+                if ($pdo?->inTransaction()) {
+                    $pdo->rollBack();
+                }
+            } catch (\Throwable) {
+                // Handle already dead — never let this mask the real error.
+                // Mirrors doWrite()'s guarded rollback.
+            }
+
+            error_log('[NightOwl Drain] partition maintenance failed (will retry next tick): '.$e->getMessage());
+        }
+    }
+
+    /**
      * A rollup table's existence is fixed for the agent's lifetime, so probe
      * once per table and cache. When the table is missing (a customer running
      * new agent code before `nightowl:migrate` created it), skip the rollup
@@ -1003,9 +1271,9 @@ final class RecordWriter
      *
      * @param  list<string>  $histColumns
      */
-    private function rollupColumnsPresent(RollupSpec $spec, array $histColumns): bool
+    private function rollupColumnsPresent(RollupSpec $spec, array $histColumns, ?string $table = null): bool
     {
-        $table = $spec->table;
+        $table ??= $spec->table;
         if (array_key_exists($table, $this->rollupColumnsChecked)) {
             return $this->rollupColumnsChecked[$table];
         }
@@ -1015,8 +1283,11 @@ final class RecordWriter
         if ($spec->hasDuration) {
             $expected = [...$expected, 'total_duration', 'min_duration', 'max_duration'];
         }
-        if ($spec->hasHistogram) {
+        if ($spec->hasHistogram && $this->histEnabled($table)) {
             $expected = [...$expected, ...$histColumns];
+        }
+        if ($spec->hasDurationCount && $this->durationCountEnabled($table)) {
+            $expected[] = 'duration_count';
         }
         $expected = [...$expected, ...$spec->representativeColumns()];
 
@@ -1109,6 +1380,16 @@ final class RecordWriter
         $counterCols = $spec->counterColumns();
         $repCols = $spec->representativeColumns();
 
+        // Clamp group-column values to their varchar width HERE, at the grouping layer,
+        // not only before the INSERT: the group value IS the conflict key, so two values
+        // sharing a 255-char prefix must land in the SAME additive group. Keyed by the
+        // un-clamped value they would be two groups that clamp to one identical conflict
+        // tuple, and the multi-row upsert then aborts the whole batch with 21000 ("cannot
+        // affect row a second time") — a drain wedge, not a transient. Same clamp the raw
+        // row gets (columnLimits agree across raw/rollup), so a row and its rollup still
+        // key off the same value.
+        $groupLimits = $this->columnLimits($spec->table);
+
         $groups = [];
         foreach ($records as $r) {
             // Bucket on the event's own time (matching created_at), so a backdated or
@@ -1118,6 +1399,9 @@ final class RecordWriter
             $keyParts = [$bucket];
             foreach ($spec->groupColumns as $col => $def) {
                 $value = (string) ($def['php'])($r);
+                if (isset($groupLimits[$col])) {
+                    $value = (string) $this->clampToColumn($spec->table, $col, $value, $groupLimits[$col]);
+                }
                 $groupVals[$col] = $value;
                 $keyParts[] = $value;
             }
@@ -1130,9 +1414,11 @@ final class RecordWriter
                     'call_count' => 0,
                     'counters' => array_fill_keys($counterCols, 0),
                     'total_duration' => 0,
+                    'duration_count' => 0,
                     'min_duration' => null,
                     'max_duration' => null,
                     'hist' => $spec->hasHistogram ? array_fill(0, count($histColumns), 0) : [],
+                    'sketch' => [],
                     'reps' => array_fill_keys($repCols, null),
                 ];
             }
@@ -1149,12 +1435,18 @@ final class RecordWriter
                 if ($duration !== null) {
                     $duration = (int) $duration;
                     $groups[$key]['total_duration'] += $duration;
+                    // Exact by construction: incremented precisely where a
+                    // duration folds in, so it always equals the histogram mass.
+                    $groups[$key]['duration_count']++;
                     $groups[$key]['min_duration'] = $groups[$key]['min_duration'] === null
                         ? $duration : min($groups[$key]['min_duration'], $duration);
                     $groups[$key]['max_duration'] = $groups[$key]['max_duration'] === null
                         ? $duration : max($groups[$key]['max_duration'], $duration);
                     if ($spec->hasHistogram) {
                         $groups[$key]['hist'][QueryHistogram::binIndex($duration)]++;
+                        // v2 sketch accumulates in parallel with the v1 bins
+                        // (dual-write transition, specs/ddsketch_percentiles.md).
+                        DDSketchHistogram::add($groups[$key]['sketch'], $duration);
                     }
                 }
             }
@@ -1172,29 +1464,113 @@ final class RecordWriter
             return;
         }
 
-        $upsert = $this->pdo()->prepare($this->rollupSql($spec, $histColumns));
+        $this->upsertRollupGroups($spec, $histColumns, $groups, $spec->table);
 
-        foreach ($groups as $g) {
-            $params = $g['group'];
-            $params['bucket_start'] = $g['bucket_start'];
-            $params['environment'] = $this->environment;
-            $params['call_count'] = $g['call_count'];
-            foreach ($g['counters'] as $cc => $value) {
-                $params[$cc] = $value;
+        // Hour/day tiers: re-collapse the (already minute-collapsed) groups in
+        // PHP and upsert the same additive shape into the sibling tables — no
+        // extra per-record work, and each tier gates independently so an
+        // un-migrated sibling just no-ops until nightowl:migrate + restart.
+        foreach (RollupTiers::TIERS as $tier => $granularity) {
+            $tierTable = RollupTiers::table($spec->table, $tier);
+
+            if (! $this->rollupEnabled($tierTable)
+                || ! $this->rollupColumnsPresent($spec, $histColumns, $tierTable)) {
+                continue;
             }
-            if ($spec->hasDuration) {
-                $params['total_duration'] = $g['total_duration'];
-                $params['min_duration'] = $g['min_duration'];
-                $params['max_duration'] = $g['max_duration'];
-                foreach ($histColumns as $i => $hc) {
-                    $params[$hc] = $g['hist'][$i];
+
+            $this->markWriteTarget($tierTable);
+            $this->lockRollupForWriteShared($tierTable);
+
+            $this->upsertRollupGroups(
+                $spec,
+                $histColumns,
+                RollupTiers::collapse($groups, $granularity, ['group']),
+                $tierTable,
+            );
+        }
+    }
+
+    /**
+     * Rows per multi-row upsert statement. Widest row is ~50 params (group cols
+     * + counters + 39 hist bins + reps), so 500 rows stays far under PDO's
+     * 65,535-parameter cap while collapsing a 200-group × 3-tier batch from
+     * ~600 round trips into 3.
+     */
+    private const ROLLUP_UPSERT_CHUNK = 500;
+
+    /**
+     * Additive multi-row upsert into $table — shared by the base minute write
+     * and the hour/day tier writes (identical column shape by construction:
+     * tier tables are LIKE-clones of their base).
+     *
+     * Multi-row ON CONFLICT is safe from "cannot affect row a second time"
+     * because $groups is keyed by exactly the conflict key AS CLAMPED (bucket +
+     * group columns; environment is constant per writer). The grouping layer
+     * (writeRollup / RollupTiers::collapse) applies the same varchar clamp these
+     * tuples carry, so two group values that clamp equal already merged into ONE
+     * additive group upstream — the emitted tuples stay unique even after the
+     * per-column clamp below.
+     *
+     * @param  list<string>  $histColumns
+     * @param  array<string, array<string, mixed>>  $groups
+     */
+    private function upsertRollupGroups(RollupSpec $spec, array $histColumns, array $groups, string $table): void
+    {
+        $withSketch = $spec->hasHistogram && $this->sketchEnabled($table);
+        $withHist = $this->histEnabled($table);
+        $withDurationCount = $spec->hasDurationCount && $this->durationCountEnabled($table);
+        $insertCols = $this->rollupInsertColumns($spec, $histColumns, $withSketch, $withHist, $withDurationCount);
+
+        // A rollup's group columns (user_id, group_hash, key, store, …) are the same
+        // varchar(255) strings the raw tables carry, so they need the same clamp —
+        // and the SAME one, or a raw row and its rollup would key off different
+        // values. An unclamped rollup would head-of-line-block the drain exactly as
+        // the raw row would (see copyBatch).
+        $limits = $this->columnLimits($table);
+
+        foreach (array_chunk($groups, self::ROLLUP_UPSERT_CHUNK) as $chunk) {
+            $flat = [];
+            foreach ($chunk as $g) {
+                $params = $g['group'];
+                $params['bucket_start'] = $g['bucket_start'];
+                $params['environment'] = $this->environment;
+                $params['call_count'] = $g['call_count'];
+                foreach ($g['counters'] as $cc => $value) {
+                    $params[$cc] = $value;
+                }
+                if ($spec->hasDuration) {
+                    $params['total_duration'] = $g['total_duration'];
+                    $params['min_duration'] = $g['min_duration'];
+                    $params['max_duration'] = $g['max_duration'];
+                    if ($withDurationCount) {
+                        $params['duration_count'] = $g['duration_count'];
+                    }
+                    if ($withHist) {
+                        foreach ($histColumns as $i => $hc) {
+                            $params[$hc] = $g['hist'][$i];
+                        }
+                    }
+                }
+                if ($withSketch) {
+                    $params['sketch'] = bin2hex(DDSketchHistogram::pack($g['sketch'] ?? []));
+                    $params['sketch_version'] = DDSketchHistogram::VERSION;
+                }
+                foreach ($g['reps'] as $rc => $value) {
+                    $params[$rc] = $value;
+                }
+
+                // Flatten in insert-column order — the positional contract
+                // with rollupSql()'s VALUES tuples.
+                foreach ($insertCols as $col) {
+                    $flat[] = isset($limits[$col])
+                        ? $this->clampToColumn($table, $col, $params[$col], $limits[$col])
+                        : $params[$col];
                 }
             }
-            foreach ($g['reps'] as $rc => $value) {
-                $params[$rc] = $value;
-            }
 
-            $upsert->execute($params);
+            $this->pdo()
+                ->prepare($this->rollupSql($spec, $histColumns, $table, count($chunk)))
+                ->execute($flat);
         }
     }
 
@@ -1205,52 +1581,185 @@ final class RecordWriter
      *
      * @param  list<string>  $histColumns
      */
-    private function rollupSql(RollupSpec $spec, array $histColumns): string
+    /** @var array<string, bool> per-table: does it carry the DDSketch columns (000057 applied + CREATE FUNCTION allowed)? */
+    private array $sketchColumnChecked = [];
+
+    /** @var array<string, bool> per-table: does it still carry the v1 hist_NN columns (pre nightowl:drop-v1-histograms)? */
+    private array $histColumnChecked = [];
+
+    /** @var array<string, bool> per-table: does it carry the duration_count counter (000061 applied)? */
+    private array $durationCountChecked = [];
+
+    /**
+     * Whether $table carries the duration_count column (migration 000061).
+     * False on un-migrated tenants — the writer then omits the column instead
+     * of disabling the whole rollup, and nightowl:migrate + a restart pick it
+     * up (backfill-rollups closes the gap for rows written in between).
+     */
+    private function durationCountEnabled(string $table): bool
     {
-        if (isset($this->rollupSqlCache[$spec->table])) {
-            return $this->rollupSqlCache[$spec->table];
+        if (array_key_exists($table, $this->durationCountChecked)) {
+            return $this->durationCountChecked[$table];
         }
 
-        $groupCols = $spec->groupColumnNames();
-        $insertCols = [...$groupCols, 'bucket_start', 'environment', 'call_count', ...$spec->counterColumns()];
+        try {
+            $stmt = $this->pdo()->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ? AND column_name = 'duration_count'"
+            );
+            $stmt->execute([$table]);
+
+            return $this->durationCountChecked[$table] = (int) $stmt->fetchColumn() > 0;
+        } catch (\Throwable) {
+            // Probe failed — omit the column for THIS call (always safe), but do NOT
+            // cache it, so a transient blip doesn't downgrade the tenant for the whole
+            // process life. Mirrors histEnabled()/sketchEnabled()/columnLimits().
+            return false;
+        }
+    }
+
+    /**
+     * Whether $table still carries the v1 √2 histogram columns. False after
+     * the operator runs nightowl:drop-v1-histograms (post-DDSketch cleanup) —
+     * the writer then upserts sketch-only rows instead of failing on unknown
+     * columns.
+     */
+    private function histEnabled(string $table): bool
+    {
+        if (array_key_exists($table, $this->histColumnChecked)) {
+            return $this->histColumnChecked[$table];
+        }
+
+        try {
+            $stmt = $this->pdo()->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ? AND column_name = 'hist_00'"
+            );
+            $stmt->execute([$table]);
+
+            return $this->histColumnChecked[$table] = (int) $stmt->fetchColumn() > 0;
+        } catch (\Throwable) {
+            // Probe failed — assume the pre-drop layout for THIS call (fail-open) but do
+            // NOT cache it. This rides the drain connection, so a PG restart or a blip
+            // fails it; caching hist=true against a post-drop tenant would emit hist_NN
+            // columns on every later batch → 42703 → the whole drain wedges until restart.
+            // Uncached, the next batch re-probes and self-corrects. Same contract as
+            // columnLimits().
+            return true;
+        }
+    }
+
+    /**
+     * Whether $table carries the v2 DDSketch columns. False on tenants that
+     * haven't run 000057 or whose PG denied CREATE FUNCTION — the drain then
+     * writes the v1 histogram only, and the reader stays on the √2 path.
+     */
+    private function sketchEnabled(string $table): bool
+    {
+        if (array_key_exists($table, $this->sketchColumnChecked)) {
+            return $this->sketchColumnChecked[$table];
+        }
+
+        try {
+            $stmt = $this->pdo()->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ? AND column_name = 'sketch'"
+            );
+            $stmt->execute([$table]);
+
+            return $this->sketchColumnChecked[$table] = (int) $stmt->fetchColumn() > 0;
+        } catch (\Throwable) {
+            // Probe failed — assume no sketch column for THIS call (safe: the drain
+            // writes the v1 hist only) but do NOT cache it. Caching false on a blip would
+            // silently downgrade a 000057-migrated tenant to v1 percentiles for the whole
+            // process life; uncached, the next batch re-probes. Same contract as
+            // columnLimits().
+            return false;
+        }
+    }
+
+    /**
+     * The ordered insert-column list for a spec's rollup upsert — the contract
+     * between rollupSql()'s VALUES tuples and the positional flattening in
+     * upsertRollupGroups().
+     *
+     * @param  list<string>  $histColumns
+     * @return list<string>
+     */
+    private function rollupInsertColumns(RollupSpec $spec, array $histColumns, bool $withSketch = false, bool $withHist = true, bool $withDurationCount = false): array
+    {
+        $insertCols = [...$spec->groupColumnNames(), 'bucket_start', 'environment', 'call_count', ...$spec->counterColumns()];
         if ($spec->hasDuration) {
             $insertCols = [...$insertCols, 'total_duration', 'min_duration', 'max_duration'];
         }
-        if ($spec->hasHistogram) {
+        if ($withDurationCount) {
+            $insertCols[] = 'duration_count';
+        }
+        if ($spec->hasHistogram && $withHist) {
             $insertCols = [...$insertCols, ...$histColumns];
         }
-        $insertCols = [...$insertCols, ...$spec->representativeColumns()];
-
-        $placeholders = array_map(static fn (string $c): string => ':'.$c, $insertCols);
-        $pk = [...$groupCols, 'bucket_start', 'environment'];
-
-        $t = $spec->table;
-        $set = ["call_count = {$t}.call_count + EXCLUDED.call_count"];
-        foreach ($spec->counterColumns() as $c) {
-            $set[] = "{$c} = {$t}.{$c} + EXCLUDED.{$c}";
+        if ($withSketch) {
+            $insertCols = [...$insertCols, 'sketch', 'sketch_version'];
         }
-        if ($spec->hasDuration) {
-            $set[] = "total_duration = {$t}.total_duration + EXCLUDED.total_duration";
-            $set[] = "min_duration = LEAST({$t}.min_duration, EXCLUDED.min_duration)";
-            $set[] = "max_duration = GREATEST({$t}.max_duration, EXCLUDED.max_duration)";
-        }
-        if ($spec->hasHistogram) {
-            foreach ($histColumns as $c) {
+
+        return [...$insertCols, ...$spec->representativeColumns()];
+    }
+
+    private function rollupSql(RollupSpec $spec, array $histColumns, ?string $table = null, int $rowCount = 1): string
+    {
+        $table ??= $spec->table;
+
+        if (! isset($this->rollupSqlCache[$table])) {
+            $groupCols = $spec->groupColumnNames();
+            $withSketch = $spec->hasHistogram && $this->sketchEnabled($table);
+            $withHist = $this->histEnabled($table);
+            $withDurationCount = $spec->hasDurationCount && $this->durationCountEnabled($table);
+            $insertCols = $this->rollupInsertColumns($spec, $histColumns, $withSketch, $withHist, $withDurationCount);
+
+            // Positional placeholders, one tuple per row: multi-row VALUES turns a
+            // round trip per group into one statement per chunk. The sketch value
+            // travels hex-encoded (PDO's flat positional execute() can't tag a
+            // param as LOB) and decodes SQL-side.
+            $placeholders = array_map(
+                static fn (string $c): string => $c === 'sketch' ? "decode(?, 'hex')" : '?',
+                $insertCols,
+            );
+            $pk = [...$groupCols, 'bucket_start', 'environment'];
+
+            $t = $table;
+            $set = ["call_count = {$t}.call_count + EXCLUDED.call_count"];
+            foreach ($spec->counterColumns() as $c) {
                 $set[] = "{$c} = {$t}.{$c} + EXCLUDED.{$c}";
             }
-        }
-        foreach ($spec->representativeColumns() as $c) {
-            $set[] = "{$c} = COALESCE({$t}.{$c}, EXCLUDED.{$c})";
+            if ($spec->hasDuration) {
+                $set[] = "total_duration = {$t}.total_duration + EXCLUDED.total_duration";
+                $set[] = "min_duration = LEAST({$t}.min_duration, EXCLUDED.min_duration)";
+                $set[] = "max_duration = GREATEST({$t}.max_duration, EXCLUDED.max_duration)";
+            }
+            if ($withDurationCount) {
+                $set[] = "duration_count = {$t}.duration_count + EXCLUDED.duration_count";
+            }
+            if ($spec->hasHistogram && $withHist) {
+                foreach ($histColumns as $c) {
+                    $set[] = "{$c} = {$t}.{$c} + EXCLUDED.{$c}";
+                }
+            }
+            if ($withSketch) {
+                // Row-lock-serialised SQL-side merge — no PHP read-modify-write.
+                $set[] = "sketch = nightowl_ddsketch_merge({$t}.sketch, EXCLUDED.sketch)";
+                $set[] = 'sketch_version = EXCLUDED.sketch_version';
+            }
+            foreach ($spec->representativeColumns() as $c) {
+                $set[] = "{$c} = COALESCE({$t}.{$c}, EXCLUDED.{$c})";
+            }
+
+            $this->rollupSqlCache[$table] = [
+                'tuple' => '('.implode(', ', $placeholders).')',
+                'prefix' => sprintf('INSERT INTO %s (%s) VALUES ', $t, implode(', ', $insertCols)),
+                'suffix' => sprintf(' ON CONFLICT (%s) DO UPDATE SET %s', implode(', ', $pk), implode(', ', $set)),
+            ];
         }
 
-        return $this->rollupSqlCache[$t] = sprintf(
-            'INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s',
-            $t,
-            implode(', ', $insertCols),
-            implode(', ', $placeholders),
-            implode(', ', $pk),
-            implode(', ', $set),
-        );
+        ['tuple' => $tuple, 'prefix' => $prefix, 'suffix' => $suffix] = $this->rollupSqlCache[$table];
+
+        return $prefix.implode(', ', array_fill(0, $rowCount, $tuple)).$suffix;
     }
 
     /**
@@ -1265,19 +1774,85 @@ final class RecordWriter
      * Unlike copyBatch, this is a plain prepared statement, so it is unaffected
      * by the Swoole pgsqlCopyFromArray spin — no special-casing needed.
      */
+    /**
+     * The bespoke query-rollup twin of rollupColumnsPresent(). writeQueryRollups
+     * carries no RollupSpec, so it needs its own gate: a query rollup table that
+     * EXISTS but lacks a written column (a partial/failed migration) raises 42703
+     * from the prepared upsert INSIDE the shared drain transaction, rolling the raw
+     * COPY back and — because a prepared-statement failure can't be poison-row-
+     * bisected — head-of-line-blocking the whole drain. Verify the full written set
+     * once per table (same order queryRollupInsertColumns() builds it), disable the
+     * rollup and keep draining raw if a column is missing. Probed via
+     * information_schema and cached, sharing rollupColumnsChecked with writeRollup.
+     *
+     * @param  list<string>  $histColumns
+     */
+    private function queryRollupColumnsPresent(array $histColumns, string $table): bool
+    {
+        if (array_key_exists($table, $this->rollupColumnsChecked)) {
+            return $this->rollupColumnsChecked[$table];
+        }
+
+        $expected = $this->queryRollupInsertColumns(
+            $histColumns,
+            $this->sketchEnabled($table),
+            $this->histEnabled($table),
+        );
+
+        try {
+            $stmt = $this->pdo()->prepare(
+                'SELECT column_name FROM information_schema.columns WHERE table_schema = \'public\' AND table_name = ?'
+            );
+            $stmt->execute([$table]);
+            $present = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+        } catch (\Throwable) {
+            // Probe itself failed — the table-existence gate already passed, so stay
+            // permissive rather than silently dropping every query rollup.
+            return $this->rollupColumnsChecked[$table] = true;
+        }
+
+        $missing = array_diff($expected, $present);
+        if (! empty($missing)) {
+            error_log('[NightOwl Agent] '.$table.' missing column(s) '.implode(', ', $missing).' — rollups for it disabled until nightowl:migrate runs (restart the agent afterward)');
+
+            return $this->rollupColumnsChecked[$table] = false;
+        }
+
+        return $this->rollupColumnsChecked[$table] = true;
+    }
+
     private function writeQueryRollups(array $records, int $nowTs): void
     {
-        $this->markWriteTarget('nightowl_query_rollups');
-        $this->lockRollupForWriteShared('nightowl_query_rollups');
-        // Bucket per-record on the event's own time (same clock as created_at), so a
-        // backdated/delayed drain spreads across the right minutes instead of "now".
         $histColumns = QueryHistogram::columns();
 
+        // The bespoke query path carries no RollupSpec, so it needs its own
+        // column-presence gate — the same protection writeRollup gets from
+        // rollupColumnsPresent(): a table that EXISTS but lacks a written column would
+        // raise 42703 from the prepared upsert INSIDE the shared drain transaction,
+        // rolling the raw COPY back and head-of-line-blocking the whole drain.
+        if (! $this->queryRollupColumnsPresent($histColumns, 'nightowl_query_rollups')) {
+            return;
+        }
+
+        $this->markWriteTarget('nightowl_query_rollups');
+        $this->lockRollupForWriteShared('nightowl_query_rollups');
+
+        // Clamp the conflict-key columns (group_hash, connection) at the grouping layer
+        // so two values that clamp equal merge into ONE additive group. Keyed by the
+        // un-clamped value they would emit duplicate conflict tuples in the multi-row
+        // upsert and abort the batch with 21000. Mirrors writeRollup / copyBatch.
+        $limits = $this->columnLimits('nightowl_query_rollups');
+        $clampKey = fn (string $column, string $value): string => isset($limits[$column])
+            ? (string) $this->clampToColumn('nightowl_query_rollups', $column, $value, $limits[$column])
+            : $value;
+
+        // Bucket per-record on the event's own time (same clock as created_at), so a
+        // backdated/delayed drain spreads across the right minutes instead of "now".
         $groups = [];
         foreach ($records as $r) {
             $bucket = $this->eventBucket($r, $nowTs);
-            $groupHash = (string) ($r['_group'] ?? '');
-            $connection = (string) ($r['connection'] ?? ''); // '' sentinel (see migration)
+            $groupHash = $clampKey('group_hash', (string) ($r['_group'] ?? ''));
+            $connection = $clampKey('connection', (string) ($r['connection'] ?? '')); // '' sentinel (see migration)
             $key = $bucket."\0".$groupHash."\0".$connection;
 
             $duration = $r['duration'] ?? null;
@@ -1294,6 +1869,7 @@ final class RecordWriter
                     'max_duration' => null,
                     'sql_query' => null,
                     'hist' => array_fill(0, count($histColumns), 0),
+                    'sketch' => [],
                 ];
             }
 
@@ -1305,6 +1881,7 @@ final class RecordWriter
                 $groups[$key]['max_duration'] = $groups[$key]['max_duration'] === null
                     ? $duration : max($groups[$key]['max_duration'], $duration);
                 $groups[$key]['hist'][QueryHistogram::binIndex($duration)]++;
+                DDSketchHistogram::add($groups[$key]['sketch'], $duration);
             }
             if ($groups[$key]['sql_query'] === null && isset($r['sql']) && $r['sql'] !== '') {
                 $groups[$key]['sql_query'] = $r['sql'];
@@ -1315,25 +1892,79 @@ final class RecordWriter
             return;
         }
 
-        $upsert = $this->pdo()->prepare($this->rollupUpsertSql($histColumns));
+        $this->upsertQueryRollupGroups($histColumns, $groups, 'nightowl_query_rollups');
 
-        foreach ($groups as $g) {
-            $params = [
-                'group_hash' => $g['group_hash'],
-                'bucket_start' => $g['bucket_start'],
-                'environment' => $this->environment,
-                'connection' => $g['connection'],
-                'call_count' => $g['call_count'],
-                'total_duration' => $g['total_duration'],
-                'min_duration' => $g['min_duration'],
-                'max_duration' => $g['max_duration'],
-                'sql_query' => $g['sql_query'],
-            ];
-            foreach ($histColumns as $i => $column) {
-                $params[$column] = $g['hist'][$i];
+        // Hour/day tiers — same re-collapse as the generic writeRollup path,
+        // keyed on (group_hash, connection) to preserve the query rollup's
+        // 4-column PK identity.
+        foreach (RollupTiers::TIERS as $tier => $granularity) {
+            $tierTable = RollupTiers::table('nightowl_query_rollups', $tier);
+
+            if (! $this->rollupEnabled($tierTable)
+                || ! $this->queryRollupColumnsPresent($histColumns, $tierTable)) {
+                continue;
             }
 
-            $upsert->execute($params);
+            $this->markWriteTarget($tierTable);
+            $this->lockRollupForWriteShared($tierTable);
+
+            $this->upsertQueryRollupGroups(
+                $histColumns,
+                RollupTiers::collapse($groups, $granularity, ['group_hash', 'connection']),
+                $tierTable,
+            );
+        }
+    }
+
+    /**
+     * Multi-row upsert for the bespoke query-rollup shape. Tuples within one
+     * statement are unique on the conflict key by construction: $groups is keyed
+     * bucket + group_hash + connection, both key columns already clamped at the
+     * grouping layer (writeQueryRollups / RollupTiers::collapse), so two values
+     * that clamp equal merged upstream and the emitted tuples stay unique after
+     * the per-column clamp below. Chunked like upsertRollupGroups.
+     *
+     * @param  list<string>  $histColumns
+     * @param  array<string, array<string, mixed>>  $groups
+     */
+    private function upsertQueryRollupGroups(array $histColumns, array $groups, string $table): void
+    {
+        $withSketch = $this->sketchEnabled($table);
+        $withHist = $this->histEnabled($table);
+
+        // Same clamp as upsertRollupGroups — this path is bespoke, so it needs its
+        // own application. Only the string columns can overflow; the rest are ints.
+        $limits = $this->columnLimits($table);
+        $clamp = fn (string $column, mixed $value): mixed => isset($limits[$column])
+            ? $this->clampToColumn($table, $column, $value, $limits[$column])
+            : $value;
+
+        foreach (array_chunk($groups, self::ROLLUP_UPSERT_CHUNK) as $chunk) {
+            $flat = [];
+            foreach ($chunk as $g) {
+                $flat[] = $clamp('group_hash', $g['group_hash']);
+                $flat[] = $g['bucket_start'];
+                $flat[] = $clamp('environment', $this->environment);
+                $flat[] = $clamp('connection', $g['connection']);
+                $flat[] = $g['call_count'];
+                $flat[] = $g['total_duration'];
+                $flat[] = $g['min_duration'];
+                $flat[] = $g['max_duration'];
+                $flat[] = $clamp('sql_query', $g['sql_query']);
+                if ($withHist) {
+                    foreach ($histColumns as $i => $column) {
+                        $flat[] = $g['hist'][$i];
+                    }
+                }
+                if ($withSketch) {
+                    $flat[] = bin2hex(DDSketchHistogram::pack($g['sketch'] ?? []));
+                    $flat[] = DDSketchHistogram::VERSION;
+                }
+            }
+
+            $this->pdo()
+                ->prepare($this->rollupUpsertSql($histColumns, $table, count($chunk)))
+                ->execute($flat);
         }
     }
 
@@ -1345,34 +1976,63 @@ final class RecordWriter
      *
      * @param  list<string>  $histColumns
      */
-    private function rollupUpsertSql(array $histColumns): string
+    /**
+     * Query-rollup insert-column order — the positional contract between
+     * rollupUpsertSql()'s VALUES tuples and upsertQueryRollupGroups().
+     *
+     * @param  list<string>  $histColumns
+     * @return list<string>
+     */
+    private function queryRollupInsertColumns(array $histColumns, bool $withSketch = false, bool $withHist = true): array
     {
-        if ($this->rollupUpsertSql !== null) {
-            return $this->rollupUpsertSql;
+        $cols = ['group_hash', 'bucket_start', 'environment', 'connection',
+            'call_count', 'total_duration', 'min_duration', 'max_duration', 'sql_query',
+            ...($withHist ? $histColumns : [])];
+
+        return $withSketch ? [...$cols, 'sketch', 'sketch_version'] : $cols;
+    }
+
+    private function rollupUpsertSql(array $histColumns, string $table = 'nightowl_query_rollups', int $rowCount = 1): string
+    {
+        if (! isset($this->rollupUpsertSqlCache[$table])) {
+            $withSketch = $this->sketchEnabled($table);
+            $withHist = $this->histEnabled($table);
+            $insertColumns = $this->queryRollupInsertColumns($histColumns, $withSketch, $withHist);
+            $placeholders = array_map(
+                static fn (string $c): string => $c === 'sketch' ? "decode(?, 'hex')" : '?',
+                $insertColumns,
+            );
+
+            $setClauses = [
+                "call_count     = {$table}.call_count     + EXCLUDED.call_count",
+                "total_duration = {$table}.total_duration + EXCLUDED.total_duration",
+                "min_duration   = LEAST({$table}.min_duration,  EXCLUDED.min_duration)",
+                "max_duration   = GREATEST({$table}.max_duration, EXCLUDED.max_duration)",
+                "sql_query      = COALESCE({$table}.sql_query, EXCLUDED.sql_query)",
+            ];
+            if ($withHist) {
+                foreach ($histColumns as $column) {
+                    $setClauses[] = "{$column} = {$table}.{$column} + EXCLUDED.{$column}";
+                }
+            }
+            if ($withSketch) {
+                $setClauses[] = "sketch = nightowl_ddsketch_merge({$table}.sketch, EXCLUDED.sketch)";
+                $setClauses[] = 'sketch_version = EXCLUDED.sketch_version';
+            }
+
+            $this->rollupUpsertSqlCache[$table] = [
+                'tuple' => '('.implode(', ', $placeholders).')',
+                'prefix' => sprintf('INSERT INTO %s (%s) VALUES ', $table, implode(', ', $insertColumns)),
+                'suffix' => sprintf(
+                    ' ON CONFLICT (group_hash, bucket_start, environment, connection) DO UPDATE SET %s',
+                    implode(', ', $setClauses),
+                ),
+            ];
         }
 
-        $insertColumns = ['group_hash', 'bucket_start', 'environment', 'connection',
-            'call_count', 'total_duration', 'min_duration', 'max_duration', 'sql_query', ...$histColumns];
-        $placeholders = array_map(static fn (string $c): string => ':'.$c, $insertColumns);
+        ['tuple' => $tuple, 'prefix' => $prefix, 'suffix' => $suffix] = $this->rollupUpsertSqlCache[$table];
 
-        $setClauses = [
-            'call_count     = nightowl_query_rollups.call_count     + EXCLUDED.call_count',
-            'total_duration = nightowl_query_rollups.total_duration + EXCLUDED.total_duration',
-            'min_duration   = LEAST(nightowl_query_rollups.min_duration,  EXCLUDED.min_duration)',
-            'max_duration   = GREATEST(nightowl_query_rollups.max_duration, EXCLUDED.max_duration)',
-            'sql_query      = COALESCE(nightowl_query_rollups.sql_query, EXCLUDED.sql_query)',
-        ];
-        foreach ($histColumns as $column) {
-            $setClauses[] = "{$column} = nightowl_query_rollups.{$column} + EXCLUDED.{$column}";
-        }
-
-        return $this->rollupUpsertSql = sprintf(
-            'INSERT INTO nightowl_query_rollups (%s) VALUES (%s) '.
-            'ON CONFLICT (group_hash, bucket_start, environment, connection) DO UPDATE SET %s',
-            implode(', ', $insertColumns),
-            implode(', ', $placeholders),
-            implode(', ', $setClauses),
-        );
+        return $prefix.implode(', ', array_fill(0, $rowCount, $tuple)).$suffix;
     }
 
     private function writeExceptions(array $records): void
@@ -1411,7 +2071,7 @@ final class RecordWriter
             $deploy = $r['deploy'] ?? null;
             $groupKey = $fingerprint.'|'.$this->environment;
 
-            $stmt->execute([
+            $stmt->execute($this->clampParams('nightowl_exceptions', [
                 'v' => $r['v'] ?? null,
                 'trace_id' => $r['trace_id'] ?? null,
                 'timestamp' => $r['timestamp'] ?? null,
@@ -1435,7 +2095,7 @@ final class RecordWriter
                 'handled' => filter_var($r['handled'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
                 'fingerprint' => $fingerprint,
                 'created_at' => $this->eventCreatedAt($r, $nowTs),
-            ]);
+            ]));
 
             if (! isset($issueGroups[$groupKey])) {
                 $issueGroups[$groupKey] = [
@@ -1526,7 +2186,7 @@ final class RecordWriter
             $lastSeen = ! empty($timestamps) ? gmdate('Y-m-d H:i:s', (int) end($timestamps)) : $now;
             $userCount = count($group['users']);
 
-            $upsertStmt->execute([
+            $upsertStmt->execute($this->clampParams('nightowl_issues', [
                 'type' => 'exception',
                 'deploy' => $group['deploy'] ?? null,
                 'environment' => $group['environment'] ?? $this->environment,
@@ -1541,7 +2201,7 @@ final class RecordWriter
                 'created_at' => $now,
                 'updated_at' => $now,
                 'should_reopen' => isset($reopenIds[$key]) ? 'true' : 'false',
-            ]);
+            ]));
         }
 
         $this->logReopenActivity($reopenIds, $now);
@@ -1817,7 +2477,7 @@ final class RecordWriter
                 continue;
             }
 
-            $stmt->execute([
+            $stmt->execute($this->clampParams('nightowl_users', [
                 'v' => $r['v'] ?? null,
                 'user_id' => (string) $userId,
                 'name' => $r['name'] ?? null,
@@ -1825,7 +2485,7 @@ final class RecordWriter
                 'timestamp' => $r['timestamp'] ?? null,
                 'created_at' => $now,
                 'updated_at' => $now,
-            ]);
+            ]));
         }
     }
 
@@ -2145,7 +2805,7 @@ final class RecordWriter
             $thresholdMs = $thresholdUs !== null ? (int) round($thresholdUs / 1000) : null;
             $triggeredMs = $maxDurationUs !== null ? (int) round($maxDurationUs / 1000) : null;
 
-            $upsertStmt->execute([
+            $upsertStmt->execute($this->clampParams('nightowl_issues', [
                 'type' => 'performance',
                 'deploy' => $group['deploy'] ?? null,
                 'environment' => $group['environment'] ?? $this->environment,
@@ -2163,7 +2823,7 @@ final class RecordWriter
                 'created_at' => $now,
                 'updated_at' => $now,
                 'should_reopen' => isset($reopenIds[$key]) ? 'true' : 'false',
-            ]);
+            ]));
         }
 
         $this->logReopenActivity($reopenIds, $now);

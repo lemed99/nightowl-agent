@@ -4,6 +4,9 @@ namespace NightOwl\Tests\Integration;
 
 use NightOwl\Agent\RecordWriter;
 use NightOwl\Simulator\NightwatchSimulator;
+use NightOwl\Support\QueryHistogram;
+use NightOwl\Support\RawPartitions;
+use NightOwl\Support\RollupSpecs;
 use PDO;
 use PHPUnit\Framework\TestCase;
 
@@ -128,6 +131,263 @@ class RecordWriterTest extends TestCase
         $this->assertNotFalse($row);
         $this->assertSame(200, (int) $row['status_code']);
         $this->assertSame('req-001', $row['trace_id']);
+    }
+
+    // ─── varchar(255) clamping ─────────────────────────────
+    //
+    // A field longer than its column poisons the batch with SQLSTATE 22001. With
+    // drain_quarantine off (the default) the drain retries that batch intact
+    // forever, so ONE over-long value silently stops all telemetry and fills the
+    // buffer until back-pressure refuses payloads. Reported from production.
+
+    public function test_write_request_clamps_over_long_varchar_field(): void
+    {
+        $record = $this->sim->makeRequest([
+            'trace_id' => 'req-clamp-001',
+            'route_action' => str_repeat('A', 300),
+        ]);
+
+        $this->writer->write([$record]);
+
+        $row = self::$pdo->query("SELECT route_action FROM nightowl_requests WHERE trace_id = 'req-clamp-001'")
+            ->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertNotFalse($row, 'the over-long row must be written, not rejected');
+        $this->assertSame(255, strlen($row['route_action']));
+        $this->assertSame(str_repeat('A', 255), $row['route_action']);
+    }
+
+    /**
+     * The actual production failure: one poison row in a batch of good ones. Before
+     * clamping this threw 22001 and NOTHING in the batch landed.
+     */
+    public function test_over_long_field_does_not_block_the_rest_of_the_batch(): void
+    {
+        $records = [
+            $this->sim->makeRequest(['trace_id' => 'req-batch-ok-1']),
+            $this->sim->makeRequest(['trace_id' => 'req-batch-poison', 'route_action' => str_repeat('B', 512)]),
+            $this->sim->makeRequest(['trace_id' => 'req-batch-ok-2']),
+        ];
+
+        $this->writer->write($records);
+
+        $count = (int) self::$pdo->query(
+            "SELECT COUNT(*) FROM nightowl_requests WHERE trace_id IN ('req-batch-ok-1', 'req-batch-poison', 'req-batch-ok-2')"
+        )->fetchColumn();
+
+        $this->assertSame(3, $count, 'the whole batch must drain, not just the well-formed rows');
+    }
+
+    /**
+     * varchar(n) counts characters, not bytes — clamping on strlen() would cut a
+     * 255-byte prefix through the middle of a multibyte sequence and hand Postgres
+     * invalid UTF-8 (22021), trading one poison row for another.
+     */
+    public function test_clamp_counts_characters_not_bytes(): void
+    {
+        $record = $this->sim->makeRequest([
+            'trace_id' => 'req-clamp-utf8',
+            'route_action' => str_repeat('é', 300),
+        ]);
+
+        $this->writer->write([$record]);
+
+        $row = self::$pdo->query("SELECT route_action FROM nightowl_requests WHERE trace_id = 'req-clamp-utf8'")
+            ->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertNotFalse($row);
+        $this->assertSame(255, mb_strlen($row['route_action'], 'UTF-8'));
+        $this->assertSame(str_repeat('é', 255), $row['route_action']);
+    }
+
+    /** text columns are unconstrained — clamping them would destroy data for no reason. */
+    public function test_text_columns_are_not_clamped(): void
+    {
+        $longUrl = 'https://example.com/'.str_repeat('x', 1000);
+        $record = $this->sim->makeRequest(['trace_id' => 'req-clamp-text', 'url' => $longUrl]);
+
+        $this->writer->write([$record]);
+
+        $row = self::$pdo->query("SELECT url FROM nightowl_requests WHERE trace_id = 'req-clamp-text'")
+            ->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertNotFalse($row);
+        $this->assertSame($longUrl, $row['url']);
+    }
+
+    /** Exceptions take the INSERT/upsert path, not copyBatch — same bug, separate fix site. */
+    public function test_write_exception_clamps_over_long_varchar_field(): void
+    {
+        $record = $this->sim->makeException([
+            'trace_id' => 'exc-clamp-001',
+            'execution_preview' => str_repeat('C', 400),
+        ]);
+
+        $this->writer->write([$record]);
+
+        $row = self::$pdo->query("SELECT execution_preview FROM nightowl_exceptions WHERE trace_id = 'exc-clamp-001'")
+            ->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertNotFalse($row, 'the over-long exception must be written, not rejected');
+        $this->assertSame(255, strlen($row['execution_preview']));
+    }
+
+    /**
+     * The column-width probe rides the drain connection, so a PG restart or a network
+     * blip fails it. Caching that failure turns clamping off for the rest of the
+     * process, and the next over-long value then raises 22001 and (quarantine off)
+     * head-of-line-blocks the whole drain — the exact wedge clamping exists to stop.
+     */
+    public function test_clamping_survives_a_transient_column_limit_probe_failure(): void
+    {
+        $dsn = sprintf('pgsql:host=%s;port=%d;dbname=%s', self::$host, self::$port, self::$database);
+        $reaped = new PDO($dsn, self::$username, self::$password);
+        $reaped->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+        // A handle whose backend the server has reaped: every statement on it throws,
+        // exactly as a PG restart between batches leaves the drain's connection.
+        $pid = (int) $reaped->query('SELECT pg_backend_pid()')->fetchColumn();
+        self::$pdo->query("SELECT pg_terminate_backend({$pid})");
+
+        $pdoProp = new \ReflectionProperty($this->writer, 'pdo');
+        $pdoProp->setValue($this->writer, $reaped);
+
+        $columnLimits = new \ReflectionMethod($this->writer, 'columnLimits');
+        $this->assertSame(
+            [],
+            $columnLimits->invoke($this->writer, 'nightowl_requests'),
+            'a failed probe must clamp nothing rather than guess a width',
+        );
+
+        // The connection recovers, as it does after any blip.
+        $pdoProp->setValue($this->writer, null);
+
+        $this->writer->write([$this->sim->makeRequest([
+            'trace_id' => 'req-clamp-after-blip',
+            'route_action' => str_repeat('D', 300),
+        ])]);
+
+        $row = self::$pdo->query("SELECT route_action FROM nightowl_requests WHERE trace_id = 'req-clamp-after-blip'")
+            ->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertNotFalse($row, 'the probe must re-run after the blip, not serve a cached failure');
+        $this->assertSame(255, strlen($row['route_action']));
+    }
+
+    /** A probe that genuinely finds no length-constrained columns is still cached. */
+    public function test_successful_column_limit_probe_is_cached(): void
+    {
+        $columnLimits = new \ReflectionMethod($this->writer, 'columnLimits');
+        $cache = new \ReflectionProperty($this->writer, 'columnLimits');
+
+        $this->assertArrayHasKey('route_action', $columnLimits->invoke($this->writer, 'nightowl_requests'));
+        $this->assertArrayHasKey('nightowl_requests', $cache->getValue($this->writer));
+
+        // No varchar columns at all — an empty map, cached, not a failure.
+        $this->assertSame([], $columnLimits->invoke($this->writer, 'nightowl_no_such_table'));
+        $this->assertArrayHasKey('nightowl_no_such_table', $cache->getValue($this->writer));
+    }
+
+    /**
+     * Two rollup group values sharing a 255-char prefix clamp to the SAME conflict
+     * tuple. Keyed by the un-clamped value they were two distinct groups, so the
+     * multi-row upsert emitted two tuples with an identical (key, store, bucket,
+     * environment) conflict key and Postgres aborted the whole batch with 21000
+     * ("ON CONFLICT DO UPDATE command cannot affect row a second time"). That is
+     * neither a connection error nor transient, so the drain retries the identical
+     * batch forever. Clamping at the grouping layer merges the two into ONE additive
+     * row instead. Reachable on nightowl_cache_rollups (key varchar(255)) with two
+     * long cache keys, and equivalently on nightowl_exception_server_rollups (server).
+     */
+    public function test_group_values_colliding_on_the_varchar_prefix_merge_additively(): void
+    {
+        $prefix = str_repeat('K', 255);
+        $records = [
+            $this->sim->makeCacheEvent(['trace_id' => 'clash-1', 'type' => 'hit', 'key' => $prefix.'-page=1', 'store' => 'redis']),
+            $this->sim->makeCacheEvent(['trace_id' => 'clash-2', 'type' => 'hit', 'key' => $prefix.'-page=2', 'store' => 'redis']),
+        ];
+
+        // Before the fix this threw 21000 and NOTHING in the batch landed.
+        $this->writer->write($records);
+
+        $rows = self::$pdo->query(
+            "SELECT \"key\", call_count FROM nightowl_cache_rollups WHERE store = 'redis' AND \"key\" LIKE 'K%'"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertCount(1, $rows, 'the two prefix-colliding keys must collapse into one clamped rollup row');
+        $this->assertSame(255, strlen($rows[0]['key']), 'the merged row keys off the clamped value');
+        $this->assertSame(2, (int) $rows[0]['call_count'], 'both events must accumulate into the single merged group');
+
+        // The raw side clamps to the same 255-char key, so both events still land.
+        $rawCount = (int) self::$pdo->query(
+            "SELECT COUNT(*) FROM nightowl_cache_events WHERE store = 'redis' AND \"key\" LIKE 'K%'"
+        )->fetchColumn();
+        $this->assertSame(2, $rawCount, 'both raw cache events must drain');
+
+        // The hourly tier collapses the same clamped groups, so it cannot collide either.
+        $hourly = (int) self::$pdo->query(
+            "SELECT SUM(call_count) FROM nightowl_cache_hourly_rollups WHERE store = 'redis' AND \"key\" LIKE 'K%'"
+        )->fetchColumn();
+        $this->assertSame(2, $hourly, 'the hourly tier must also merge the colliding keys additively');
+    }
+
+    /**
+     * The sketch/hist column probes ride the drain connection, so a PG restart or a
+     * blip fails them. Caching that failure pins the WRONG layout for the whole
+     * process life: sketchEnabled cached false silently downgrades a 000057 tenant to
+     * v1 percentiles forever, and histEnabled cached true on a post-drop tenant emits
+     * hist_NN columns on every later batch → 42703 → the drain wedges until restart. A
+     * failed probe must therefore NOT be cached — the next batch re-probes. Mirrors
+     * test_clamping_survives_a_transient_column_limit_probe_failure.
+     */
+    public function test_hist_and_sketch_probes_survive_a_transient_failure(): void
+    {
+        $dsn = sprintf('pgsql:host=%s;port=%d;dbname=%s', self::$host, self::$port, self::$database);
+        $reaped = new PDO($dsn, self::$username, self::$password);
+        $reaped->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+        // A handle whose backend the server has reaped: every statement on it throws,
+        // exactly as a PG restart between batches leaves the drain's connection.
+        $pid = (int) $reaped->query('SELECT pg_backend_pid()')->fetchColumn();
+        self::$pdo->query("SELECT pg_terminate_backend({$pid})");
+
+        $pdoProp = new \ReflectionProperty($this->writer, 'pdo');
+        $pdoProp->setValue($this->writer, $reaped);
+
+        $sketchEnabled = new \ReflectionMethod($this->writer, 'sketchEnabled');
+        $histEnabled = new \ReflectionMethod($this->writer, 'histEnabled');
+        $sketchCache = new \ReflectionProperty($this->writer, 'sketchColumnChecked');
+        $histCache = new \ReflectionProperty($this->writer, 'histColumnChecked');
+
+        // A failed probe falls back to its SAFE default for this call (sketch=false so
+        // the drain writes v1 only; hist=true so a pre-drop tenant keeps its bins)...
+        $this->assertFalse($sketchEnabled->invoke($this->writer, 'nightowl_query_rollups'));
+        $this->assertTrue($histEnabled->invoke($this->writer, 'nightowl_query_rollups'));
+        // ...but must NOT cache it, or a blip pins the wrong layout for the process life.
+        $this->assertArrayNotHasKey(
+            'nightowl_query_rollups',
+            $sketchCache->getValue($this->writer),
+            'a failed sketch probe must not be cached',
+        );
+        $this->assertArrayNotHasKey(
+            'nightowl_query_rollups',
+            $histCache->getValue($this->writer),
+            'a failed hist probe must not be cached',
+        );
+
+        // The connection recovers, as it does after any blip.
+        $pdoProp->setValue($this->writer, null);
+
+        // The migrated test DB carries the sketch column, so the re-probe must now
+        // report true — proving the blip's false was never served from cache.
+        $this->assertTrue(
+            $sketchEnabled->invoke($this->writer, 'nightowl_query_rollups'),
+            'the probe must re-run after the blip, not serve a cached failure',
+        );
+        $this->assertTrue($histEnabled->invoke($this->writer, 'nightowl_query_rollups'));
+        // A SUCCESSFUL probe is cached, keeping the hot path off information_schema.
+        $this->assertArrayHasKey('nightowl_query_rollups', $sketchCache->getValue($this->writer));
+        $this->assertArrayHasKey('nightowl_query_rollups', $histCache->getValue($this->writer));
     }
 
     public function test_write_tallies_app_vitals_including_5xx(): void
@@ -671,7 +931,8 @@ class RecordWriterTest extends TestCase
                     SUM(queued_count) AS qc,
                     SUM(failed_count) AS fc,
                     SUM(total_duration) AS td,
-                    {$histSum} AS dc
+                    {$histSum} AS dc,
+                    SUM(duration_count) AS dcc
              FROM nightowl_mail_rollups
              GROUP BY group_hash ORDER BY group_hash"
         )->fetchAll(PDO::FETCH_ASSOC);
@@ -682,7 +943,8 @@ class RecordWriterTest extends TestCase
                     SUM(CASE WHEN queued = true THEN 1 ELSE 0 END) AS qc,
                     SUM(CASE WHEN failed = true THEN 1 ELSE 0 END) AS fc,
                     COALESCE(SUM(duration), 0) AS td,
-                    COUNT(duration) AS dc
+                    COUNT(duration) AS dc,
+                    COUNT(duration) AS dcc
              FROM nightowl_mail
              GROUP BY COALESCE(group_hash, '') ORDER BY group_hash"
         )->fetchAll(PDO::FETCH_ASSOC);
@@ -721,7 +983,8 @@ class RecordWriterTest extends TestCase
                     SUM(queued_count) AS qc,
                     SUM(failed_count) AS fc,
                     SUM(total_duration) AS td,
-                    {$histSum} AS dc
+                    {$histSum} AS dc,
+                    SUM(duration_count) AS dcc
              FROM nightowl_notification_rollups
              GROUP BY group_hash, channel ORDER BY group_hash, channel"
         )->fetchAll(PDO::FETCH_ASSOC);
@@ -732,7 +995,8 @@ class RecordWriterTest extends TestCase
                     SUM(CASE WHEN queued = true THEN 1 ELSE 0 END) AS qc,
                     SUM(CASE WHEN failed = true THEN 1 ELSE 0 END) AS fc,
                     COALESCE(SUM(duration), 0) AS td,
-                    COUNT(duration) AS dc
+                    COUNT(duration) AS dc,
+                    COUNT(duration) AS dcc
              FROM nightowl_notifications
              GROUP BY COALESCE(group_hash, ''), COALESCE(channel, '') ORDER BY group_hash, channel"
         )->fetchAll(PDO::FETCH_ASSOC);
@@ -770,7 +1034,8 @@ class RecordWriterTest extends TestCase
                     SUM(successful_count) AS sc,
                     SUM(unsuccessful_count) AS uc,
                     SUM(total_duration) AS td,
-                    {$histSum} AS dc
+                    {$histSum} AS dc,
+                    SUM(duration_count) AS dcc
              FROM nightowl_command_rollups
              WHERE group_hash LIKE 'cg%'
              GROUP BY group_hash ORDER BY group_hash"
@@ -782,7 +1047,8 @@ class RecordWriterTest extends TestCase
                     SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS sc,
                     SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) AS uc,
                     COALESCE(SUM(duration), 0) AS td,
-                    COUNT(duration) AS dc
+                    COUNT(duration) AS dc,
+                    COUNT(duration) AS dcc
              FROM nightowl_commands
              WHERE COALESCE(group_hash, '') LIKE 'cg%'
              GROUP BY COALESCE(group_hash, '') ORDER BY group_hash"
@@ -822,7 +1088,8 @@ class RecordWriterTest extends TestCase
                     SUM(processed_count) AS pc,
                     SUM(skipped_count) AS kc,
                     SUM(total_duration) AS td,
-                    {$histSum} AS dc
+                    {$histSum} AS dc,
+                    SUM(duration_count) AS dcc
              FROM nightowl_scheduled_task_rollups
              WHERE group_hash LIKE 'sg%'
              GROUP BY group_hash ORDER BY group_hash"
@@ -835,7 +1102,8 @@ class RecordWriterTest extends TestCase
                     SUM(CASE WHEN status = 'processed' OR status = 'success' THEN 1 ELSE 0 END) AS pc,
                     SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS kc,
                     COALESCE(SUM(duration), 0) AS td,
-                    COUNT(duration) AS dc
+                    COUNT(duration) AS dc,
+                    COUNT(duration) AS dcc
              FROM nightowl_scheduled_tasks
              WHERE COALESCE(group_hash, '') LIKE 'sg%'
              GROUP BY COALESCE(group_hash, '') ORDER BY group_hash"
@@ -994,6 +1262,37 @@ class RecordWriterTest extends TestCase
             // Recreate the table for the remaining tests in this class.
             $this->rollupMigration32()->up();
             $this->rollupMigration33()->up();
+        }
+    }
+
+    /**
+     * The bespoke query path has no RollupSpec, so it needs its own column-presence
+     * gate — the same one writeRollup gets from rollupColumnsPresent(). A query rollup
+     * table that EXISTS but lacks a written column (a partial/failed migration) would
+     * otherwise raise 42703 from the prepared upsert INSIDE the shared drain
+     * transaction, roll the raw COPY back too, and — being neither transient nor
+     * poison-row-bisectable — head-of-line-block the whole drain. The rollup must be
+     * skipped and the raw query must still land.
+     */
+    public function test_query_drain_survives_a_missing_rollup_column(): void
+    {
+        // min_duration is bigint nullable with no default/index (migration 000032),
+        // so it drops and re-adds faithfully.
+        self::$pdo->exec('ALTER TABLE nightowl_query_rollups DROP COLUMN min_duration');
+
+        try {
+            // Fresh writer so the column probe re-runs and observes the drop.
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer->write([
+                $this->sim->makeQuery(['trace_id' => 'q-missing-col', 'sql' => 'SELECT 1', 'duration' => 1000]),
+            ]);
+
+            $raw = (int) self::$pdo->query(
+                "SELECT COUNT(*) FROM nightowl_queries WHERE trace_id = 'q-missing-col'"
+            )->fetchColumn();
+            $this->assertSame(1, $raw, 'the raw query must still drain when a rollup column is missing');
+        } finally {
+            self::$pdo->exec('ALTER TABLE nightowl_query_rollups ADD COLUMN min_duration bigint');
         }
     }
 
@@ -1714,6 +2013,496 @@ class RecordWriterTest extends TestCase
 
     // ─── Helpers ───────────────────────────────────────────
 
+    /**
+     * Tier drift guard: the hourly and daily request rollups, summed per group,
+     * must reproduce both the minute rollup and a raw re-aggregation — and their
+     * bucket_starts must be hour-/day-truncated. Records span two adjacent hours
+     * so the hour collapse is exercised across a boundary.
+     */
+    public function test_request_tier_rollups_match_raw_reaggregation(): void
+    {
+        $hourStart = intdiv(time(), 3600) * 3600 - 7200; // two hours ago, hour-aligned
+        $records = [];
+        for ($i = 0; $i < 24; $i++) {
+            $records[] = $this->sim->makeRequest([
+                'trace_id' => "tier-req-{$i}",
+                '_group' => 'tiergroup'.($i % 2),
+                'status_code' => $i % 3 === 0 ? 500 : 200,
+                'duration' => 1000 + $i * 100,
+                // 12 records per hour, spread across distinct minutes.
+                'timestamp' => $hourStart + intdiv($i, 12) * 3600 + ($i % 12) * 60,
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $agg = fn (string $table): array => self::$pdo->query(
+            "SELECT group_hash, SUM(call_count) AS cc, SUM(server_error_count) AS sec,
+                    SUM(total_duration) AS td, MIN(min_duration) AS mn, MAX(max_duration) AS mx
+             FROM {$table} GROUP BY group_hash ORDER BY group_hash"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $minute = $agg('nightowl_request_rollups');
+        $hourly = $agg('nightowl_request_hourly_rollups');
+        $daily = $agg('nightowl_request_daily_rollups');
+
+        $this->assertNotEmpty($minute);
+        $this->assertEquals($minute, $hourly, 'hourly tier must reproduce the minute rollup aggregation');
+        $this->assertEquals($minute, $daily, 'daily tier must reproduce the minute rollup aggregation');
+
+        $raw = self::$pdo->query(
+            "SELECT group_hash, COUNT(*) AS cc,
+                    SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END) AS sec,
+                    SUM(duration) AS td, MIN(duration) AS mn, MAX(duration) AS mx
+             FROM nightowl_requests GROUP BY group_hash ORDER BY group_hash"
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $this->assertEquals($raw, $hourly, 'hourly tier must reproduce a raw re-aggregation');
+
+        // Bucket truncation: two hour buckets, one day bucket, all aligned.
+        $hourBuckets = self::$pdo->query(
+            "SELECT DISTINCT bucket_start FROM nightowl_request_hourly_rollups ORDER BY bucket_start"
+        )->fetchAll(PDO::FETCH_COLUMN);
+        $this->assertCount(2, $hourBuckets);
+        foreach ($hourBuckets as $b) {
+            $this->assertStringEndsWith(':00:00', $b, 'hourly bucket_start must be hour-truncated');
+        }
+
+        $misalignedDaily = self::$pdo->query(
+            "SELECT COUNT(*) FROM nightowl_request_daily_rollups WHERE bucket_start != date_trunc('day', bucket_start)"
+        )->fetchColumn();
+        $this->assertSame(0, (int) $misalignedDaily, 'daily bucket_start must be day-truncated');
+
+        // Histogram bins stay additive across the collapse.
+        $histSql = fn (string $table): int => (int) self::$pdo->query(
+            "SELECT COALESCE(SUM(hist_00 + hist_10 + hist_20), 0) FROM {$table}"
+        )->fetchColumn();
+        $minuteBins = (int) self::$pdo->query(
+            'SELECT COALESCE(SUM(hist_00 + hist_10 + hist_20), 0) FROM nightowl_request_rollups'
+        )->fetchColumn();
+        $this->assertSame($minuteBins, $histSql('nightowl_request_hourly_rollups'));
+    }
+
+    /**
+     * Tier drift guard for the bespoke query rollup path: the hourly tier keeps
+     * the (group_hash, connection) identity and reproduces the minute rollup.
+     */
+    public function test_query_tier_rollups_keep_connection_identity(): void
+    {
+        $hourStart = intdiv(time(), 3600) * 3600 - 3600;
+        $records = [];
+        for ($i = 0; $i < 12; $i++) {
+            $records[] = $this->sim->makeQuery([
+                'trace_id' => "tier-q-{$i}",
+                '_group' => 'tierqueryhash',
+                'sql' => 'SELECT * FROM widgets',
+                'duration' => 500 + $i * 50,
+                'connection' => $i % 2 === 0 ? 'pgsql' : 'mysql',
+                'timestamp' => $hourStart + $i * 60,
+            ]);
+        }
+
+        $this->writer->write($records);
+
+        $agg = fn (string $table): array => self::$pdo->query(
+            "SELECT connection, SUM(call_count) AS cc, SUM(total_duration) AS td,
+                    MIN(min_duration) AS mn, MAX(max_duration) AS mx
+             FROM {$table} WHERE group_hash = 'tierqueryhash'
+             GROUP BY connection ORDER BY connection"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $minute = $agg('nightowl_query_rollups');
+        $hourly = $agg('nightowl_query_hourly_rollups');
+
+        $this->assertCount(2, $minute, 'both connections must appear');
+        $this->assertEquals($minute, $hourly, 'hourly query tier must reproduce the minute rollup per connection');
+
+        // The whole hour collapses to one row per connection.
+        $hourlyRows = (int) self::$pdo->query(
+            "SELECT COUNT(*) FROM nightowl_query_hourly_rollups WHERE group_hash = 'tierqueryhash'"
+        )->fetchColumn();
+        $this->assertSame(2, $hourlyRows);
+
+        // sql_query representative survives the collapse.
+        $rep = self::$pdo->query(
+            "SELECT DISTINCT sql_query FROM nightowl_query_hourly_rollups WHERE group_hash = 'tierqueryhash'"
+        )->fetchAll(PDO::FETCH_COLUMN);
+        $this->assertSame(['SELECT * FROM widgets'], $rep);
+    }
+
+    /**
+     * The multi-row upsert chunks at 500 rows/statement; a batch producing more
+     * groups than one chunk must land every group, and a second batch must
+     * accumulate additively onto the same rows through the chunked path.
+     */
+    public function test_batched_upserts_span_chunks_and_accumulate(): void
+    {
+        $batch = fn (string $prefix): array => array_map(
+            fn (int $i): array => $this->sim->makeQuery([
+                'trace_id' => "{$prefix}-{$i}",
+                '_group' => sprintf('chunkhash%04d', $i), // 520 distinct groups > 500 chunk
+                'sql' => 'SELECT 1',
+                'duration' => 100,
+                'connection' => 'pgsql',
+            ]),
+            range(0, 519),
+        );
+
+        $this->writer->write($batch('chunk-a'));
+        $this->writer->write($batch('chunk-b'));
+
+        $rows = self::$pdo->query(
+            "SELECT COUNT(*) AS groups, SUM(call_count) AS cc, MIN(call_count) AS mn, MAX(call_count) AS mx
+             FROM nightowl_query_rollups WHERE group_hash LIKE 'chunkhash%'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(520, (int) $rows['groups'], 'every group beyond the chunk boundary must land');
+        $this->assertSame(1040, (int) $rows['cc'], 'second batch must accumulate additively');
+        $this->assertSame(2, (int) $rows['mn']);
+        $this->assertSame(2, (int) $rows['mx']);
+
+        // Tier tables get the same chunked treatment.
+        $hourly = (int) self::$pdo->query(
+            "SELECT SUM(call_count) FROM nightowl_query_hourly_rollups WHERE group_hash LIKE 'chunkhash%'"
+        )->fetchColumn();
+        $this->assertSame(1040, $hourly);
+    }
+
+    /**
+     * DDSketch dual-write: the drain writes the v2 sketch alongside the v1
+     * hist bins, the SQL-side merge accumulates across batches, tiers carry
+     * the merged sketch, and the estimate reproduces the exact percentile
+     * within α.
+     */
+    public function test_ddsketch_dual_write_accumulates_and_estimates(): void
+    {
+        $durations = [1_000, 2_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000];
+
+        $batch = fn (string $prefix): array => array_map(
+            fn (int $i): array => $this->sim->makeQuery([
+                'trace_id' => "{$prefix}-{$i}",
+                '_group' => 'sketchhash',
+                'sql' => 'SELECT 1',
+                'duration' => $durations[$i],
+                'connection' => 'pgsql',
+            ]),
+            array_keys($durations),
+        );
+
+        $this->writer->write($batch('sk-a'));
+        $this->writer->write($batch('sk-b')); // second batch exercises the SQL merge
+
+        $row = self::$pdo->query(
+            "SELECT sketch, sketch_version, min_duration, max_duration, call_count
+             FROM nightowl_query_rollups WHERE group_hash = 'sketchhash'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(2, (int) $row['sketch_version']);
+        $this->assertSame(16, (int) $row['call_count']);
+
+        $packed = is_resource($row['sketch']) ? stream_get_contents($row['sketch']) : (string) $row['sketch'];
+        if (str_starts_with($packed, '\x')) {
+            $packed = hex2bin(substr($packed, 2));
+        }
+        $counts = \NightOwl\Support\DDSketchHistogram::unpack($packed);
+        $this->assertSame(16, array_sum($counts), 'sketch counts must accumulate across batches');
+
+        // Doubled sample = same percentiles; estimate within α of exact.
+        sort($durations);
+        $exactP95 = $durations[(int) ceil(count($durations) * 0.95) - 1];
+        $est = \NightOwl\Support\DDSketchHistogram::percentile(
+            $counts, 0.95, (int) $row['min_duration'], (int) $row['max_duration']
+        );
+        $this->assertLessThanOrEqual(0.01 + 1e-9, abs($est - $exactP95) / $exactP95);
+
+        // Hourly tier carries the merged sketch too.
+        $tier = self::$pdo->query(
+            "SELECT sketch FROM nightowl_query_hourly_rollups WHERE group_hash = 'sketchhash'"
+        )->fetchColumn();
+        $tierPacked = is_resource($tier) ? stream_get_contents($tier) : (string) $tier;
+        if (str_starts_with($tierPacked, '\x')) {
+            $tierPacked = hex2bin(substr($tierPacked, 2));
+        }
+        $this->assertSame($counts, \NightOwl\Support\DDSketchHistogram::unpack($tierPacked), 'tier sketch must equal the minute sketch for a single-hour batch');
+    }
+
+    // ─── Rollup upsert SQL cache ───────────────────────────
+    //
+    // array_chunk(…, ROLLUP_UPSERT_CHUNK) leaves a tail of any size from 1 to 500, so
+    // a cache keyed on the row count accumulates one whole statement string (~75KB at
+    // 500 rows for the ~48-column query rollup) per distinct tail size per table —
+    // unbounded across 42 rollup tables, in a worker whose RSS is back-pressure-gated.
+
+    public function test_rollup_sql_cache_holds_one_entry_per_table(): void
+    {
+        $rollupSql = new \ReflectionMethod($this->writer, 'rollupSql');
+        $cache = new \ReflectionProperty($this->writer, 'rollupSqlCache');
+
+        $spec = RollupSpecs::requests();
+        $hist = QueryHistogram::columns();
+
+        $perRow = substr_count($rollupSql->invoke($this->writer, $spec, $hist, null, 1), '?');
+        $this->assertGreaterThan(0, $perRow);
+
+        foreach ([2, 17, 499, 500] as $rowCount) {
+            $sql = $rollupSql->invoke($this->writer, $spec, $hist, null, $rowCount);
+            $this->assertSame(
+                $rowCount * $perRow,
+                substr_count($sql, '?'),
+                "the {$rowCount}-row statement must still carry {$rowCount} VALUES tuples",
+            );
+        }
+
+        $this->assertSame(
+            [$spec->table],
+            array_keys($cache->getValue($this->writer)),
+            'one entry per table — never one per chunk size',
+        );
+    }
+
+    public function test_query_rollup_sql_cache_holds_one_entry_per_table(): void
+    {
+        $upsertSql = new \ReflectionMethod($this->writer, 'rollupUpsertSql');
+        $cache = new \ReflectionProperty($this->writer, 'rollupUpsertSqlCache');
+
+        $hist = QueryHistogram::columns();
+
+        $perRow = substr_count($upsertSql->invoke($this->writer, $hist, 'nightowl_query_rollups', 1), '?');
+        $this->assertGreaterThan(0, $perRow);
+
+        foreach ([2, 17, 499, 500] as $rowCount) {
+            $sql = $upsertSql->invoke($this->writer, $hist, 'nightowl_query_rollups', $rowCount);
+            $this->assertSame(
+                $rowCount * $perRow,
+                substr_count($sql, '?'),
+                "the {$rowCount}-row statement must still carry {$rowCount} VALUES tuples",
+            );
+        }
+
+        $this->assertSame(
+            ['nightowl_query_rollups'],
+            array_keys($cache->getValue($this->writer)),
+            'one entry per table — never one per chunk size',
+        );
+    }
+
+    /**
+     * A ragged tail is the normal case (array_chunk's last chunk), so the rebuilt
+     * per-call VALUES list has to bind correctly at sizes the cache no longer keys on.
+     */
+    public function test_rollup_upsert_writes_a_ragged_chunk_tail(): void
+    {
+        $records = [];
+        for ($i = 0; $i < 7; $i++) {
+            $records[] = $this->sim->makeQuery(['trace_id' => "ragged-{$i}", 'sql' => "SELECT {$i}"]);
+            $records[$i]['_group'] = 'raggedhash'.$i;
+        }
+
+        $this->writer->write($records);
+
+        $this->assertSame(
+            7,
+            (int) self::$pdo->query(
+                "SELECT COUNT(*) FROM nightowl_query_rollups WHERE group_hash LIKE 'raggedhash%'"
+            )->fetchColumn(),
+            'every group in a ragged chunk must land',
+        );
+    }
+
+    /**
+     * A cached rollup upsert statement bakes in the column set the sketch/hist probes
+     * reported when it was first built. Those probes fail OPEN and UNCACHED, so a
+     * statement built while a probe was momentarily failing carries a column count that
+     * no longer matches the per-call flattened params once the probe recovers — and the
+     * SQL cache is not transactional, so a rolled-back batch leaves the wrong statement
+     * cached. Reused as-is, its VALUES tuples would bind the wrong number of params and
+     * wedge that table permanently. reconnect() must therefore drop the SQL caches so the
+     * next batch rebuilds them against the recovered connection; the probe caches (which
+     * store only successful probes) are kept.
+     */
+    public function test_reconnect_drops_the_rollup_sql_caches_so_a_recovered_probe_rebuilds_them(): void
+    {
+        // A normal mixed batch populates both caches: the request rollup fills
+        // rollupSqlCache, the query rollup fills rollupUpsertSqlCache.
+        $this->writer->write([
+            $this->sim->makeRequest(['trace_id' => 'recon-req', '_group' => 'reconreqhash']),
+            $this->sim->makeQuery(['trace_id' => 'recon-qry', '_group' => 'reconqryhash', 'sql' => 'SELECT 1']),
+        ]);
+
+        $sqlCache = new \ReflectionProperty($this->writer, 'rollupSqlCache');
+        $upsertCache = new \ReflectionProperty($this->writer, 'rollupUpsertSqlCache');
+
+        $this->assertNotEmpty($sqlCache->getValue($this->writer), 'the batch must have cached the spec-driven upsert SQL');
+        $this->assertNotEmpty($upsertCache->getValue($this->writer), 'the batch must have cached the query upsert SQL');
+
+        // Poison the query cache with a statement whose tuple carries FEWER columns than
+        // the migrated layout — the shape a probe-failure batch (sketch/hist read as
+        // absent) leaves behind. Reused against the full param set it would bind the
+        // wrong count and wedge nightowl_query_rollups.
+        $upsertCache->setValue($this->writer, ['nightowl_query_rollups' => [
+            'tuple' => '(?, ?)',
+            'prefix' => 'INSERT INTO nightowl_query_rollups (group_hash, bucket_start) VALUES ',
+            'suffix' => ' ON CONFLICT (group_hash, bucket_start, environment, connection) DO UPDATE SET call_count = nightowl_query_rollups.call_count',
+        ]]);
+
+        (new \ReflectionMethod($this->writer, 'reconnect'))->invoke($this->writer);
+
+        $this->assertSame([], $sqlCache->getValue($this->writer), 'reconnect must drop the spec-driven SQL cache');
+        $this->assertSame([], $upsertCache->getValue($this->writer), 'reconnect must drop the poisoned query SQL cache');
+
+        // With the poison gone the next batch rebuilds the statement against the
+        // recovered connection, so the write lands instead of wedging on a param
+        // mismatch. A fresh group hash keeps the assertion off the setup batch's row.
+        $this->writer->write([
+            $this->sim->makeQuery(['trace_id' => 'recon-qry-2', '_group' => 'reconqryhash2', 'sql' => 'SELECT 2']),
+        ]);
+
+        $this->assertSame(
+            1,
+            (int) self::$pdo->query(
+                "SELECT call_count FROM nightowl_query_rollups WHERE group_hash = 'reconqryhash2'"
+            )->fetchColumn(),
+            'the rebuilt statement must upsert the query rollup, not wedge on the stale column count',
+        );
+    }
+
+    // ─── Partition maintenance ─────────────────────────────
+
+    /**
+     * A clean tick commits its children and ends holding nothing — no advisory lock, no
+     * open transaction left on the drain connection for the next batch to inherit.
+     *
+     * This does NOT pin the lock's SCOPE. Session and transaction scope are
+     * indistinguishable on a direct connection: both release on the same backend that
+     * took them. Only a transaction-mode pooler separates them, by landing the release on
+     * a different backend than the acquire.
+     */
+    public function test_partition_maintenance_commits_and_ends_holding_nothing(): void
+    {
+        $today = intdiv(time(), 86400) * 86400;
+        $children = [
+            RawPartitions::childName('nightowl_requests', $today + 86400),
+            RawPartitions::childName('nightowl_jobs', $today + 86400),
+        ];
+
+        foreach ($children as $child) {
+            self::$pdo->exec("DROP TABLE IF EXISTS {$child}");
+        }
+
+        $this->writer->maintainRawPartitions();
+
+        foreach ($children as $child) {
+            $this->assertNotNull(
+                self::$pdo->query("SELECT to_regclass('{$child}')")->fetchColumn(),
+                'a clean tick must commit the children it creates',
+            );
+        }
+
+        $this->assertSame(0, $this->writerAdvisoryLockCount(), 'the commit must release the lock');
+        $this->assertFalse(
+            (new \ReflectionMethod($this->writer, 'pdo'))->invoke($this->writer)->inTransaction(),
+            'the tick must not leave its transaction open on the drain connection',
+        );
+    }
+
+    /**
+     * ensureFutureChildren savepoint-isolates each table, sweeps them all, and RETURNS
+     * the ones that failed (it does not throw). The tick must COMMIT that partial progress:
+     * a single persistently failing table would otherwise discard every healthy table's
+     * children on every tick, stranding their rows in {t}_pdefault — which prune can only
+     * row-DELETE, never DROP. That is the same silent outcome the session lock caused.
+     */
+    public function test_partition_maintenance_keeps_healthy_tables_children_when_one_table_fails(): void
+    {
+        $today = intdiv(time(), 86400) * 86400;
+        $blockedDay = $today + 3 * 86400;
+        // nightowl_requests precedes nightowl_queries in RawPartitions::TABLES and
+        // nightowl_jobs follows it, so the failure lands mid-sweep.
+        $before = RawPartitions::childName('nightowl_requests', $blockedDay);
+        $after = RawPartitions::childName('nightowl_jobs', $blockedDay);
+        $blocked = RawPartitions::childName('nightowl_queries', $blockedDay);
+        $from = gmdate('Y-m-d 00:00:00', $blockedDay);
+        $to = gmdate('Y-m-d 00:00:00', $blockedDay + 86400);
+
+        foreach ([$before, $after, $blocked] as $child) {
+            self::$pdo->exec("DROP TABLE IF EXISTS {$child}");
+        }
+
+        // An overlapping child under a name ensureDailyChild will not recognise, so its
+        // CREATE ... IF NOT EXISTS for that day raises 42P17 instead of no-op'ing.
+        self::$pdo->exec(
+            "CREATE TABLE nightowl_queries_pblocker PARTITION OF nightowl_queries FOR VALUES FROM ('{$from}') TO ('{$to}')"
+        );
+
+        try {
+            $this->writer->maintainRawPartitions();
+
+            $this->assertNotNull(
+                self::$pdo->query("SELECT to_regclass('{$before}')")->fetchColumn(),
+                'a table swept BEFORE the failing one must keep the children it got',
+            );
+            $this->assertNotNull(
+                self::$pdo->query("SELECT to_regclass('{$after}')")->fetchColumn(),
+                'a table swept AFTER the failing one must still get its children',
+            );
+            $this->assertSame(0, $this->writerAdvisoryLockCount(), 'the tick must release the lock');
+        } finally {
+            self::$pdo->exec('DROP TABLE IF EXISTS nightowl_queries_pblocker');
+        }
+
+        // Unblocked, the next tick fills the gap the failure left.
+        $this->writer->maintainRawPartitions();
+
+        $this->assertNotNull(
+            self::$pdo->query("SELECT to_regclass('{$blocked}')")->fetchColumn(),
+            'the next tick must create the child the blocked one could not',
+        );
+    }
+
+    /**
+     * Non-blocking by contract: a worker that cannot take the lock skips the tick
+     * rather than queueing behind the one sweeping.
+     */
+    public function test_partition_maintenance_skips_when_another_worker_holds_the_lock(): void
+    {
+        $today = intdiv(time(), 86400) * 86400;
+        $child = RawPartitions::childName('nightowl_requests', $today + 2 * 86400);
+
+        self::$pdo->exec("DROP TABLE IF EXISTS {$child}");
+        self::$pdo->query("SELECT pg_advisory_lock(hashtext('nightowl_partition_maintenance'))");
+
+        try {
+            $this->writer->maintainRawPartitions();
+
+            $this->assertNull(
+                self::$pdo->query("SELECT to_regclass('{$child}')")->fetchColumn(),
+                'the tick must skip while another worker holds the lock, not block on it',
+            );
+        } finally {
+            self::$pdo->query("SELECT pg_advisory_unlock(hashtext('nightowl_partition_maintenance'))");
+        }
+
+        $this->writer->maintainRawPartitions();
+
+        $this->assertNotNull(
+            self::$pdo->query("SELECT to_regclass('{$child}')")->fetchColumn(),
+            'the next tick must pick up the work the skipped one left',
+        );
+    }
+
+    /**
+     * Advisory locks held by the writer's OWN backend. Scoped by pid because the test
+     * database is shared — a suite running beside this one holds its own rollup locks.
+     */
+    private function writerAdvisoryLockCount(): int
+    {
+        $pdo = (new \ReflectionMethod($this->writer, 'pdo'))->invoke($this->writer);
+        $pid = (int) $pdo->query('SELECT pg_backend_pid()')->fetchColumn();
+
+        return (int) self::$pdo->query(
+            "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = {$pid}"
+        )->fetchColumn();
+    }
+
     private static function truncateAllTables(): void
     {
         $tables = [
@@ -1733,6 +2522,13 @@ class RecordWriterTest extends TestCase
 
         foreach ($tables as $table) {
             self::$pdo->exec("TRUNCATE TABLE {$table} CASCADE");
+
+            // Hour/day tier siblings of every rollup table (migration 000054).
+            if (str_ends_with($table, '_rollups')) {
+                foreach (\NightOwl\Support\RollupTiers::tierTables($table) as $tierTable) {
+                    self::$pdo->exec("TRUNCATE TABLE {$tierTable} CASCADE");
+                }
+            }
         }
     }
 }
