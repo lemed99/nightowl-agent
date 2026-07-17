@@ -17,7 +17,8 @@ class BackfillRollupsCommand extends Command
         {--since= : Start datetime (default: earliest source row)}
         {--until= : End datetime (default: now minus the safety margin)}
         {--chunk-days=1 : Days of source data processed per transaction}
-        {--type= : Restrict to one rollup table (e.g. nightowl_request_rollups)}';
+        {--type= : Restrict to one rollup table (e.g. nightowl_request_rollups)}
+        {--tiers-only : Skip the raw→minute pass and rebuild only the hourly/daily tiers from the minute rollups}';
 
     protected $description = 'Backfill every nightowl_*_rollups table from existing raw telemetry';
 
@@ -63,7 +64,14 @@ class BackfillRollupsCommand extends Command
             // commit individually and the pass is replace-per-bucket, so a
             // re-run after the fix resumes without duplicating work.
             try {
-                $this->backfillSpec($conn, $spec, $chunkDays);
+                // --tiers-only: the minute table is already populated (live
+                // drain or an earlier full pass) and only the hourly/daily
+                // siblings need history — the upgrade path onto the tier
+                // release. Skipping the raw pass keeps this cheap enough for
+                // nightowl:migrate to run it automatically.
+                if (! $this->option('tiers-only')) {
+                    $this->backfillSpec($conn, $spec, $chunkDays);
+                }
                 $this->backfillTiers($conn, $schema, $spec, $chunkDays);
             } catch (\Throwable $e) {
                 $failed[$spec->table] = $e;

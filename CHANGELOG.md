@@ -5,6 +5,29 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.3.1] - 2026-07-17
+
+### Changed
+
+- **`nightowl:migrate` now reconciles rollup completeness — no manual backfill
+  on any upgrade path.** Its auto-backfill previously covered only empty *base*
+  rollup tables, so upgrading to 1.3.0 created the hour/day tier tables empty and
+  left them that way until someone ran `nightowl:backfill-rollups` by hand (the
+  read side falls back to the minute base meanwhile, so charts stay correct but
+  the tier speedup doesn't apply to existing history). Migrate now also detects
+  incomplete state: a minute table missing history the raw table still holds
+  (earliest bucket younger than the earliest raw row) gets the full
+  raw→minute→tier chain, and a tier whose `call_count` sum falls short of its
+  chain source's — the drain writes both in one transaction, so a shortfall is a
+  gap wherever it sits, including the mid-history hole left when a daemon keeps
+  writing minute-only between migrate and its restart — gets the new
+  `nightowl:backfill-rollups --tiers-only` pass (minute→hour→day re-aggregation,
+  no raw scan; replace-per-window, so it heals middle holes). Detection costs two
+  index-backed MINs plus one SUM per rollup table per deploy. Retention asymmetry
+  never false-triggers (tiers keep more history than their source).
+  `--no-backfill` skips all of it, and `nightowl:backfill-rollups` remains
+  available for exotic states.
+
 ## [1.3.0] - 2026-07-17
 
 ### Added

@@ -227,4 +227,49 @@ final class BackfillRollupsFailureTest extends TestCase
             }
         }
     }
+
+    /**
+     * The upgrade path nightowl:migrate automates: a populated minute table
+     * whose new tier siblings are empty. --tiers-only must rebuild the tiers
+     * from the minute rows WITHOUT the raw pass — proven by the raw source
+     * table not existing at all.
+     */
+    public function test_tiers_only_rebuilds_tiers_without_touching_raw(): void
+    {
+        self::$pdo->exec('DROP SCHEMA IF EXISTS '.self::SCHEMA.' CASCADE');
+        self::$pdo->exec('CREATE SCHEMA '.self::SCHEMA);
+
+        // No nightowl_mail raw table on purpose.
+        $this->makeRollupTable('nightowl_mail_rollups', hist: true, sketch: false, durationCount: true);
+        $this->makeRollupTable('nightowl_mail_hourly_rollups', hist: true, sketch: false, durationCount: true);
+        $this->makeRollupTable('nightowl_mail_daily_rollups', hist: true, sketch: false, durationCount: true);
+
+        self::$pdo->exec('INSERT INTO '.self::SCHEMA.".nightowl_mail_rollups
+            (group_hash, bucket_start, environment, call_count, queued_count, failed_count,
+             total_duration, min_duration, max_duration, duration_count, hist_10, mailable)
+            VALUES
+            ('g1', date_trunc('day', now() - interval '1 day') + interval '6 hours 15 minutes', 'production', 3, 1, 0, 300, 100, 100, 2, 2, 'App\\Mail\\A'),
+            ('g1', date_trunc('day', now() - interval '1 day') + interval '7 hours 15 minutes', 'production', 2, 0, 0, 200, 100, 100, 2, 2, 'App\\Mail\\A')");
+
+        $command = new BackfillRollupsCommand;
+        $command->setLaravel($this->app);
+        $output = new BufferedOutput;
+        $exit = $command->run(new ArrayInput(['--type' => 'nightowl_mail_rollups', '--tiers-only' => true]), $output);
+
+        $this->assertSame(0, $exit, 'tiers-only must succeed with no raw table present: '.$output->fetch());
+
+        // Two minute buckets an hour apart → two hourly rows, one daily row,
+        // additively correct across every summed column.
+        $hourly = self::$pdo->query('SELECT count(*) FROM '.self::SCHEMA.'.nightowl_mail_hourly_rollups')->fetchColumn();
+        $this->assertSame(2, (int) $hourly);
+
+        $daily = self::$pdo->query(
+            'SELECT call_count, queued_count, duration_count, hist_10 FROM '.self::SCHEMA.'.nightowl_mail_daily_rollups'
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $this->assertCount(1, $daily);
+        $this->assertSame(
+            ['call_count' => 5, 'queued_count' => 1, 'duration_count' => 4, 'hist_10' => 4],
+            array_map('intval', $daily[0]),
+        );
+    }
 }

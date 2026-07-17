@@ -162,4 +162,47 @@ final class MigrateCommandTest extends TestCase
         $applied = MigrateCommand::appliedSet(['a', 'b'], [], []);
         $this->assertFalse(MigrateCommand::isBehind(['a', 'b'], $applied));
     }
+
+    public function test_backfill_plan_upgrade_path_gets_tiers_only(): void
+    {
+        // The tier-release upgrade: sound minute tables, tier siblings empty
+        // or holed (sum short of the source). Without the tiers-only pass,
+        // wide ranges stay on the minute tier — past the statement timeout at
+        // 8M req/day scale.
+        $plan = MigrateCommand::backfillPlan(
+            basesNeedingFull: [],
+            basesOk: ['nightowl_request_rollups', 'nightowl_query_rollups'],
+            incompleteTiers: ['nightowl_request_hourly_rollups', 'nightowl_request_daily_rollups'],
+        );
+
+        $this->assertSame([], $plan['full']);
+        $this->assertSame(['nightowl_request_rollups'], $plan['tiers_only'], 'only the type with incomplete tiers is re-aggregated');
+    }
+
+    public function test_backfill_plan_empty_base_takes_the_full_chain_only(): void
+    {
+        // A full pass already rebuilds the tiers — the same type must not also
+        // be queued tiers-only.
+        $plan = MigrateCommand::backfillPlan(
+            basesNeedingFull: ['nightowl_request_rollups'],
+            basesOk: [],
+            incompleteTiers: ['nightowl_request_hourly_rollups'],
+        );
+
+        $this->assertSame(['nightowl_request_rollups'], $plan['full']);
+        $this->assertSame([], $plan['tiers_only']);
+    }
+
+    public function test_backfill_plan_maintained_tiers_are_left_alone(): void
+    {
+        // Sound base, no incomplete tiers (live drain maintains them): no work.
+        $plan = MigrateCommand::backfillPlan(
+            basesNeedingFull: [],
+            basesOk: ['nightowl_request_rollups'],
+            incompleteTiers: [],
+        );
+
+        $this->assertSame([], $plan['full']);
+        $this->assertSame([], $plan['tiers_only']);
+    }
 }
