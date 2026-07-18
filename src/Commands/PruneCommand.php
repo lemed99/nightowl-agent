@@ -13,7 +13,8 @@ class PruneCommand extends Command
     protected $signature = 'nightowl:prune
         {--days= : Number of days to retain raw telemetry}
         {--hours= : Number of HOURS to retain raw telemetry (overrides --days; for aggressive demo-feeder retention on a sub-day cadence)}
-        {--rollup-days= : Number of days to retain query rollups (defaults to far longer than raw)}';
+        {--rollup-days= : Number of days to retain query rollups (defaults to far longer than raw)}
+        {--delete-chunk=100000 : Rows per DELETE statement for raw-table trims (smaller = shorter transactions, more statements)}';
 
     protected $description = 'Prune old NightOwl monitoring data';
 
@@ -70,7 +71,7 @@ class PruneCommand extends Command
                 }
             }
 
-            $deleted = $conn->table($table)->where('created_at', '<', $cutoff)->delete();
+            $deleted = $this->chunkedDelete($conn, $table, $cutoff, max(1, (int) $this->option('delete-chunk')));
             $totalDeleted += $deleted;
 
             if ($deleted > 0) {
@@ -142,6 +143,52 @@ class PruneCommand extends Command
         $this->newLine();
         $this->info("Pruned {$totalDeleted} records total.");
 
+        return $this->finish($conn);
+    }
+
+    /**
+     * Trim raw rows older than $cutoff in bounded statements instead of one
+     * mega-DELETE. The first prune after nightowl:partition trims the entire
+     * pre-conversion backlog out of the historic partition — tens of GB on
+     * exactly the tenants that needed partitioning most — and a single DELETE
+     * of that size runs for many minutes with no output (reported from the
+     * field as "prune gets stuck"), holds one long transaction (WAL and bloat
+     * spike, blocks vacuum truncation), and hands autovacuum one giant
+     * dead-tuple wave. Chunking bounds each statement's transaction, emits
+     * progress the operator can see, and an interrupted prune resumes where
+     * it stopped instead of rolling the whole trim back.
+     *
+     * The inner SELECT walks the created_at index; the outer created_at bound
+     * repeats so partition pruning stays effective on partitioned parents (an
+     * id-only semi-join would probe every daily child).
+     */
+    private function chunkedDelete($conn, string $table, string $cutoff, int $chunk): int
+    {
+        $total = 0;
+        $lastReport = 0;
+
+        do {
+            $deleted = $conn->affectingStatement(
+                "DELETE FROM {$table} WHERE created_at < ? AND id IN (
+                    SELECT id FROM {$table} WHERE created_at < ? LIMIT {$chunk}
+                )",
+                [$cutoff, $cutoff],
+            );
+            $total += $deleted;
+
+            // A heartbeat roughly every 10 chunks — enough to prove liveness
+            // on a multi-GB trim without flooding the output.
+            if ($total - $lastReport >= $chunk * 10) {
+                $this->line("  {$table}: {$total} records deleted so far...");
+                $lastReport = $total;
+            }
+        } while ($deleted >= $chunk);
+
+        return $total;
+    }
+
+    private function finish($conn): int
+    {
         // THE moment the false expectation forms: "Pruned 24M records" reads
         // as "disk freed", but on unpartitioned tables Postgres only reuses
         // that space — it never returns it to the OS. Say so right here, in

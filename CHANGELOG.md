@@ -5,6 +5,20 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.3.2] - 2026-07-18
+
+### Changed
+
+- **`nightowl:prune` trims raw tables in bounded chunks with progress output.**
+  The first prune after `nightowl:partition` deletes the entire pre-conversion
+  backlog out of the historic partition — tens of GB on exactly the tenants
+  that needed partitioning most — and that used to be a single `DELETE` that
+  ran for many minutes with no output (reported from the field as "prune gets
+  stuck"), held one long transaction, and handed autovacuum a giant dead-tuple
+  wave. Raw trims now delete `--delete-chunk` rows per statement (default
+  100k), print a heartbeat every ~10 chunks, and an interrupted prune resumes
+  where it stopped instead of rolling the whole trim back.
+
 ## [1.3.1] - 2026-07-17
 
 ### Changed
