@@ -53,6 +53,10 @@ final class EmailTemplate
             $titleText = 'Exception: ' . $e($name);
         } elseif ($thresholdMs !== null) {
             $titleText = $e($name) . ' exceeded ' . number_format($thresholdMs) . 'ms threshold';
+        } elseif ($subtype === 'worker_saturation') {
+            // The name IS the event ("Worker saturation") — a "Slow Worker
+            // Saturation:" prefix would be nonsense. Details ride the message.
+            $titleText = $e($name);
         } else {
             $titleText = 'Slow ' . $e($subtypeLabel) . ': ' . $e($name);
         }

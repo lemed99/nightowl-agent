@@ -5,6 +5,28 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.4.0] - 2026-07-19
+
+### Added
+
+- **Worker saturation alert.** When the tenant configures a per-environment
+  HTTP worker count (`http_workers` setting) and enables the trigger
+  (`worker_saturation` setting: `enabled` / `percent` 10–200 /
+  `sustained_minutes` 1–60), the drain's cleanup tick evaluates average request
+  concurrency against the worker count once per minute, reading occupancy back
+  from `nightowl_request_rollups` (SUM(total_duration) per completed minute).
+  When it holds at/above `percent`% for `sustained_minutes` consecutive
+  completed minutes, the agent opens a `performance` issue (subtype
+  `worker_saturation`, fingerprint `worker_saturation` per environment) through
+  the existing threshold-issue protocol — dedup, resolve/reopen with
+  `NIGHTOWL_REOPEN_COOLDOWN_HOURS`, and `issue.new` / `issue.reopened` channel
+  dispatch all included. Each agent evaluates only its own environment
+  (advisory-locked, one evaluation per tenant per minute across drain workers).
+  A minute with no traffic breaks the streak; unconfigured or out-of-bounds
+  settings disable the check entirely. Both settings are read with the same
+  cached 30s `updated_at` poll as thresholds, so dashboard edits apply without
+  an agent restart. No new env vars, no schema changes.
+
 ## [1.3.2] - 2026-07-18
 
 ### Changed

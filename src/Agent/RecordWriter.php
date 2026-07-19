@@ -24,6 +24,18 @@ final class RecordWriter
 
     private ?string $thresholdUpdatedAt = null;
 
+    /**
+     * Generic nightowl_settings cache for keys beyond 'thresholds', same
+     * protocol as the threshold trio above: parsed value held for the TTL,
+     * with a 30s updated_at poll so dashboard edits apply without restart.
+     *
+     * @var array<string, array{value: mixed, expiry: float, versionCheckAt: float, updatedAt: ?string}>
+     */
+    private array $settingsCache = [];
+
+    /** Completed-minute stamp of the last saturation evaluation (once per minute). */
+    private int $saturationCheckedMinute = 0;
+
     private AlertNotifier $notifier;
 
     /** Cached per rollup table: whether it exists on the target DB. */
@@ -2640,6 +2652,255 @@ final class RecordWriter
     }
 
     /**
+     * Cached read of an arbitrary nightowl_settings key, mirroring the
+     * getThresholds() protocol: parsed value held for the threshold TTL, a 30s
+     * updated_at poll so dashboard edits apply without an agent restart, and a
+     * silent empty fallback when the table/row is absent. $parse maps the raw
+     * JSON string to the cached value and runs once per reload.
+     */
+    private function getCachedSetting(string $key, \Closure $parse): mixed
+    {
+        $now = microtime(true);
+        $entry = $this->settingsCache[$key] ?? null;
+
+        if ($entry !== null && $now < $entry['expiry']) {
+            if ($now < $entry['versionCheckAt']) {
+                return $entry['value'];
+            }
+
+            $this->settingsCache[$key]['versionCheckAt'] = $now + 30;
+
+            try {
+                $stmt = $this->pdo()->prepare('SELECT updated_at FROM nightowl_settings WHERE key = ?');
+                $stmt->execute([$key]);
+                $updatedAt = $stmt->fetchColumn() ?: null;
+
+                if ($updatedAt === $entry['updatedAt']) {
+                    return $entry['value'];
+                }
+                // updated_at changed — fall through to full reload
+            } catch (\Throwable) {
+                return $entry['value'];
+            }
+        }
+
+        $entry = [
+            'value' => $parse(null),
+            'expiry' => $now + $this->thresholdCacheTtl,
+            'versionCheckAt' => $now + 30,
+            'updatedAt' => null,
+        ];
+
+        try {
+            $stmt = $this->pdo()->prepare('SELECT value, updated_at FROM nightowl_settings WHERE key = ?');
+            $stmt->execute([$key]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (is_array($row)) {
+                $entry['updatedAt'] = $row['updated_at'] ?? null;
+                $entry['value'] = $parse(empty($row['value']) ? null : (string) $row['value']);
+            }
+        } catch (\Throwable) {
+            // Table may not exist yet — silently keep the empty parse
+        }
+
+        $this->settingsCache[$key] = $entry;
+
+        return $entry['value'];
+    }
+
+    /**
+     * Per-environment HTTP worker counts ({"production": 8, ...}), the same
+     * defensive decode as the api's App\Support\HttpWorkers::map().
+     *
+     * @return array<string, int>
+     */
+    private function getHttpWorkersMap(): array
+    {
+        return $this->getCachedSetting('http_workers', static function (?string $raw): array {
+            if ($raw === null) {
+                return [];
+            }
+            try {
+                $map = json_decode($raw, true, 8, JSON_THROW_ON_ERROR);
+            } catch (\JsonException) {
+                return [];
+            }
+            if (! is_array($map)) {
+                return [];
+            }
+
+            return array_filter($map, static fn ($v): bool => is_int($v) && $v > 0);
+        });
+    }
+
+    /**
+     * Worker saturation trigger config. Bounds mirror the api's validation so a
+     * hand-edited row can't produce a nonsense trigger; disabled when absent.
+     *
+     * @return array{enabled: bool, percent: int, sustained_minutes: int}
+     */
+    private function getWorkerSaturationConfig(): array
+    {
+        return $this->getCachedSetting('worker_saturation', static function (?string $raw): array {
+            $disabled = ['enabled' => false, 'percent' => 90, 'sustained_minutes' => 3];
+            if ($raw === null) {
+                return $disabled;
+            }
+            try {
+                $config = json_decode($raw, true, 8, JSON_THROW_ON_ERROR);
+            } catch (\JsonException) {
+                return $disabled;
+            }
+            if (! is_array($config) || ($config['enabled'] ?? false) !== true) {
+                return $disabled;
+            }
+
+            $percent = (int) ($config['percent'] ?? 90);
+            $minutes = (int) ($config['sustained_minutes'] ?? 3);
+            if ($percent < 10 || $percent > 200 || $minutes < 1 || $minutes > 60) {
+                return $disabled;
+            }
+
+            return ['enabled' => true, 'percent' => $percent, 'sustained_minutes' => $minutes];
+        });
+    }
+
+    /**
+     * Worker saturation check — fires an issue when average request concurrency
+     * holds at/above the configured fraction of this environment's HTTP worker
+     * count for N consecutive completed minutes.
+     *
+     * Occupancy comes from nightowl_request_rollups: SUM(total_duration) per
+     * (bucket_start, environment) is the worker-time consumed that minute
+     * (additively merged across drain workers by the rollup upsert), so
+     * occ / 60e6 is the average workers busy. Only COMPLETED minutes are
+     * evaluated — the in-progress minute is still accumulating and would
+     * under-read. A minute with no row is zero occupancy and breaks the streak:
+     * no traffic is not saturation.
+     *
+     * Scoped to THIS agent's environment. On a shared tenant DB (staging and
+     * production agents draining the same PG), each agent alerting on every
+     * environment in the http_workers map would race the other's snapshot and
+     * double-notify; own-env scoping removes the overlap entirely.
+     *
+     * Rides the existing performance-issue protocol, so dedup on
+     * (group_hash='worker_saturation', type, environment), the resolve/reopen
+     * lifecycle with NIGHTOWL_REOPEN_COOLDOWN_HOURS, and issue.new /
+     * issue.reopened channel dispatch all behave like duration thresholds.
+     * While the issue stays open, each further saturated minute increments
+     * occurrences_count silently — occurrences read as "saturated minutes".
+     * threshold_ms / triggered_duration_ms stay NULL on purpose: every alert
+     * formatter renders them with an "ms" suffix, which is nonsense for worker
+     * counts. The numbers live in the message instead.
+     *
+     * Called from the drain's cleanup tick (~60s). The advisory xact lock keeps
+     * one evaluation per tenant when NIGHTOWL_DRAIN_WORKERS > 1; the
+     * completed-minute stamp keeps one evaluation per minute per process.
+     */
+    public function checkWorkerSaturation(): void
+    {
+        $config = $this->getWorkerSaturationConfig();
+        if (! $config['enabled']) {
+            return;
+        }
+
+        $workers = $this->getHttpWorkersMap()[$this->environment] ?? null;
+        if ($workers === null || ! $this->rollupEnabled('nightowl_request_rollups')) {
+            return;
+        }
+
+        $currentMinute = intdiv(time(), 60);
+        if ($currentMinute === $this->saturationCheckedMinute) {
+            return;
+        }
+        $this->saturationCheckedMinute = $currentMinute;
+
+        $n = $config['sustained_minutes'];
+        $thresholdOccUs = (int) ceil($workers * ($config['percent'] / 100) * 60_000_000);
+        $windowStartTs = ($currentMinute - $n) * 60;
+
+        $pdo = $this->pdo();
+        $startedTransaction = false;
+
+        try {
+            $pdo->beginTransaction();
+            $startedTransaction = true;
+
+            $locked = $pdo->query(
+                "SELECT pg_try_advisory_xact_lock(hashtext('nightowl_worker_saturation'))"
+            )->fetchColumn();
+            if (! $locked) {
+                $pdo->rollBack();
+
+                return;
+            }
+
+            $stmt = $pdo->prepare(
+                'SELECT bucket_start, SUM(total_duration) AS occ
+                 FROM nightowl_request_rollups
+                 WHERE bucket_start >= ? AND bucket_start < ? AND environment = ?
+                 GROUP BY bucket_start'
+            );
+            $stmt->execute([
+                gmdate('Y-m-d H:i:s', $windowStartTs),
+                gmdate('Y-m-d H:i:s', $currentMinute * 60),
+                $this->environment,
+            ]);
+
+            $occByMinute = [];
+            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                $occByMinute[gmdate('Y-m-d H:i:00', strtotime((string) $row['bucket_start'].' UTC'))] = (int) $row['occ'];
+            }
+
+            $worstOccUs = null;
+            for ($i = 0; $i < $n; $i++) {
+                $occ = $occByMinute[gmdate('Y-m-d H:i:00', $windowStartTs + $i * 60)] ?? 0;
+                if ($occ < $thresholdOccUs) {
+                    $pdo->commit();
+
+                    return; // streak broken — not sustained saturation
+                }
+                $worstOccUs = max($worstOccUs ?? 0, $occ);
+            }
+
+            $key = 'worker_saturation|'.$this->environment;
+            $issueGroups = [
+                $key => [
+                    'fingerprint' => 'worker_saturation',
+                    'deploy' => null,
+                    'environment' => $this->environment,
+                    'name' => 'Worker saturation',
+                    'subtype' => 'worker_saturation',
+                    'count' => 1,
+                    'users' => [],
+                    'timestamps' => [$windowStartTs, $currentMinute * 60],
+                    'message' => sprintf(
+                        'Avg concurrency held at ≥%d%% of %d workers for %d consecutive minutes (worst minute: %.1f busy)',
+                        $config['percent'],
+                        $workers,
+                        $n,
+                        ($worstOccUs ?? 0) / 60_000_000,
+                    ),
+                ],
+            ];
+
+            $snapshot = $this->notifier->snapshotExistingIssues($pdo, $issueGroups, 'performance');
+            $this->upsertPerformanceIssues($issueGroups, $snapshot['reopen'] ?? []);
+            $this->notifier->queueIssueNotifications($this->appName, $issueGroups, 'performance', $snapshot);
+
+            $pdo->commit();
+            $this->notifier->flushNotifications($this->pdo());
+        } catch (\Throwable $e) {
+            if ($startedTransaction && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            $this->notifier->clearPending();
+            error_log('[NightOwl Drain] Worker saturation check failed (will retry next tick): '.$e->getMessage());
+        }
+    }
+
+    /**
      * Find the matching threshold for a record.
      * Specific target match takes priority over global (no target).
      *
@@ -2812,7 +3073,9 @@ final class RecordWriter
                 'subtype' => $group['subtype'] ?? null,
                 'status' => 'open',
                 'exception_class' => $group['name'],
-                'exception_message' => 'Duration exceeded threshold',
+                // Threshold groups carry no message; saturation groups put their
+                // numbers here (their threshold_ms/triggered scalars stay NULL).
+                'exception_message' => $group['message'] ?? 'Duration exceeded threshold',
                 'group_hash' => $group['fingerprint'],
                 'first_seen_at' => $firstSeen,
                 'last_seen_at' => $lastSeen,

@@ -255,6 +255,11 @@ final class DrainWorker
                         $writer->maintainRawPartitions();
                         $lastPartitionCheck = time();
                     }
+
+                    // Worker saturation alert — a cheap no-op unless the tenant
+                    // enabled it in settings. Advisory-locked internally so one
+                    // worker evaluates per tenant per minute.
+                    $writer->checkWorkerSaturation();
                     $this->checkpointWithEscalation($buffer);
                 } catch (\Throwable $e) {
                     error_log("[NightOwl Drain] Cleanup error: {$e->getMessage()}");
