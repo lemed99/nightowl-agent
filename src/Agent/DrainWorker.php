@@ -42,6 +42,8 @@ final class DrainWorker
 
     private const ISSUE_COUNT_INTERVAL = 60; // seconds
 
+    private const PARTITION_CHECK_INTERVAL = 3600; // seconds
+
     private float $pgLatencyEwma = 0.0; // EWMA in ms
 
     // Checkpoint observability — answers "is TRUNCATE actually firing under load?"
@@ -248,13 +250,24 @@ final class DrainWorker
                     // cleanup targets synced=1). A no-op when no synced=-1 rows exist.
                     $buffer->pruneQuarantined($this->quarantineRetentionSeconds);
 
+                    // Every tick: strip an interrupted nightowl:partition run's
+                    // leftovers. A stranded {t}_hist_ck rejects EVERY drain row
+                    // for its table (23514) the moment its frozen boundary
+                    // passes, so this cadence IS the ceiling on that outage —
+                    // it was up to 61 minutes on the hourly gate below. Two
+                    // batched catalog reads that find nothing on a healthy
+                    // tenant: no transaction, no locks and no DDL unless they
+                    // do, and one short transaction per affected table when they
+                    // do. It shares no advisory key with the sweep below.
+                    $writer->healRawPartitionLeftovers();
+
                     // Hourly: keep future daily partitions pre-created so a
                     // day rollover can never route rows to the DEFAULT child.
-                    // (No-op on unpartitioned tenants; advisory-locked.)
-                    if (time() - $lastPartitionCheck >= 3600) {
-                        $writer->maintainRawPartitions();
-                        $lastPartitionCheck = time();
-                    }
+                    // Real DDL — ACCESS EXCLUSIVE on each parent, 88 children a
+                    // pass — and a day of slack costs nothing, so deliberately
+                    // NOT per-tick. (No-op on unpartitioned tenants;
+                    // advisory-locked.)
+                    $lastPartitionCheck = $this->maintainPartitionsIfDue($writer, $lastPartitionCheck);
 
                     // Worker saturation alert — a cheap no-op unless the tenant
                     // enabled it in settings. Advisory-locked internally so one
@@ -341,6 +354,38 @@ final class DrainWorker
         if (class_exists(\Swoole\Runtime::class) && method_exists(\Swoole\Runtime::class, 'setHookFlags')) {
             \Swoole\Runtime::setHookFlags(0);
         }
+    }
+
+    /**
+     * The hourly child-sweep step. Returns the value $lastPartitionCheck must
+     * take — extracted from run(), which is never-returning fork-loop code and
+     * so cannot be driven IN-PROCESS by a test. Extraction covers the gate's
+     * logic only; the call site itself is covered by
+     * DrainTickMaintenanceSystemTest, which boots a real run() in a subprocess —
+     * deleting the call below from the cleanup block left this method's own
+     * tests green.
+     *
+     * ONLY A SWEEP THAT RAN SPENDS THE HOUR. This gate used to advance
+     * unconditionally, so a worker that lost the nightowl_partition_maintenance
+     * lock — or whose transaction failed — created zero children and did not look
+     * again for an hour, silently. With NIGHTOWL_DRAIN_WORKERS>1 and both
+     * workers' gates repeatedly landing inside a contended window, no child sweep
+     * completes at all; after RawPartitions::DAYS_AHEAD days every drained row
+     * routes to {t}_pdefault, which nightowl:prune can only row-DELETE, never
+     * DROP PARTITION. Retrying costs at most one extra sweep per skip: the
+     * retry wins the lock, finds every child present, and is a catalog no-op.
+     *
+     * Per-table failures do NOT buy a retry — maintainRawPartitions returns true
+     * once it commits — because one persistently blocked table would otherwise
+     * re-run the whole 11-table × 8-day sweep every 60s forever.
+     */
+    private function maintainPartitionsIfDue(RecordWriter $writer, int $lastPartitionCheck): int
+    {
+        if (time() - $lastPartitionCheck < self::PARTITION_CHECK_INTERVAL) {
+            return $lastPartitionCheck;
+        }
+
+        return $writer->maintainRawPartitions() ? time() : $lastPartitionCheck;
     }
 
     /**

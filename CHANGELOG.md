@@ -5,6 +5,47 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.4.1] - 2026-07-20
+
+### Fixed
+
+- **`nightowl:partition` is safe to interrupt, safe to run twice, and refuses
+  to run behind a transaction-mode pooler.** The conversion now holds one
+  per-table *session* advisory lock across the whole run — prep included — so a
+  second concurrent run (a deploy step racing an operator) is refused cleanly
+  instead of dropping the winner's half-built table out from under it (42P01).
+  A refused table keeps its rows and its primary key, and the command exits `3`
+  (BUSY) rather than reporting a hard failure. Behind PgBouncer/Supavisor in
+  transaction mode the session lock silently moves between backends; the
+  command now detects that (backend pid read in the same statement that takes
+  the key, re-checked per phase) and aborts the whole run with an explanatory
+  message instead of converting unprotected.
+- **A killed conversion no longer leaves a table that stops accepting writes.**
+  A `{table}_hist_ck` stranded by a SIGKILLed run rejects every drained row
+  (23514) once its boundary passes. The drain now sweeps for that leftover —
+  and for an INVALID `{table}_id_created_at_pt` from a killed `CREATE INDEX
+  CONCURRENTLY` — on **every** cleanup tick (~60s) instead of hourly, cutting
+  the worst-case write outage from 61 minutes to about one. The sweep takes no
+  locks and issues no DDL on a healthy tenant, holds ACCESS EXCLUSIVE one table
+  at a time, and only ever touches a table no conversion holds.
+- **Deadlock between the conversion swap and the drain.** `ALTER SEQUENCE ...
+  OWNED BY` now runs after `LOCK TABLE`, closing a lock cycle against the
+  drain's `nextval`: 21 of 40 conversions deadlocked before this change, 0 of 40
+  after. The swap also carries its own `lock_timeout`, so it can no longer park
+  a pending exclusive in front of every reader of a live table.
+- **Missed hourly partition sweeps are retried instead of forfeited.** The
+  drain used to spend its hour whether or not the child sweep actually ran, so a
+  worker that lost the advisory lock created no children and did not look again
+  for an hour — repeatable across workers until every row landed in the DEFAULT
+  partition, which prune can only delete row by row. The gate now advances only
+  on a sweep that committed.
+- **Failures are classified correctly.** A rolled-back swap no longer masks the
+  real error with "server closed the connection unexpectedly", so a retryable
+  contention error is reported as BUSY (`3`) rather than a hard failure. New
+  exit code `4` (INCOMPLETE) means every conversion landed but some daily
+  children did not — nothing is lost; a running agent creates them within the
+  hour.
+
 ## [1.4.0] - 2026-07-19
 
 ### Added

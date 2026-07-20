@@ -1260,8 +1260,7 @@ class RecordWriterTest extends TestCase
             $this->assertSame(1, (int) $raw, 'Raw query must still drain when the rollup table is missing');
         } finally {
             // Recreate the table for the remaining tests in this class.
-            $this->rollupMigration32()->up();
-            $this->rollupMigration33()->up();
+            $this->restoreQueryRollupsSchema();
         }
     }
 
@@ -1354,8 +1353,7 @@ class RecordWriterTest extends TestCase
             $this->rollupMigration32()->down();
             $this->assertFalse($tableExists(), 'down() must drop the rollup table');
         } finally {
-            $this->rollupMigration32()->up();
-            $this->rollupMigration33()->up();
+            $this->restoreQueryRollupsSchema();
         }
 
         $this->assertTrue($tableExists());
@@ -1376,6 +1374,34 @@ class RecordWriterTest extends TestCase
     private function rollupMigration33(): object
     {
         return $this->loadMigration(__DIR__.'/../../database/migrations/2024_01_01_000033_add_histogram_to_query_rollups.php');
+    }
+
+    /**
+     * Rebuild nightowl_query_rollups to its CURRENT schema, not its 000033-era
+     * one. 32+33 alone recreate a table without the sketch columns (000057) and
+     * duration_count (000061) — and executionOrder="defects" means the DDSketch
+     * tests can run after a test that tore the table down, dying 42703 on a
+     * column the migrations chain guarantees.
+     *
+     * The migration list is DISCOVERED, not hand-written: every later migration
+     * that names this table is replayed in filename order, so the next column
+     * added to nightowl_query_rollups is covered without touching this helper.
+     * A hand-list would silently re-create the exact stale-schema flake it was
+     * written to fix. Replay is safe because these migrations are all
+     * hasTable/hasColumn/IF NOT EXISTS guarded — a no-op for every other table.
+     */
+    private function restoreQueryRollupsSchema(): void
+    {
+        $files = glob(__DIR__.'/../../database/migrations/*.php') ?: [];
+        sort($files);
+
+        foreach ($files as $file) {
+            if (! str_contains((string) file_get_contents($file), 'nightowl_query_rollups')) {
+                continue;
+            }
+
+            $this->loadMigration($file)->up();
+        }
     }
 
     private function loadMigration(string $path): object
@@ -2405,6 +2431,97 @@ class RecordWriterTest extends TestCase
     }
 
     /**
+     * The heal rides one short transaction PER CANDIDATE TABLE and none at all on
+     * a clean tenant, so it must be as clean as the hourly sweep: no advisory
+     * lock held afterwards, no open transaction inherited by the next drain
+     * batch. Its per-table conversion keys are xact-scoped exactly so each
+     * candidate's commit releases them — a session-scoped one taken here would
+     * survive ROLLBACK TO SAVEPOINT, strand itself on the drain connection, and
+     * refuse every later nightowl:partition run.
+     */
+    public function test_heal_sweep_commits_and_ends_holding_nothing(): void
+    {
+        $this->writer->healRawPartitionLeftovers();
+
+        $this->assertSame(0, $this->writerAdvisoryLockCount(), 'the commit must release every heal lock');
+        $this->assertFalse(
+            (new \ReflectionMethod($this->writer, 'pdo'))->invoke($this->writer)->inTransaction(),
+            'the heal must not leave its transaction open on the drain connection',
+        );
+    }
+
+    /**
+     * F11. ONE TRANSACTION PER TABLE, not one for the whole sweep.
+     *
+     * The heal's ALTER TABLE ... DROP CONSTRAINT and DROP INDEX both take ACCESS
+     * EXCLUSIVE, and a lock is held until the transaction that took it commits.
+     * healConversionLeftovers opens its own transaction per candidate ONLY when
+     * the caller has none, so wrapping the sweep in one caller-owned transaction
+     * silently skipped every per-candidate commit: a nightowl:partition SIGKILLed
+     * over all 11 raw tables makes all 11 candidates on the next tick, and the
+     * tick then held ACCESS EXCLUSIVE on eleven parents at once — blocking every
+     * other drain worker's COPY and every dashboard read on all of them.
+     *
+     * Counted at the seam, on a PDO spy standing in for the drain connection,
+     * because the effect is otherwise unobservable after the fact: once the sweep
+     * returns, both shapes have committed both DROPs and every catalog view of
+     * them is identical.
+     *
+     * pg_class.xmin does NOT distinguish them and was the first thing tried —
+     * healConversionLeftovers runs each candidate inside isolated()'s SAVEPOINT,
+     * Postgres assigns every subtransaction its own xid, and the two tables come
+     * back with DIFFERENT xmins even when one caller transaction wraps the whole
+     * sweep. That test passed against the pre-fix code, which is the only reason
+     * this comment exists: the begin/commit count is the property, so count it.
+     */
+    public function test_the_heal_takes_one_transaction_per_table(): void
+    {
+        $tables = ['nightowl_mail', 'nightowl_notifications'];
+        $expired = gmdate('Y-m-d 00:00:00', intdiv(time(), 86400) * 86400);
+
+        foreach ($tables as $table) {
+            self::$pdo->exec(
+                "ALTER TABLE {$table} ADD CONSTRAINT {$table}_hist_ck
+                 CHECK (created_at IS NOT NULL AND created_at < '{$expired}') NOT VALID"
+            );
+        }
+
+        $spy = new CountingPdo(
+            sprintf('pgsql:host=%s;port=%d;dbname=%s', self::$host, self::$port, self::$database),
+            self::$username,
+            self::$password,
+        );
+        $spy->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+        $connection = new \ReflectionProperty(RecordWriter::class, 'pdo');
+        $connection->setValue($this->writer, $spy);
+
+        try {
+            $this->writer->healRawPartitionLeftovers();
+
+            foreach ($tables as $table) {
+                $this->assertSame(0, (int) self::$pdo->query(
+                    "SELECT COUNT(*) FROM pg_constraint
+                     WHERE conrelid = '{$table}'::regclass AND conname = '{$table}_hist_ck'"
+                )->fetchColumn(), "{$table}'s leftover CHECK must be stripped");
+            }
+
+            $this->assertSame(2, $spy->begins,
+                'each healed table must get its OWN transaction — one transaction for the whole sweep holds '
+                .'ACCESS EXCLUSIVE on every healed parent until the single commit, and a caller that opens '
+                .'one skips healConversionLeftovers\' per-candidate begin entirely');
+            $this->assertSame(2, $spy->commits,
+                'and must commit its own, which is what releases that table\'s ACCESS EXCLUSIVE');
+        } finally {
+            $connection->setValue($this->writer, null);
+
+            foreach ($tables as $table) {
+                self::$pdo->exec("ALTER TABLE {$table} DROP CONSTRAINT IF EXISTS {$table}_hist_ck");
+            }
+        }
+    }
+
+    /**
      * ensureFutureChildren savepoint-isolates each table, sweeps them all, and RETURNS
      * the ones that failed (it does not throw). The tick must COMMIT that partial progress:
      * a single persistently failing table would otherwise discard every healthy table's
@@ -2460,7 +2577,9 @@ class RecordWriterTest extends TestCase
 
     /**
      * Non-blocking by contract: a worker that cannot take the lock skips the tick
-     * rather than queueing behind the one sweeping.
+     * rather than queueing behind the one sweeping — and REPORTS the skip, so the
+     * caller's hourly gate does not advance on it: a forfeited turn is an hour
+     * with no children created.
      */
     public function test_partition_maintenance_skips_when_another_worker_holds_the_lock(): void
     {
@@ -2471,7 +2590,9 @@ class RecordWriterTest extends TestCase
         self::$pdo->query("SELECT pg_advisory_lock(hashtext('nightowl_partition_maintenance'))");
 
         try {
-            $this->writer->maintainRawPartitions();
+            $this->assertFalse($this->writer->maintainRawPartitions(),
+                'a sweep that could not take the lock must report that it did NOT run — the caller\'s hourly '
+                .'gate advances on the return value, and a forfeited turn is an hour with no children created');
 
             $this->assertNull(
                 self::$pdo->query("SELECT to_regclass('{$child}')")->fetchColumn(),
@@ -2481,7 +2602,7 @@ class RecordWriterTest extends TestCase
             self::$pdo->query("SELECT pg_advisory_unlock(hashtext('nightowl_partition_maintenance'))");
         }
 
-        $this->writer->maintainRawPartitions();
+        $this->assertTrue($this->writer->maintainRawPartitions(), 'a sweep that ran must report that it ran');
 
         $this->assertNotNull(
             self::$pdo->query("SELECT to_regclass('{$child}')")->fetchColumn(),
@@ -2530,5 +2651,34 @@ class RecordWriterTest extends TestCase
                 }
             }
         }
+    }
+}
+
+/**
+ * A real drain connection that also counts its transaction boundaries.
+ *
+ * The heal's ACCESS EXCLUSIVE holds are bounded by WHERE the commits fall, and
+ * after the sweep returns both shapes look identical in the catalog — so the
+ * count at the seam is the only direct evidence. See
+ * RecordWriterTest::test_the_heal_takes_one_transaction_per_table.
+ */
+final class CountingPdo extends PDO
+{
+    public int $begins = 0;
+
+    public int $commits = 0;
+
+    public function beginTransaction(): bool
+    {
+        $this->begins++;
+
+        return parent::beginTransaction();
+    }
+
+    public function commit(): bool
+    {
+        $this->commits++;
+
+        return parent::commit();
     }
 }

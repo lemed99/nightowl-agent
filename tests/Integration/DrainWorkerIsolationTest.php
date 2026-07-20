@@ -203,4 +203,43 @@ class DrainWorkerIsolationTest extends TestCase
         $this->assertSame(0, $this->buffer->quarantinedCount());
         $this->assertSame(2, $this->buffer->pendingCount());
     }
+
+    /**
+     * F12. The hourly gate must advance ONLY when the sweep actually ran.
+     *
+     * It used to advance unconditionally, so a worker that failed to take
+     * nightowl_partition_maintenance created zero children and did not look again
+     * for an hour. Contention on that key stopped being rare when the per-tick
+     * leftover heal was split out and took the SAME key 60x more often; with two
+     * workers whose gates keep landing inside a contended window, no child sweep
+     * completes for RawPartitions::DAYS_AHEAD days — after which every drained row
+     * routes to {t}_pdefault, which nightowl:prune can only row-DELETE, never DROP
+     * PARTITION. (The shared key is gone now; a peer worker's own hourly sweep
+     * still contends for it, which is what this drives.)
+     */
+    public function test_a_skipped_partition_sweep_does_not_spend_the_hour(): void
+    {
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $worker = $this->worker(quarantine: false);
+
+        $gate = new ReflectionMethod($worker, 'maintainPartitionsIfDue');
+
+        // Due (0 = never swept), but a peer owns the maintenance key.
+        self::$pdo->query("SELECT pg_advisory_lock(hashtext('nightowl_partition_maintenance'))");
+
+        try {
+            $this->assertSame(0, $gate->invoke($worker, $writer, 0),
+                'a sweep that could not take the lock must leave the gate where it was, so the next ~60s '
+                .'cleanup tick retries instead of forfeiting the hour');
+        } finally {
+            self::$pdo->query("SELECT pg_advisory_unlock(hashtext('nightowl_partition_maintenance'))");
+        }
+
+        $this->assertGreaterThan(0, $gate->invoke($worker, $writer, 0),
+            'a sweep that ran must spend the hour');
+
+        // Not due: returned untouched, and no sweep attempted.
+        $recent = time();
+        $this->assertSame($recent, $gate->invoke($worker, $writer, $recent));
+    }
 }

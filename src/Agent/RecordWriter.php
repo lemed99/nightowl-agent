@@ -1199,8 +1199,48 @@ final class RecordWriter
      * CREATE ... PARTITION OF takes ACCESS EXCLUSIVE on the parent, so a sweep queued
      * behind a long COPY would stall every reader that queues behind IT. Timing out one
      * table instead costs that table an hour (isolated, reported, retried next tick).
+     * They are not the ONLY bound, and must not be: applyTransactionGuards gates both
+     * SET LOCALs on NIGHTOWL_DRAIN_CONN_TIMEOUTS, so with that rollback switch off this
+     * transaction carries none at all. RawPartitions applies its own ceiling per table
+     * (MAINTENANCE_LOCK_TIMEOUT_MS), tighten-only — so a lower NIGHTOWL_DB_LOCK_TIMEOUT_MS
+     * set here still wins.
+     *
+     * This pass stays HOURLY (DrainWorker gates it at 3600s) because creating
+     * 88 children is real DDL — each CREATE ... PARTITION OF takes ACCESS
+     * EXCLUSIVE on its parent — and a day of slack costs nothing. The much
+     * cheaper leftover heal runs on every cleanup tick instead, via
+     * healRawPartitionLeftovers().
+     *
+     * A SKIP IS NOT A COMPLETED HOUR. The 3600s gate lives in DrainWorker, and it
+     * used to advance whether or not this ran — so a worker that lost the
+     * advisory lock, or whose transaction failed, created zero children and did
+     * not look again for an hour. With several workers whose hourly gates keep
+     * landing inside a contended window, no sweep completes at all; after
+     * DAYS_AHEAD days every drained row routes to {t}_pdefault, which
+     * nightowl:prune can only row-DELETE, never DROP — the same silent outcome
+     * the paragraph above forbids a session lock for. Hence the bool: only a
+     * sweep that actually ran spends the hour.
+     *
+     * Children only. This pass heals nothing, carries no heal out-param, and
+     * prints no heal notice. Announcing a heal from inside this transaction was
+     * the original defect — a tick that then rolled back told the operator a
+     * total write outage was over while it was ongoing, with "partition
+     * maintenance failed" on the very next line — and when the heal moved out,
+     * the plumbing outlived the announcement: ensureFutureChildren reset the
+     * out-param on entry and never filled it, so logHealedPartitionChecks() here
+     * was called with an empty array on every tick, forever.
+     * healRawPartitionLeftovers() owns both the heal and its notice.
+     *
+     * @return bool whether the sweep RAN — lock taken AND transaction committed.
+     *              False means this call did no work and the caller must NOT
+     *              spend its hour on it; DrainWorker retries on the next ~60s
+     *              cleanup tick. Deliberately TRUE when the sweep committed WITH
+     *              per-table failures: those are isolated, logged and cheap to
+     *              leave to the next hourly pass, while re-running the whole
+     *              11-table sweep every minute against one persistently blocked
+     *              table is not.
      */
-    public function maintainRawPartitions(): void
+    public function maintainRawPartitions(): bool
     {
         $pdo = null;
 
@@ -1223,11 +1263,16 @@ final class RecordWriter
             $pdo->commit();
 
             if ($failures !== []) {
+                // Next HOURLY pass, not next tick: the sweep committed, so it
+                // spent its hour. Only a skip or a throw buys a 60s retry.
                 error_log(sprintf(
-                    '[NightOwl Drain] partition maintenance incomplete: %d partition(s) not created (will retry next tick)',
+                    '[NightOwl Drain] partition maintenance incomplete: %d partition(s) not created '
+                    .'(will retry on the next hourly sweep)',
                     count($failures),
                 ));
             }
+
+            return $got;
         } catch (\Throwable $e) {
             try {
                 if ($pdo?->inTransaction()) {
@@ -1239,7 +1284,85 @@ final class RecordWriter
             }
 
             error_log('[NightOwl Drain] partition maintenance failed (will retry next tick): '.$e->getMessage());
+
+            return false;
         }
+    }
+
+    /**
+     * Strip the wreckage of an interrupted nightowl:partition run — a
+     * {t}_hist_ck stranded on a live table, and an INVALID {t}_id_created_at_pt
+     * left by a killed CREATE INDEX CONCURRENTLY.
+     *
+     * Runs on EVERY cleanup tick (~60s), unlike the child sweep above. The two
+     * were one call and it cost the wrong thing: the sweep is hourly because
+     * creating children is expensive, the heal inherited that cadence, and a
+     * tenant whose frozen boundary had passed sat in a total 23514 write outage
+     * for up to 61 minutes — buffered with quarantine off, DROPPED with it on.
+     * Per tick it costs two batched catalog reads that find nothing on every tick
+     * but one; until they find something it opens no transaction, takes no lock
+     * of any kind and issues no DDL, and it bounds whatever it does issue with
+     * its own lock_timeout (RawPartitions::MAINTENANCE_LOCK_TIMEOUT_MS — the
+     * drain's guards carry one, but NIGHTOWL_DRAIN_CONN_TIMEOUTS=false removes
+     * it).
+     *
+     * NO transaction of its own, and that is the load-bearing part.
+     * healConversionLeftovers opens one PER CANDIDATE TABLE when the caller has
+     * none, and only that shape bounds the heal's ACCESS EXCLUSIVE holds: wrapped
+     * in one caller-owned transaction its per-candidate begin/commit was skipped,
+     * so every healed table's DROP CONSTRAINT / DROP INDEX held ACCESS EXCLUSIVE
+     * until the single commit. A nightowl:partition SIGKILLed over all 11 raw
+     * tables makes all 11 candidates on the next tick, so one tick could park
+     * exclusive locks on eleven parents at once for the sum of their lock waits,
+     * blocking every other drain worker's COPY and every dashboard read on all of
+     * them — the heal turning into a broader outage than the one it clears. One
+     * table at a time also means the drain never holds two raw-table exclusives
+     * simultaneously, so it cannot deadlock against the hourly sweep, which does.
+     * And it puts production on the SAME path the tests exercise, which is why
+     * the caller's transaction never showed up in them.
+     *
+     * NO shared maintenance key either. This used to take the child sweep's
+     * nightowl_partition_maintenance lock, which coordinated nothing the
+     * per-table conversion key does not already cover and starved the sweep it
+     * was borrowed from: taken 60x more often, by a different code path, it could
+     * be held whenever a peer worker's hourly gate fired. Two workers healing the
+     * same table still serialize on that table's conversion key — the loser
+     * reports the skip and finds nothing left to do on its next tick.
+     *
+     * Catches its own throwables — DrainWorker's cleanup block is one shared try,
+     * and a throw here would cost that tick its saturation check and its WAL
+     * checkpoint. healConversionLeftovers never throws by contract and unwinds
+     * its own transactions, so the only thing left to catch is the connection.
+     */
+    public function healRawPartitionLeftovers(): void
+    {
+        try {
+            $failures = [];
+            $healed = RawPartitions::healConversionLeftovers($this->pdo(), null, $failures);
+
+            // Safe to announce unconditionally: healConversionLeftovers appends a
+            // table only once its OWN transaction has committed the DROP.
+            $this->logHealedPartitionChecks($healed);
+        } catch (\Throwable $e) {
+            error_log('[NightOwl Drain] partition leftover sweep failed (will retry next tick): '.$e->getMessage());
+        }
+    }
+
+    /**
+     * @param  list<string>  $healed
+     */
+    private function logHealedPartitionChecks(array $healed): void
+    {
+        if ($healed === []) {
+            return;
+        }
+
+        error_log(sprintf(
+            '[NightOwl Drain] cleaned up an interrupted nightowl:partition run\'s leftovers on %s — a stale '
+            .'boundary CHECK (which rejects every write to that table with 23514 once its boundary passes) '
+            .'and/or an invalid scaffolding index. Re-run nightowl:partition to finish converting.',
+            implode(', ', $healed),
+        ));
     }
 
     /**

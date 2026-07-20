@@ -23,6 +23,8 @@ final class MigrationRunner
 
     private static bool $migrated = false;
 
+    private static ?Container $container = null;
+
     public static function migrate(string $host, int $port, string $database, string $username, string $password): void
     {
         self::bootCapsule($host, $port, $database, $username, $password);
@@ -79,16 +81,25 @@ final class MigrationRunner
 
     private static function bootCapsule(string $host, int $port, string $database, string $username, string $password): void
     {
-        $container = Container::getInstance() ?: new Container;
-        Container::setInstance($container);
-
         if (self::$booted) {
-            // Already wired up — just refresh the connection so subsequent
-            // test classes get a clean PDO handle against the same DB.
-            $container['db']->purge('nightowl');
+            // Already wired up — but a Laravel-booting test class
+            // (PruneCommandTest, BackfillRollupsFailureTest) may have nulled
+            // the facade root in its tearDown since, and executionOrder
+            // "defects" makes class order vary run to run. Re-point global
+            // state at OUR container so the eval'd migrations' Schema:: calls
+            // keep resolving whatever ran before, then refresh the connection
+            // so subsequent test classes get a clean PDO handle.
+            Container::setInstance(self::$container);
+            Facade::clearResolvedInstances();
+            Facade::setFacadeApplication(self::$container);
+            self::$container['db']->purge('nightowl');
 
             return;
         }
+
+        $container = Container::getInstance() ?: new Container;
+        Container::setInstance($container);
+        self::$container = $container;
 
         $capsule = new Capsule($container);
         $capsule->addConnection([
