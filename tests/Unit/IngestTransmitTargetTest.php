@@ -7,6 +7,7 @@ use Illuminate\Foundation\Application;
 use Laravel\Nightwatch\Core;
 use Laravel\Nightwatch\Ingest;
 use NightOwl\NightOwlAgentServiceProvider;
+use NightOwl\Support\MultiIngest;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
 
@@ -211,12 +212,19 @@ final class IngestTransmitTargetTest extends TestCase
         $app->boot();
 
         $this->assertInstanceOf(
-            Ingest::class,
+            MultiIngest::class,
             $core->ingest,
-            'The provider must redirect Core::$ingest at a Nightwatch Ingest.'
+            'The provider must wrap NightOwl ingest so transport failures cannot break the host application.'
         );
 
-        return $core->ingest;
+        $ingests = (new ReflectionClass($core->ingest))
+            ->getProperty('ingests')
+            ->getValue($core->ingest);
+
+        $this->assertCount(1, $ingests, 'Single-agent mode must transmit once, without duplicate records.');
+        $this->assertInstanceOf(Ingest::class, $ingests[0]);
+
+        return $ingests[0];
     }
 
     private function prop(Ingest $ingest, string $name): mixed

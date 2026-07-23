@@ -91,4 +91,27 @@ final class NightwatchCompatibilityTest extends TestCase
 
         $this->assertSame(1, $writes, 'Re-wrapping MultiIngest must not multiply writes to the same downstream ingest.');
     }
+
+    public function test_multi_ingest_prevents_downstream_write_failures_from_escaping(): void
+    {
+        $failing = new class implements IngestContract {
+            public function write(array $record): void
+            {
+                throw new \RuntimeException('Agent acknowledgment timed out.');
+            }
+
+            public function writeNow(array $record): void {}
+            public function ping(): void {}
+            public function shouldDigest(bool $bool = true): void {}
+            public function shouldDigestWhenBufferIsFull(bool $bool = true): void {}
+            public function digest(): void {}
+            public function flush(): void {}
+        };
+
+        $ingest = new MultiIngest($failing);
+
+        $ingest->write(['v' => 1]);
+
+        $this->addToAssertionCount(1);
+    }
 }

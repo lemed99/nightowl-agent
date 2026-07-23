@@ -5,8 +5,8 @@ namespace NightOwl\Tests\Unit;
 use Illuminate\Config\Repository;
 use Illuminate\Foundation\Application;
 use Laravel\Nightwatch\Core;
-use Laravel\Nightwatch\Ingest;
 use NightOwl\NightOwlAgentServiceProvider;
+use NightOwl\Support\MultiIngest;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -46,9 +46,9 @@ final class MasterSwitchTest extends TestCase
         $core = $this->bootProviderWithSwitch(true);
 
         $this->assertInstanceOf(
-            Ingest::class,
+            MultiIngest::class,
             $core->ingest,
-            'With NIGHTOWL_ENABLED=true the provider must redirect Core::$ingest at the NightOwl agent.'
+            'With NIGHTOWL_ENABLED=true the provider must use fail-open NightOwl ingestion.'
         );
     }
 
