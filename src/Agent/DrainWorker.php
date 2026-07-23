@@ -216,6 +216,10 @@ final class DrainWorker
             lockTimeoutMs: (int) config('nightowl.drain_connection.lock_timeout_ms', 10000),
             heartbeat: $heartbeat,
             idleTxnTimeoutMs: (int) config('nightowl.drain_connection.idle_txn_timeout_ms', 30000),
+            // Kill switch, not a rule DSL: templating is hardcoded, this only
+            // turns it off for a tenant the rule hurts. Top-level key (shallow
+            // merge rule).
+            cacheKeyTemplateEnabled: (bool) config('nightowl.cache_key_template', true),
         );
 
         $workerLabel = $this->totalWorkers > 1
@@ -260,6 +264,13 @@ final class DrainWorker
                     // do, and one short transaction per affected table when they
                     // do. It shares no advisory key with the sweep below.
                     $writer->healRawPartitionLeftovers();
+
+                    // Per-tick EXACT recompute of the trailing concurrency
+                    // window — the ONLY writer of that table (a per-batch
+                    // incremental fold under-reports peaks on completion-
+                    // ordered arrival; see ConcurrencyRollup). try-locked, so
+                    // one worker per tenant per tick; never throws.
+                    $writer->maintainConcurrencyRollup(time());
 
                     // Hourly: keep future daily partitions pre-created so a
                     // day rollover can never route rows to the DEFAULT child.

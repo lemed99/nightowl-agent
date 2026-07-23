@@ -100,6 +100,9 @@ class PruneCommand extends Command
         foreach (RollupSpecs::all() as $spec) {
             $rollupTables[$spec->table] = true;
         }
+        // Bespoke (non-spec) rollup — the concurrency table isn't in
+        // RollupSpecs::all(), so list it by hand or it is never pruned.
+        $rollupTables['nightowl_request_concurrency_rollups'] = true;
 
         foreach (array_keys($rollupTables) as $table) {
             if (! $schema->hasTable($table)) {

@@ -674,6 +674,159 @@ class RecordWriterTest extends TestCase
         $this->assertSame(4000, (int) $row['max_duration']);
     }
 
+    // ─── Concurrency rollup (peak-concurrency chart) ───────
+    //
+    // The table's ONLY writer is the cleanup tick's exact recompute
+    // (maintainConcurrencyRollup) — a per-batch incremental fold was measured
+    // ~70% low on max_prefix because drain batches arrive COMPLETION-ordered.
+    // These tests therefore write batches in completion order (the realistic
+    // and formerly-broken case) and assert EXACT numbers.
+
+    public function test_concurrency_maintenance_folds_a_minute_exactly(): void
+    {
+        $minute = (intdiv(time(), 60) - 10) * 60;
+
+        // A [+0s,10s], B [+2s,12s], C [+4s,6s] — peak 3 in flight, all inside
+        // one minute. Drained in COMPLETION order (C finishes first).
+        $records = [];
+        foreach ([[4, 2_000_000], [0, 10_000_000], [2, 10_000_000]] as $i => [$offset, $dur]) {
+            $records[] = $this->sim->makeRequest([
+                'trace_id' => "conc-{$i}",
+                'timestamp' => (float) ($minute + $offset),
+                'duration' => $dur,
+            ]);
+        }
+        $this->writer->write($records);
+        $this->writer->maintainConcurrencyRollup(time());
+
+        $row = self::$pdo->query(
+            "SELECT * FROM nightowl_request_concurrency_rollups WHERE bucket_start = to_timestamp({$minute}) AT TIME ZONE 'UTC'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertNotFalse($row, 'concurrency bucket row must exist');
+        $this->assertSame(0, (int) $row['delta_sum'], 'all requests start AND end in the minute');
+        $this->assertSame(3, (int) $row['max_prefix'], 'three requests overlapped');
+    }
+
+    public function test_concurrency_is_exact_across_completion_ordered_batches(): void
+    {
+        // THE regression test for the incremental fold's fatal flaw: a short
+        // request COMPLETES (and therefore drains) before a longer one that
+        // STARTED earlier. An append combine loses their overlap entirely —
+        // the exact recompute must not.
+        $minute = (intdiv(time(), 60) - 10) * 60;
+
+        // Batch 1: short request [+40s, 5s] — completes first, drains first.
+        $this->writer->write([$this->sim->makeRequest([
+            'trace_id' => 'conc-short',
+            'timestamp' => (float) ($minute + 40),
+            'duration' => 5_000_000,
+        ])]);
+
+        // Batch 2: the spanning request [+30s, 90s] — started EARLIER,
+        // completed later, drains later.
+        $this->writer->write([$this->sim->makeRequest([
+            'trace_id' => 'conc-span',
+            'timestamp' => (float) ($minute + 30),
+            'duration' => 90_000_000,
+        ])]);
+
+        $this->writer->maintainConcurrencyRollup(time());
+
+        $rows = self::$pdo->query(
+            "SELECT EXTRACT(EPOCH FROM bucket_start)::bigint AS epoch, delta_sum, max_prefix
+             FROM nightowl_request_concurrency_rollups
+             WHERE bucket_start >= to_timestamp({$minute}) AT TIME ZONE 'UTC'
+             ORDER BY bucket_start"
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $byEpoch = [];
+        foreach ($rows as $r) {
+            $byEpoch[(int) $r['epoch']] = $r;
+        }
+
+        // First minute: +1(span@30) +1(short@40) -1(short@45) → delta +1,
+        // and BOTH were in flight at t+40 → max_prefix 2. The old incremental
+        // fold reported 1 here — the overlap crossed a batch boundary.
+        $this->assertSame(1, (int) $byEpoch[$minute]['delta_sum']);
+        $this->assertSame(2, (int) $byEpoch[$minute]['max_prefix'], 'overlap across drain batches must be counted');
+
+        // Middle minute: the spanner runs straight through — no events, no row.
+        $this->assertArrayNotHasKey($minute + 60, $byEpoch, 'eventless buckets get no row');
+
+        // Third minute: the spanner ends (+30s + 90s = +120s).
+        $this->assertSame(-1, (int) $byEpoch[$minute + 120]['delta_sum']);
+        $this->assertSame(0, (int) $byEpoch[$minute + 120]['max_prefix']);
+    }
+
+    public function test_concurrency_maintenance_skips_unusable_records(): void
+    {
+        $minute = (intdiv(time(), 60) - 10) * 60;
+
+        $this->writer->write([
+            // No duration — can never emit a matched -1.
+            $this->sim->makeRequest(['trace_id' => 'conc-nodur', 'timestamp' => (float) $minute, 'duration' => null]),
+            // Garbage timestamp — the recompute's regex guard drops it.
+            $this->sim->makeRequest(['trace_id' => 'conc-badts', 'timestamp' => 'not-a-number', 'duration' => 1000]),
+            // Garbage duration whose end lands beyond the plausible-future
+            // ceiling — dropped WHOLE, or its +1 would be a permanent phantom.
+            $this->sim->makeRequest(['trace_id' => 'conc-badend', 'timestamp' => (float) ($minute + 2), 'duration' => 9_000_000_000_000_000]),
+            // One good record so the bucket exists at all.
+            $this->sim->makeRequest(['trace_id' => 'conc-good', 'timestamp' => (float) ($minute + 1), 'duration' => 1_000_000]),
+        ]);
+        $this->writer->maintainConcurrencyRollup(time());
+
+        $row = self::$pdo->query(
+            "SELECT * FROM nightowl_request_concurrency_rollups WHERE bucket_start = to_timestamp({$minute}) AT TIME ZONE 'UTC'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(0, (int) $row['delta_sum'], 'only the good record contributes (+1 -1)');
+        $this->assertSame(1, (int) $row['max_prefix'], 'exactly one request in flight');
+    }
+
+    // Backfill/live fold equivalence lives in ConcurrencyBackfillTest — it
+    // needs the mini-app command harness this raw-PDO class doesn't carry.
+
+    // ─── Cache key templating (rollup groups by SHAPE) ─────
+
+    public function test_cache_rollup_groups_by_templated_key(): void
+    {
+        $records = [];
+        foreach ([8213, 44, 907] as $i => $id) {
+            $records[] = $this->sim->makeCacheEvent([
+                'trace_id' => "tmpl-{$i}",
+                'key' => "user:{$id}:profile",
+                'store' => 'redis',
+                'type' => 'hit',
+            ]);
+        }
+        // One static key that must pass through literally.
+        $records[] = $this->sim->makeCacheEvent([
+            'trace_id' => 'tmpl-static',
+            'key' => 'spatie.permission.cache',
+            'store' => 'redis',
+            'type' => 'hit',
+        ]);
+
+        $this->writer->write($records);
+
+        // Raw rows keep the LITERAL key and carry the pattern alongside.
+        $raw = self::$pdo->query(
+            "SELECT key, key_pattern FROM nightowl_cache_events WHERE trace_id = 'tmpl-0'"
+        )->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame('user:8213:profile', $raw['key'], 'raw keeps the literal key');
+        $this->assertSame('user:{int}:profile', $raw['key_pattern']);
+
+        // The rollup collapses the family to ONE group keyed by the pattern.
+        $rollup = self::$pdo->query(
+            "SELECT key, SUM(call_count) AS calls FROM nightowl_cache_rollups GROUP BY key ORDER BY key"
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $byKey = array_column($rollup, 'calls', 'key');
+
+        $this->assertSame(3, (int) $byKey['user:{int}:profile'], 'three ids, one pattern group');
+        $this->assertSame(1, (int) $byKey['spatie.permission.cache'], 'static key groups literally');
+        $this->assertArrayNotHasKey('user:8213:profile', $byKey, 'literal ids must not appear as rollup groups');
+    }
+
     // ─── Per-user rollups (powers the users list) ──────────
 
     /** @return array<string, array<string, string>> rollup rows indexed by user_id */
@@ -1603,8 +1756,10 @@ class RecordWriterTest extends TestCase
             $mk('cr-7', 'write_fail', 0), $mk('cr-8', 'delete_fail', 0),
         ]);
 
+        // The rollup groups by the TEMPLATED key (users:1 → users:{int}) —
+        // raw keeps the literal, the rollup keys on shape.
         $row = self::$pdo->query(
-            "SELECT * FROM nightowl_cache_rollups WHERE \"key\" = 'users:1' AND store = 'redis'"
+            "SELECT * FROM nightowl_cache_rollups WHERE \"key\" = 'users:{int}' AND store = 'redis'"
         )->fetch(PDO::FETCH_ASSOC);
 
         $this->assertSame(8, (int) $row['call_count']);
@@ -1634,8 +1789,13 @@ class RecordWriterTest extends TestCase
         }
         $this->writer->write($records);
 
+        // Grouping by COALESCE(key_pattern, key, '') — the spec's SQL group
+        // form — makes this a live dual-form equivalence check: the rollup was
+        // written by the PHP fold (_key_pattern), the re-aggregation uses the
+        // SQL expression over the same raw rows. They must agree exactly, or
+        // backfill would silently re-key what the drain wrote.
         $raw = self::$pdo->query(
-            "SELECT COALESCE(\"key\", '') AS k, COALESCE(store, '') AS s, COUNT(*) AS c,
+            "SELECT COALESCE(key_pattern, \"key\", '') AS k, COALESCE(store, '') AS s, COUNT(*) AS c,
                     SUM(CASE WHEN event_type = 'hit' THEN 1 ELSE 0 END) AS h,
                     SUM(CASE WHEN event_type IN ('write_fail', 'set_fail', 'put_fail', 'fail') THEN 1 ELSE 0 END) AS wf,
                     COALESCE(SUM(duration), 0) AS sd
@@ -2639,13 +2799,16 @@ class RecordWriterTest extends TestCase
             'nightowl_exception_server_rollups',
             'nightowl_mail_rollups', 'nightowl_notification_rollups',
             'nightowl_command_rollups', 'nightowl_scheduled_task_rollups',
+            // Bespoke, not in RollupSpecs::all(), and deliberately tier-less
+            // (migration 000063) — the tier expansion below must skip it.
+            'nightowl_request_concurrency_rollups',
         ];
 
         foreach ($tables as $table) {
             self::$pdo->exec("TRUNCATE TABLE {$table} CASCADE");
 
             // Hour/day tier siblings of every rollup table (migration 000054).
-            if (str_ends_with($table, '_rollups')) {
+            if (str_ends_with($table, '_rollups') && $table !== 'nightowl_request_concurrency_rollups') {
                 foreach (\NightOwl\Support\RollupTiers::tierTables($table) as $tierTable) {
                     self::$pdo->exec("TRUNCATE TABLE {$tierTable} CASCADE");
                 }

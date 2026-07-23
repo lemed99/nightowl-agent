@@ -82,6 +82,9 @@ class ClearCommand extends Command
         return array_values(array_unique([
             ...self::RAW_TABLES,
             ...array_keys($rollups),
+            // Bespoke rollup outside RollupSpecs::all() — hand-listed, like
+            // its PruneCommand twin.
+            'nightowl_request_concurrency_rollups',
         ]));
     }
 }

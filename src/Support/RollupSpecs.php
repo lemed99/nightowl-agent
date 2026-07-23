@@ -157,7 +157,18 @@ final class RollupSpecs
             table: 'nightowl_cache_rollups',
             source: 'nightowl_cache_events',
             groupColumns: [
-                'key' => ['php' => static fn (array $r): string => (string) ($r['key'] ?? ''), 'sql' => "COALESCE(key, '')"],
+                // Grouped by the TEMPLATED key (CacheKeyTemplate — uuid/hex/
+                // int/email/datetime segments collapsed to placeholders), which
+                // bounds cardinality for machine-generated key families. The
+                // pattern is computed once in writeCacheEvents (PHP), stashed
+                // as _key_pattern AND stored in the raw key_pattern column —
+                // the SQL form only READS what PHP wrote, so the two forms
+                // agree by construction. Fallbacks keep every legacy state
+                // coherent: rows without _key_pattern (templating off, or a
+                // pre-000065 tenant) group by the literal key on the PHP side
+                // and COALESCE onto the literal key on the SQL side — exactly
+                // what each of those rows' drain wrote at the time.
+                'key' => ['php' => static fn (array $r): string => (string) ($r['_key_pattern'] ?? $r['key'] ?? ''), 'sql' => "COALESCE(key_pattern, key, '')"],
                 'store' => ['php' => static fn (array $r): string => (string) ($r['store'] ?? ''), 'sql' => "COALESCE(store, '')"],
             ],
             counters: [

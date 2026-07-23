@@ -6,6 +6,7 @@ use Carbon\Carbon;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use NightOwl\Support\QueryHistogram;
+use NightOwl\Support\ConcurrencyRollup;
 use NightOwl\Support\RollupSpec;
 use NightOwl\Support\RollupSpecs;
 use NightOwl\Support\RollupTiers;
@@ -41,7 +42,11 @@ class BackfillRollupsCommand extends Command
             fn (RollupSpec $spec): bool => $only === null || $spec->table === $only,
         );
 
-        if (empty($specs)) {
+        // The concurrency rollup is bespoke (its ordered-fold combine isn't
+        // expressible as a RollupSpec), so it rides outside the spec loop.
+        $includeConcurrency = $only === null || $only === 'nightowl_request_concurrency_rollups';
+
+        if (empty($specs) && ! $includeConcurrency) {
             $this->error($only ? "Unknown rollup table: {$only}" : 'No rollup specs registered.');
 
             return self::FAILURE;
@@ -76,6 +81,15 @@ class BackfillRollupsCommand extends Command
             } catch (\Throwable $e) {
                 $failed[$spec->table] = $e;
                 $this->error("  {$spec->table}: FAILED — {$e->getMessage()}");
+            }
+        }
+
+        if ($includeConcurrency && ! $this->option('tiers-only') && $schema->hasTable('nightowl_request_concurrency_rollups')) {
+            try {
+                $this->backfillConcurrency($conn, $chunkDays);
+            } catch (\Throwable $e) {
+                $failed['nightowl_request_concurrency_rollups'] = $e;
+                $this->error('  nightowl_request_concurrency_rollups: FAILED — '.$e->getMessage());
             }
         }
 
@@ -409,5 +423,90 @@ class BackfillRollupsCommand extends Command
                 ->where('bucket_start', '<', $end)
                 ->count();
         });
+    }
+
+    /**
+     * Bespoke raw→minute backfill for nightowl_request_concurrency_rollups —
+     * the (delta_sum, max_prefix) fold of the in-flight running count (see
+     * RecordWriter::writeConcurrencyRollup for the full contract).
+     *
+     * Unlike the live drain's batch-append approximation, this recompute is
+     * EXACT per bucket: the window function orders the chunk's full event
+     * stream, so max_prefix is the true within-bucket fold. Selection is by
+     * created_at (indexed, partition-pruned) widened by a 900s margin, then
+     * bucketed on EVENT time — same shape and margin as the API's raw sweep,
+     * so a request longer than the margin can drop its -1 exactly as it
+     * escapes the read path today.
+     *
+     * Same lock protocol as backfillChunk: EXCLUSIVE advisory lock on the same
+     * key the drain's shared lock uses, DELETE-then-recompute per chunk, so it
+     * commutes with a live drain.
+     */
+    private function backfillConcurrency($conn, int $chunkDays): void
+    {
+        $table = 'nightowl_request_concurrency_rollups';
+        $safetyCeiling = now()->subSeconds(self::SAFETY_MARGIN_SECONDS);
+
+        $until = $this->option('until') ? Carbon::parse($this->option('until')) : $safetyCeiling->copy();
+        if ($until->greaterThan($safetyCeiling)) {
+            $until = $safetyCeiling->copy();
+        }
+
+        $sinceOption = $this->option('since') ?: $conn->table('nightowl_requests')->min('created_at');
+        if ($sinceOption === null) {
+            $this->line("  {$table}: no source rows.");
+
+            return;
+        }
+        $since = Carbon::parse($sinceOption);
+
+        if ($since->greaterThanOrEqualTo($until)) {
+            $this->line("  {$table}: nothing to backfill.");
+
+            return;
+        }
+
+        $this->info("Backfilling {$table} from {$since->toDateTimeString()} to {$until->toDateTimeString()}...");
+
+        $margin = ConcurrencyRollup::SCAN_MARGIN_SECONDS;
+
+        $cursor = $since->copy();
+        while ($cursor->lessThan($until)) {
+            $chunkEnd = $cursor->copy()->addDays($chunkDays);
+            if ($chunkEnd->greaterThan($until)) {
+                $chunkEnd = $until->copy();
+            }
+
+            $scanFrom = $cursor->copy()->subSeconds($margin)->toDateTimeString();
+            $scanTo = $chunkEnd->copy()->addSeconds($margin)->toDateTimeString();
+            $bucketLowEpoch = intdiv($cursor->timestamp, 60) * 60;
+            $bucketHighEpoch = $chunkEnd->timestamp;
+
+            $conn->transaction(function () use ($conn, $table, $scanFrom, $scanTo, $bucketLowEpoch, $bucketHighEpoch): void {
+                $conn->statement('SELECT pg_advisory_xact_lock(hashtext(?))', ['nightowl_rollup:'.$table]);
+
+                $conn->table($table)
+                    ->where('bucket_start', '>=', gmdate('Y-m-d H:i:s', $bucketLowEpoch))
+                    ->where('bucket_start', '<', gmdate('Y-m-d H:i:s', $bucketHighEpoch))
+                    ->delete();
+
+                // The ONE shared recompute (ConcurrencyRollup) — identical SQL
+                // to the drain's cleanup-tick maintenance, so backfilled and
+                // live buckets can never diverge.
+                $q = ConcurrencyRollup::recompute(
+                    $scanFrom,
+                    $scanTo,
+                    now()->getTimestamp() + ConcurrencyRollup::END_CEIL_FUTURE_SECONDS,
+                    $bucketLowEpoch,
+                    $bucketHighEpoch,
+                );
+                $conn->statement($q['sql'], $q['bindings']);
+            });
+
+            $cursor = $chunkEnd;
+            usleep(50_000);
+        }
+
+        $this->line("  {$table}: backfilled.");
     }
 }

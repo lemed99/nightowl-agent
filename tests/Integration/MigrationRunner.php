@@ -39,11 +39,17 @@ final class MigrationRunner
         // with its own static state. Probe the NEWEST migration's observable
         // effect — probing an early artifact would skip every migration added
         // since the test DB was first provisioned. Update this probe whenever
-        // a migration is added (currently 000062's sketch sample counter).
+        // a migration is added (currently 000063 concurrency rollup, 000064
+        // mail/notification composites, 000065 cache key_pattern).
         if (Schema::connection('nightowl')->hasTable('nightowl_request_hourly_rollups')
             && Schema::connection('nightowl')->hasColumn('nightowl_query_rollups', 'sketch')
             && Schema::connection('nightowl')->hasTable('nightowl_logs_pdefault')
             && Schema::connection('nightowl')->hasColumn('nightowl_mail_rollups', 'duration_count')
+            && Schema::connection('nightowl')->hasTable('nightowl_request_concurrency_rollups')
+            && Schema::connection('nightowl')->hasColumn('nightowl_cache_events', 'key_pattern')
+            && Schema::connection('nightowl')->getConnection()->selectOne(
+                "SELECT to_regclass('nightowl_mail_group_hash_created_at_idx') IS NOT NULL AS present"
+            )->present
             && Schema::connection('nightowl')->getConnection()->selectOne(
                 "SELECT to_regprocedure('nightowl_ddsketch_count(bytea)') IS NOT NULL AS present"
             )->present) {

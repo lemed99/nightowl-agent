@@ -2,6 +2,8 @@
 
 namespace NightOwl\Agent;
 
+use NightOwl\Support\CacheKeyTemplate;
+use NightOwl\Support\ConcurrencyRollup;
 use NightOwl\Support\DDSketchHistogram;
 use NightOwl\Support\QueryHistogram;
 use NightOwl\Support\RawPartitions;
@@ -140,6 +142,7 @@ final class RecordWriter
         private int $lockTimeoutMs = 10000,
         private ?DrainHeartbeat $heartbeat = null,
         private int $idleTxnTimeoutMs = 30000,
+        private bool $cacheKeyTemplateEnabled = true,
     ) {
         $this->notifier = $notifier ?? new AlertNotifier;
     }
@@ -344,6 +347,7 @@ final class RecordWriter
             (int) config('nightowl.drain_connection.keepalives_interval', 5),
             (int) config('nightowl.drain_connection.keepalives_count', 3),
             (int) config('nightowl.drain_connection.lock_timeout_ms', 10000),
+            cacheKeyTemplateEnabled: (bool) config('nightowl.cache_key_template', true),
         );
     }
 
@@ -1122,6 +1126,7 @@ final class RecordWriter
         $this->checkRouteThresholds($records);
     }
 
+
     private function writeQueries(array $records): void
     {
         // created_at and the rollup bucket come from each event's OWN timestamp
@@ -1334,6 +1339,81 @@ final class RecordWriter
      * checkpoint. healConversionLeftovers never throws by contract and unwinds
      * its own transactions, so the only thing left to catch is the connection.
      */
+    /**
+     * Cleanup-tick maintenance of nightowl_request_concurrency_rollups: an
+     * EXACT recompute of the trailing REBUILD_WINDOW from raw, replacing any
+     * per-batch incremental fold — which was measured ~70% low on max_prefix,
+     * because drain batches arrive COMPLETION-ordered and the append combine
+     * is only exact for event-time-ordered input (see ConcurrencyRollup's
+     * docblock). Every row this table ever holds comes from the shared
+     * window-function SQL, so live and backfilled buckets are the same fold.
+     *
+     * Bounds and their honest limits:
+     *  - Trailing window (20 min) recomputed every ~60s tick: a bucket's
+     *    numbers converge as late completions land, and are final once the
+     *    window slides past. A request COMPLETING more than the window after
+     *    its own start escapes — the same order of margin as every event-time
+     *    read here (SCAN_MARGIN).
+     *  - A worker outage longer than the window leaves an interior gap the
+     *    resumed tick does not reach back to; the next nightowl:migrate
+     *    reconciliation or manual backfill closes it. The API's coverage gate
+     *    checks ends, not interiors — a gap window reads as flat carried
+     *    occupancy until then.
+     *  - try-lock, not blocking: with multiple drain workers only one runs
+     *    the recompute per tick, and a concurrent backfill (exclusive holder
+     *    of the same 'nightowl_rollup:' key) makes this tick a no-op.
+     *
+     * Never throws — the cleanup tick is one shared try, and this must not
+     * cost a tick its WAL checkpoint.
+     */
+    public function maintainConcurrencyRollup(int $nowTs): void
+    {
+        if (! $this->rollupEnabled(ConcurrencyRollup::TABLE)) {
+            return;
+        }
+
+        try {
+            $pdo = $this->pdo();
+            $pdo->beginTransaction();
+
+            $locked = $pdo->query(
+                "SELECT pg_try_advisory_xact_lock(hashtext('nightowl_rollup:".ConcurrencyRollup::TABLE."'))"
+            )->fetchColumn();
+            if (! $locked) {
+                $pdo->rollBack();
+
+                return;
+            }
+
+            $bucketLow = intdiv($nowTs - self::CONCURRENCY_REBUILD_WINDOW_SECONDS, 60) * 60;
+            $bucketHigh = (intdiv($nowTs, 60) + 1) * 60; // include the current partial minute
+
+            $del = $pdo->prepare('DELETE FROM '.ConcurrencyRollup::TABLE.' WHERE bucket_start >= ? AND bucket_start < ?');
+            $del->execute([gmdate('Y-m-d H:i:s', $bucketLow), gmdate('Y-m-d H:i:s', $bucketHigh)]);
+
+            $q = ConcurrencyRollup::recompute(
+                gmdate('Y-m-d H:i:s', $bucketLow - ConcurrencyRollup::SCAN_MARGIN_SECONDS),
+                gmdate('Y-m-d H:i:s', $bucketHigh + ConcurrencyRollup::SCAN_MARGIN_SECONDS),
+                $nowTs + ConcurrencyRollup::END_CEIL_FUTURE_SECONDS,
+                $bucketLow,
+                $bucketHigh,
+            );
+            $pdo->prepare($q['sql'])->execute($q['bindings']);
+
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            try {
+                $this->pdo()->rollBack();
+            } catch (\Throwable) {
+                // connection died mid-rollback — reconnect happens lazily
+            }
+            error_log('[NightOwl Drain] concurrency rollup maintenance failed (retried next tick): '.$e->getMessage());
+        }
+    }
+
+    /** Trailing window the cleanup tick recomputes exactly. */
+    private const CONCURRENCY_REBUILD_WINDOW_SECONDS = 1200;
+
     public function healRawPartitionLeftovers(): void
     {
         try {
@@ -1724,6 +1804,9 @@ final class RecordWriter
 
     /** @var array<string, bool> per-table: does it carry the duration_count counter (000061 applied)? */
     private array $durationCountChecked = [];
+
+    /** @see keyPatternColumnEnabled() */
+    private ?bool $keyPatternChecked = null;
 
     /**
      * Whether $table carries the duration_count column (migration 000061).
@@ -2432,22 +2515,40 @@ final class RecordWriter
     {
         $nowTs = time();
 
+        // Key templating (CacheKeyTemplate): computed ONCE here at ingest,
+        // stored on the raw row (key_pattern) AND stashed on the in-flight
+        // record (_key_pattern) for the rollup group. The rollup spec's SQL
+        // form reads the stored column (COALESCE(key_pattern, key, '')), so
+        // the PHP and SQL group forms agree BY CONSTRUCTION — no regex ever
+        // crosses the PCRE/POSIX boundary. Column-gated like duration_count:
+        // a pre-000065 tenant keeps the pre-templating shape on both paths.
+        $withPattern = $this->cacheKeyTemplateEnabled && $this->keyPatternColumnEnabled();
+
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
             'event_type', 'key', 'store', 'ttl', 'duration', 'created_at',
         ];
+        if ($withPattern) {
+            $columns[] = 'key_pattern';
+        }
 
         $rows = [];
-        foreach ($records as $r) {
-            $rows[] = [
+        foreach ($records as &$r) {
+            $row = [
                 $r['v'] ?? null,
                 $r['trace_id'] ?? null, $r['timestamp'] ?? null, $r['deploy'] ?? null, $this->environment, $r['server'] ?? null, $r['_group'] ?? null,
                 $r['execution_source'] ?? null, $r['execution_id'] ?? null, $r['execution_stage'] ?? null, $r['execution_preview'] ?? null, $r['user'] ?? null,
                 $r['type'] ?? 'unknown', $r['key'] ?? '', $r['store'] ?? null, $r['ttl'] ?? null, $r['duration'] ?? null,
                 $this->eventCreatedAt($r, $nowTs),
             ];
+            if ($withPattern) {
+                $r['_key_pattern'] = CacheKeyTemplate::template((string) ($r['key'] ?? ''));
+                $row[] = $r['_key_pattern'];
+            }
+            $rows[] = $row;
         }
+        unset($r);
 
         $this->copyBatch('nightowl_cache_events', $columns, $rows);
 
@@ -2456,6 +2557,31 @@ final class RecordWriter
         }
 
         $this->checkThresholds('cache', $records, 'store');
+    }
+
+    /**
+     * Whether nightowl_cache_events carries the key_pattern column (migration
+     * 000065). Same probe discipline as durationCountEnabled: cache a positive
+     * or negative verdict, but never cache a FAILED probe — omitting the
+     * column for one call is always safe, downgrading the tenant for the
+     * process's life is not.
+     */
+    private function keyPatternColumnEnabled(): bool
+    {
+        if ($this->keyPatternChecked !== null) {
+            return $this->keyPatternChecked;
+        }
+
+        try {
+            $stmt = $this->pdo()->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'nightowl_cache_events' AND column_name = 'key_pattern'"
+            );
+            $stmt->execute();
+
+            return $this->keyPatternChecked = (int) $stmt->fetchColumn() > 0;
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     private function writeMail(array $records): void

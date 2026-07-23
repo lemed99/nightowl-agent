@@ -185,6 +185,16 @@ class MigrateCommand extends Command
             }
         }
 
+        // The bespoke concurrency rollup sits outside RollupSpecs::all() and
+        // would otherwise be created by 000063 and never populated — the API's
+        // coverage gate then keeps peak reads on the clamped raw path for up
+        // to raw retention after upgrade. Same incompleteness rule as the spec
+        // bases: empty, or its floor younger than raw history.
+        if ($schema->hasTable('nightowl_request_concurrency_rollups')
+            && $this->concurrencyIsIncomplete($conn)) {
+            $basesNeedingFull[] = 'nightowl_request_concurrency_rollups';
+        }
+
         $plan = self::backfillPlan($basesNeedingFull, $basesOk, $incompleteTiers);
 
         if ($plan['full'] !== []) {
@@ -229,6 +239,23 @@ class MigrateCommand extends Command
      * trigger: a fresh install starts both at the same instant, and raw
      * pruning (14d) moves the raw floor ABOVE the rollup's (90d) floor.
      */
+    /** The concurrency-rollup twin of baseIsIncomplete (bespoke, no spec). */
+    private function concurrencyIsIncomplete($conn): bool
+    {
+        $rollupMin = $conn->table('nightowl_request_concurrency_rollups')->min('bucket_start');
+        if ($rollupMin === null) {
+            return true;
+        }
+
+        $rawMin = $conn->table('nightowl_requests')->min('created_at');
+        if ($rawMin === null) {
+            return false;
+        }
+
+        return \Carbon\Carbon::parse($rawMin)->startOfMinute()
+            ->lessThan(\Carbon\Carbon::parse($rollupMin));
+    }
+
     private function baseIsIncomplete($conn, \NightOwl\Support\RollupSpec $spec): bool
     {
         $rollupMin = $conn->table($spec->table)->min('bucket_start');

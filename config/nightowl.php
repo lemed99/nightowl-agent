@@ -45,6 +45,82 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Auto-Migrate at Daemon Startup
+    |--------------------------------------------------------------------------
+    |
+    | When the agent daemon starts and the nightowl schema is behind the
+    | package's migrations, run `nightowl:migrate` automatically (schema part
+    | synchronously before ingest starts; rollup backfill reconciliation in a
+    | detached background process), so `composer update nightowl/agent` plus
+    | your usual restart is the whole upgrade — no separate migrate step.
+    |
+    | Set false when the agent's DB role lacks DDL rights — the agent then
+    | warns (pre-existing behavior) and you run nightowl:migrate yourself.
+    | Ignored under NIGHTOWL_RUN_MIGRATIONS=true (the host app's migrate owns
+    | the schema there). Failures never block startup: warn-and-continue, and
+    | the schema run is bounded by auto_migrate_timeout — it executes in a
+    | child process that is killed at the deadline (a lock wait on the tenant
+    | DB must never keep the ingest port unbound), leaving the migrations
+    | pending for the next boot to retry.
+    |
+    */
+    'auto_migrate' => (bool) env('NIGHTOWL_AUTO_MIGRATE', true),
+    // TOP-LEVEL on purpose (shallow-merge rule — see 'drain_connection').
+    'auto_migrate_timeout' => (int) env('NIGHTOWL_AUTO_MIGRATE_TIMEOUT', 300),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Cache Key Templating
+    |--------------------------------------------------------------------------
+    |
+    | Group the cache rollup by key SHAPE instead of key instance: uuid/ulid/
+    | hex/int/email/datetime segments collapse to placeholders at drain time
+    | (`user:8213:profile` → `user:{int}:profile`), bounding the rollup's
+    | cardinality for machine-generated key families. The rule is hardcoded
+    | (NightOwl\Support\CacheKeyTemplate) — this is a kill switch for a tenant
+    | the rule hurts, not a pattern DSL.
+    |
+    | Off, NEW keys group literally — but rollup rows written while it was ON
+    | keep their pattern grouping (history is never rewritten), so a key's
+    | history spans two groups across the flip, converging as the patterned
+    | rows age out of rollup retention. Raw cache events always keep the
+    | literal key either way. TOP-LEVEL key (shallow-merge rule).
+    |
+    */
+    'cache_key_template' => (bool) env('NIGHTOWL_CACHE_KEY_TEMPLATE', true),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Update Check (warn only)
+    |--------------------------------------------------------------------------
+    |
+    | Deliberately a TOP-LEVEL key (see 'drain_connection' below for why new
+    | groups never nest under 'database').
+    |
+    | A running daemon can never pick up a `composer update` on its own: the
+    | loaded code and Composer's version metadata are frozen in-process. Worse,
+    | drain workers respawn as fresh interpreters, so after an update a
+    | respawned worker runs NEW code under an OLD parent — a combination
+    | nothing tests. The daemon polls vendor/composer/installed.php and logs a
+    | warning once it sees a newer version on disk (confirmed on two
+    | consecutive polls, so a half-written vendor tree never triggers it).
+    |
+    | It only WARNS. Restarting the agent is your call, made by whatever
+    | already restarts your processes — the agent deliberately does not exit on
+    | its own, because whether a supervisor would bring it back depends on
+    | configuration the agent cannot verify, and being wrong about that leaves
+    | the agent down instead of merely stale.
+    |
+    | Async driver only (the sync fallback has no event loop to poll on).
+    |
+    */
+    'update_check' => [
+        'enabled' => (bool) env('NIGHTOWL_UPDATE_CHECK', true),
+        'poll_seconds' => (int) env('NIGHTOWL_UPDATE_CHECK_POLL_SECONDS', 300),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Database
     |--------------------------------------------------------------------------
     |
