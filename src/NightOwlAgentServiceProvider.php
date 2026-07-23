@@ -150,7 +150,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
             if (config('nightowl.parallel_with_nightwatch', false)) {
                 $core->ingest = new MultiIngest($core->ingest, $nightowlIngest);
             } else {
-                $core->ingest = $nightowlIngest;
+                $core->ingest = new MultiIngest($nightowlIngest);
             }
         });
 
