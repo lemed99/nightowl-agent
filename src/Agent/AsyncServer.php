@@ -85,6 +85,10 @@ final class AsyncServer
         // named, and several harnesses pass drainSpawner positionally, so inserting
         // earlier would silently shift arguments with no type error.
         float $drainWedgeSeconds = 180.0,
+        // Update-drift watcher (warn-only; see VersionDriftWatcher). null =
+        // feature off — the default keeps every existing harness/test
+        // byte-identical in behavior. Appended LAST (see above).
+        private ?VersionDriftWatcher $driftWatcher = null,
     ) {
         $this->expectedTokenHash = $token !== null
             ? substr(hash('xxh128', $token), 0, 7)
@@ -264,6 +268,23 @@ final class AsyncServer
                 }
             }
         });
+
+        // Update-drift watcher: say so in the log when composer update has put
+        // a newer agent on disk while this process keeps running the old one.
+        // Warn only — restarting is the operator's call (see the class
+        // docblock for why the agent does not make it).
+        if ($this->driftWatcher !== null) {
+            $this->loop->addPeriodicTimer($this->driftWatcher->pollSeconds(), function () {
+                if ($this->shuttingDown) {
+                    return;
+                }
+
+                $warning = $this->driftWatcher->check();
+                if ($warning !== null) {
+                    error_log("[NightOwl Agent] Update available: {$warning}");
+                }
+            });
+        }
 
         // Restart drain workers if they die unexpectedly
         $this->loop->addSignal(SIGCHLD, function () {

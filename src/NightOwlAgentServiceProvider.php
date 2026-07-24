@@ -12,6 +12,7 @@ use NightOwl\Agent\ConnectionHandler;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
 use NightOwl\Agent\RecordWriter;
+use NightOwl\Agent\VersionDriftWatcher;
 use NightOwl\Agent\Server;
 use NightOwl\Commands\AgentCommand;
 use NightOwl\Commands\BackfillRollupsCommand;
@@ -22,6 +23,7 @@ use NightOwl\Commands\InstallCommand;
 use NightOwl\Commands\MigrateCommand;
 use NightOwl\Commands\PartitionCommand;
 use NightOwl\Commands\PruneCommand;
+use NightOwl\Support\InstalledVersionReader;
 use NightOwl\Support\MultiIngest;
 
 class NightOwlAgentServiceProvider extends ServiceProvider
@@ -174,8 +176,32 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 (string) config('nightowl.database.database', 'nightowl'),
                 drainSpawner: $this->makeDrainSpawner($app),
                 drainWedgeSeconds: (float) config('nightowl.drain_connection.wedge_warn_seconds', 180),
+                driftWatcher: $this->makeDriftWatcher(),
             );
         });
+    }
+
+    /**
+     * Build the update-drift watcher, or null when disabled.
+     *
+     * Returns null when installed.php can't be located (odd bundler setups):
+     * with no baseline to compare against there is nothing to warn about.
+     */
+    protected function makeDriftWatcher(): ?VersionDriftWatcher
+    {
+        if (! config('nightowl.update_check.enabled', true)) {
+            return null;
+        }
+
+        $path = InstalledVersionReader::defaultPath();
+        if ($path === null) {
+            return null; // silent: not locating installed.php is not an error worth a log line every boot
+        }
+
+        return new VersionDriftWatcher(
+            new InstalledVersionReader($path),
+            (float) config('nightowl.update_check.poll_seconds', 300),
+        );
     }
 
     public function boot(): void

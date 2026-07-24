@@ -5,6 +5,58 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [1.5.0] - 2026-07-20
+
+### Added
+
+- **Boot-migrate: the daemon applies pending migrations at startup.** In the
+  default (DB-history) model the schema is applied by `php artisan
+  nightowl:migrate`, which is not wired into the host app's `php artisan
+  migrate` — so the step was easy to forget after a `composer update`, and a
+  behind schema means failed writes. Now, when the agent starts and its
+  nightowl-DB history is behind, it runs the migrations itself before ingest
+  begins (both drivers), so schema changes arrive with the code that needs
+  them.
+  - The schema half runs **synchronously, before the ingest port binds** — drain
+    children cache rollup-table existence per process, so they must fork after
+    the tables exist. It executes in a **child process under a hard deadline**
+    (`NIGHTOWL_AUTO_MIGRATE_TIMEOUT`, 300s) which the agent kills on expiry:
+    migration DDL can wait indefinitely on a lock, and that wait would sit in
+    front of the ingest port with clients dropping telemetry after their 0.5s
+    timeout. On timeout the agent starts on the old schema and the migrations
+    stay pending for the next boot.
+  - The **rollup backfill** half is detached to a background process (log:
+    `storage/logs/nightowl-boot-migrate.log`, truncated per run) so a backfill
+    measured in tens of minutes never delays ingest. It leaves a marker
+    (`storage/nightowl/backfill-pending`) removed only on success; if it dies
+    partway (OOM, statement timeout, database restart) a later boot re-spawns
+    it. Without that, a rollup table created empty would serve zeroed charts
+    indefinitely — the API read path prefers any rollup table that exists over
+    raw.
+  - Failure never blocks startup: warn-and-continue, matching the pre-1.5.0
+    behaviour. Opt out with `NIGHTOWL_AUTO_MIGRATE=false` (e.g. a DB role
+    without DDL rights); skipped under the legacy `NIGHTOWL_RUN_MIGRATIONS=true`
+    ride-along, where the host app's `php artisan migrate` owns the schema.
+- **Update-available warning.** A running daemon cannot pick up a `composer
+  update` on its own — the loaded code and Composer's version metadata are
+  frozen in-process, and drain workers respawn as fresh interpreters, so after
+  an update a respawned worker runs new code under an old parent. The agent
+  (async driver) now polls `vendor/composer/installed.php` every 5 minutes and
+  logs a warning once it sees a newer installed version than the one it is
+  running, confirmed on two consecutive polls so a half-written vendor tree
+  never triggers it. It warns once per version, not once per poll.
+
+  It **only warns** — the agent never exits on its own. Whether a supervisor
+  would restart it depends on configuration the agent cannot verify and gets no
+  feedback about; being wrong about that leaves you with no agent at all rather
+  than one running slightly stale code. Restarting stays your call. Opt out with
+  `NIGHTOWL_UPDATE_CHECK=false`.
+
+**Upgrade steps:** `composer update nightowl/agent`, then restart the agent.
+The `nightowl:migrate` step now happens on boot; running it in your deploy
+pipeline is still worthwhile, since a pipeline run does the rollup backfill
+where its latency is visible.
+
 ## [1.4.1] - 2026-07-20
 
 ### Fixed

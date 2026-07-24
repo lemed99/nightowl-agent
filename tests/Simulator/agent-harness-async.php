@@ -25,6 +25,8 @@ require_once __DIR__.'/../../vendor/autoload.php';
 use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\DrainWorker;
 use NightOwl\Agent\PayloadParser;
+use NightOwl\Agent\VersionDriftWatcher;
+use NightOwl\Support\InstalledVersionReader;
 use NightOwl\Tests\Integration\MigrationRunner;
 
 if (! function_exists('pcntl_fork') || ! function_exists('posix_kill')) {
@@ -32,7 +34,7 @@ if (! function_exists('pcntl_fork') || ! function_exists('posix_kill')) {
     exit(1);
 }
 
-$options = getopt('', ['token:', 'host:', 'port:', 'db-host:', 'db-port:', 'db-name:', 'db-user:', 'db-pass:', 'drain-workers:', 'threshold-cache-ttl:', 'max-pending-rows:', 'drain-interval:', 'checkpoint-interval:', 'checkpoint-truncate-bytes:', 'sqlite-path:']);
+$options = getopt('', ['token:', 'host:', 'port:', 'db-host:', 'db-port:', 'db-name:', 'db-user:', 'db-pass:', 'drain-workers:', 'threshold-cache-ttl:', 'max-pending-rows:', 'drain-interval:', 'checkpoint-interval:', 'checkpoint-truncate-bytes:', 'sqlite-path:', 'installed-php:', 'drift-poll:']);
 
 $token = $options['token'] ?? null;
 if (! $token) {
@@ -75,6 +77,16 @@ $drainIntervalMs = (int) ($options['drain-interval'] ?? 50);
 $checkpointInterval = (int) ($options['checkpoint-interval'] ?? 60);
 $checkpointTruncateBytes = (int) ($options['checkpoint-truncate-bytes'] ?? 100 * 1024 * 1024);
 
+// Update-drift watcher (warn-only) — only when --installed-php is given;
+// absent means null, i.e. zero behavior change for every existing test.
+$driftWatcher = null;
+if (isset($options['installed-php'])) {
+    $driftWatcher = new VersionDriftWatcher(
+        new InstalledVersionReader($options['installed-php']),
+        pollSeconds: (float) ($options['drift-poll'] ?? 300),
+    );
+}
+
 // Wire up the async server
 $server = new AsyncServer(
     parser: new PayloadParser(gzipEnabled: true),
@@ -99,6 +111,7 @@ $server = new AsyncServer(
     healthEnabled: false,
     healthReportEnabled: false,
     drainWorkerCount: $drainWorkers,
+    driftWatcher: $driftWatcher,
 );
 
 $tokenHash = substr(hash('xxh128', $token), 0, 7);

@@ -69,7 +69,8 @@ Laravel package installed in customer apps. Receives telemetry from `laravel/nig
 
 ```
 src/Agent/
-  AsyncServer.php        — Event loop, TCP/UDP, multi-fork, health, threshold polling (30s)
+  AsyncServer.php        — Event loop, TCP/UDP, multi-fork, health, threshold polling (30s), update-drift warn poll
+  VersionDriftWatcher.php — WARN-ONLY update check: logs once per version when installed.php shows a newer agent than the running process (2-tick debounce vs a half-written vendor tree). Never exits — restarting is the operator's call, because supervisor behaviour on a self-initiated exit is unverifiable from inside the agent
   DrainWorker.php        — Child process: batch drain (COPY), WAL checkpoint, IPC metrics, worker ID
   MetricsCollector.php   — Ring buffers, 19 diagnosis rules, lifecycle tracking, system metrics
   HealthReporter.php     — Adaptive HTTP reporting to dashboard, retry backoff, report_id
@@ -84,10 +85,11 @@ src/Agent/
   ConnectionHandler.php  — Sync payload handler
 src/Support/
   MultiIngest.php        — Nightwatch coexistence adapter (fan-out wrapper)
+  InstalledVersionReader.php — Fresh read of vendor/composer/installed.php via file_get_contents+regex (NEVER include/require: opcache validate_timestamps=0 serves a stale compile forever; never InstalledVersions: static-cached). Returns raw "pretty_version#reference" tuple; null on any failure
   QueryHistogram.php     — Frozen √2-spaced duration bin edges + bin assignment for rollups; MUST stay byte-identical to nightowl-api's App\Support\QueryHistogram (checksum-guarded both sides)
   RollupSpec.php / RollupSpecs.php — Declarative per-type rollup config (group cols, counters w/ PHP predicate + SQL condition, representatives, duration/histogram flags) driving RecordWriter::writeRollup + BackfillRollupsCommand. One spec each for queries/requests/jobs/outgoing/cache.
 src/Commands/
-  AgentCommand.php        — nightowl:agent [--driver=async|sync]; warns at startup if the nightowl-DB migration history is behind (MigrateCommand::isBehind), skipped under run_migrations ride-along
+  AgentCommand.php        — nightowl:agent [--driver=async|sync]; auto-migrates at startup when the nightowl-DB history is behind (schema sync via nightowl:migrate --no-backfill PRE-listen in a deadline-killed child process — NIGHTOWL_AUTO_MIGRATE_TIMEOUT — so drain children see new rollup tables and a tenant-DB lock can never hold the ingest port unbound; backfill reconciliation detached to background with a completion marker retried each boot; warn-and-continue on failure; warns only under NIGHTOWL_AUTO_MIGRATE=false; skipped under run_migrations ride-along)
   MigrateCommand.php      — nightowl:migrate: migrate --database=nightowl (history in nightowl DB) + baseline adoption; pure helpers migrationsToBaseline/pendingMigrations/isBehind
   InstallCommand.php      — nightowl:install
   PruneCommand.php        — nightowl:prune (retention cleanup; raw + separate longer rollup retention)
@@ -99,7 +101,7 @@ src/Commands/
 
 | Command | Purpose |
 |---------|---------|
-| `nightowl:agent [--driver=async\|sync]` | Start agent (TCP + UDP + Health API) |
+| `nightowl:agent [--driver=async\|sync]` | Start agent (TCP + UDP + Health API). Auto-migrates a behind schema at startup (see AgentCommand above) |
 | `nightowl:install` | Publish config, create/update schema (via `nightowl:migrate`), fork-safety probe |
 | `nightowl:migrate` | Idempotent schema sync — `migrate --database=nightowl` (history in the nightowl DB) + baseline adoption of an already-present schema. Run on each deploy. **Auto-backfills** any rollup table it leaves existing-but-empty (the API read path serves zeros off an empty rollup, so migrate populates it from raw immediately), and reconciles rollup completeness: a minute table missing raw history (min-vs-min) gets the full chain, a tier whose call_count sum falls short of its chain source (gaps, incl. mid-history holes) gets `nightowl:backfill-rollups --tiers-only` (minute→hour→day re-aggregation, no raw scan). Complete rollups are a cheap no-op per deploy (two MINs + one SUM per table). Skip with `--no-backfill`. |
 | `nightowl:prune` | Delete telemetry older than retention (14d default); query rollups pruned separately (90d default) |
@@ -184,6 +186,12 @@ NIGHTOWL_DRAIN_INTERVAL_MS=100           # Drain loop idle interval
 NIGHTOWL_MAX_PENDING_ROWS=100000         # Back-pressure threshold
 NIGHTOWL_MAX_BUFFER_MEMORY=268435456     # 256MB RSS limit
 NIGHTOWL_REOPEN_COOLDOWN_HOURS=0         # Hours to wait before flipping resolved → open on recurrence (0 = always reopen, Sentry-style)
+
+# Boot-migrate + update check (all TOP-LEVEL config keys — shallow-merge rule)
+NIGHTOWL_AUTO_MIGRATE=true               # Run nightowl:migrate at daemon startup when schema is behind (schema pre-listen in a deadline-killed child, backfill detached w/ completion-marker retry; warn-and-continue on failure; ignored under RUN_MIGRATIONS=true)
+NIGHTOWL_AUTO_MIGRATE_TIMEOUT=300        # Hard deadline (s) on the boot schema run — killed on expiry so a tenant-DB lock never keeps the ingest port unbound; migrations stay pending, next boot retries
+NIGHTOWL_UPDATE_CHECK=true               # Poll installed.php and LOG a warning when a newer agent is on disk than the running process. Warn only — never exits (supervisor behaviour on a self-initiated exit is unverifiable from inside the agent). Async driver only
+NIGHTOWL_UPDATE_CHECK_POLL_SECONDS=300   # Poll interval (drift needs 2 consecutive reads — debounce vs a half-written vendor tree)
 
 # Drain connection — network deadline (config key is TOP-LEVEL `drain_connection`,
 # NOT nested under `database`: mergeConfigFrom is a shallow array_merge, so a

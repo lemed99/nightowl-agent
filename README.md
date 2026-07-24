@@ -52,6 +52,47 @@ You don't need to wire up Nightwatch's transport — the service provider automa
 
 Tables fill up. Run any SQL you want against them.
 
+## Updating
+
+```bash
+composer update nightowl/agent
+# then restart the agent however you already restart it
+```
+
+The migrate step happens on boot: when the agent starts and its schema is
+behind, it applies the pending migrations itself before it accepts traffic, so
+schema changes arrive with the code that needs them. That schema run is bounded
+by `NIGHTOWL_AUTO_MIGRATE_TIMEOUT` (300s) and executes in a child process the
+agent kills at the deadline — a lock on your database can never leave the ingest
+port unbound. If it doesn't finish, the agent starts anyway on the old schema
+and retries next boot. Long rollup backfills continue in a detached background
+process (log: `storage/logs/nightowl-boot-migrate.log`) and are retried on a
+later boot if one dies partway.
+
+**The agent does not restart itself.** A running process keeps the code it
+booted with, so until you restart it the update isn't live. To make that visible
+rather than silent, the daemon checks `vendor/composer/installed.php` every few
+minutes and logs a warning once it sees a newer version on disk than the one
+it's running:
+
+```
+[NightOwl Agent] Update available: a newer nightowl/agent is installed on disk
+(v1.5.0#… -> v1.6.0#…) but this process is still running the old one. Restart
+the agent to pick it up …
+```
+
+Restarting is deliberately left to you: whether a supervisor would bring the
+agent back after a self-initiated exit depends on configuration the agent can't
+verify, and being wrong about that leaves you with no agent at all rather than a
+slightly stale one.
+
+Running `nightowl:migrate` in your deploy pipeline is still worthwhile — the
+boot-time run is the safety net, and a pipeline run does the rollup backfill
+where its latency is visible.
+
+Opt out with `NIGHTOWL_AUTO_MIGRATE=false` (e.g. a DB role without DDL rights)
+or `NIGHTOWL_UPDATE_CHECK=false`.
+
 ## Disabling NightOwl
 
 Set `NIGHTOWL_ENABLED=false` to make the package fully inert — the Nightwatch ingest hook is not wired (no telemetry is collected or transmitted) and the migrations are not registered. The most common use is turning it off in your test suite so tests don't pay the ingest overhead or require the `nightowl` database to exist:
