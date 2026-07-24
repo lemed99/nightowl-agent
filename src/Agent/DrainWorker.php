@@ -234,6 +234,9 @@ final class DrainWorker
         // 0 = run partition maintenance on the FIRST cleanup tick after start,
         // so a freshly-partitioned tenant doesn't wait an hour for children.
         $lastPartitionCheck = 0;
+        // Table stats too: first sample ships within a minute of boot, so a
+        // fresh install is visible on the platform immediately.
+        $lastTableStats = 0;
 
         while ($this->running) {
             $drained = $this->drainBatch($buffer, $writer);
@@ -279,6 +282,15 @@ final class DrainWorker
                     // NOT per-tick. (No-op on unpartitioned tenants;
                     // advisory-locked.)
                     $lastPartitionCheck = $this->maintainPartitionsIfDue($writer, $lastPartitionCheck);
+
+                    // Hourly per-table catalog stats to the platform — the
+                    // measurement layer that replaces ever asking a customer
+                    // to run SQL. Own connection + advisory lock inside; never
+                    // throws; catalog-driven so future tables are covered
+                    // automatically. Sample-arrival staleness is the platform's
+                    // signal, so a wedged drain stopping this tick IS detection,
+                    // not blindness.
+                    $lastTableStats = $this->reportTableStatsIfDue($lastTableStats);
 
                     // Worker saturation alert — a cheap no-op unless the tenant
                     // enabled it in settings. Advisory-locked internally so one
@@ -397,6 +409,19 @@ final class DrainWorker
         }
 
         return $writer->maintainRawPartitions() ? time() : $lastPartitionCheck;
+    }
+
+    /** Hourly gate for TableStatsCollector — same shape as the partition gate. */
+    private function reportTableStatsIfDue(int $lastTableStats): int
+    {
+        $interval = max(300, (int) config('nightowl.table_stats_interval', 3600));
+        if (time() - $lastTableStats < $interval) {
+            return $lastTableStats;
+        }
+
+        TableStatsCollector::fromConfig()->collectAndReport(time());
+
+        return time();
     }
 
     /**

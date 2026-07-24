@@ -91,6 +91,24 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Table Statistics Reporting
+    |--------------------------------------------------------------------------
+    |
+    | Hourly per-table catalog statistics (row counts, byte sizes, scan and
+    | write counters, rollup bucket bounds) reported to the NightOwl platform
+    | so operational problems — a wedged drain, a rollup coverage hole, a
+    | disk filling up — are diagnosed from our side without ever asking you
+    | to run queries. Reads catalog/statistics views ONLY; structurally
+    | incapable of reading telemetry contents. Disclosed in the NightOwl
+    | privacy policy; set false to opt out entirely. TOP-LEVEL keys
+    | (shallow-merge rule).
+    |
+    */
+    'table_stats' => (bool) env('NIGHTOWL_TABLE_STATS', true),
+    'table_stats_interval' => (int) env('NIGHTOWL_TABLE_STATS_INTERVAL', 3600),
+
+    /*
+    |--------------------------------------------------------------------------
     | Update Check (warn only)
     |--------------------------------------------------------------------------
     |
