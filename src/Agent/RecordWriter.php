@@ -5,6 +5,8 @@ namespace NightOwl\Agent;
 use NightOwl\Support\CacheKeyTemplate;
 use NightOwl\Support\ConcurrencyRollup;
 use NightOwl\Support\DDSketchHistogram;
+use NightOwl\Support\DictionaryCache;
+use NightOwl\Support\StorageV2;
 use NightOwl\Support\QueryHistogram;
 use NightOwl\Support\RawPartitions;
 use NightOwl\Support\RollupSpec;
@@ -120,6 +122,17 @@ final class RecordWriter
     /** When true, copyBatch() routes the COPY tables through INSERT instead. */
     private bool $forceInsert = false;
 
+    /**
+     * Storage-v2 verdict cache. Existence is fixed for the process life (same
+     * discipline as rollupEnabled: run nightowl:migrate then restart to flip
+     * it); a THROWN probe returns false for that call without caching, so a
+     * transient network error can't pin a tenant to v1 (fail-open toward v1,
+     * mirroring histEnabled).
+     */
+    private ?bool $v2Checked = null;
+
+    private DictionaryCache $dict;
+
     public function __construct(
         private string $host,
         private int $port,
@@ -143,8 +156,10 @@ final class RecordWriter
         private ?DrainHeartbeat $heartbeat = null,
         private int $idleTxnTimeoutMs = 30000,
         private bool $cacheKeyTemplateEnabled = true,
+        private bool $storageV2Config = true,
     ) {
         $this->notifier = $notifier ?? new AlertNotifier;
+        $this->dict = new DictionaryCache;
     }
 
     /**
@@ -348,6 +363,9 @@ final class RecordWriter
             (int) config('nightowl.drain_connection.keepalives_count', 3),
             (int) config('nightowl.drain_connection.lock_timeout_ms', 10000),
             cacheKeyTemplateEnabled: (bool) config('nightowl.cache_key_template', true),
+            // Top-level key (shallow-merge rule) — the operational kill switch:
+            // false makes the drain write v1 even when the v2 tables exist.
+            storageV2Config: (bool) config('nightowl.storage_v2', true),
         );
     }
 
@@ -498,6 +516,16 @@ final class RecordWriter
 
         $pdo = $this->pdo();
 
+        // Storage v2: resolve dictionary ids in autocommit BEFORE the batch
+        // transaction. Ids cached here survive a batch rollback (their rows
+        // are already durable; unreferenced dict rows are harmless), which is
+        // the invariant that keeps the LRU trustworthy. Stashes computed here
+        // (_v2_sql_hash etc.) are the same values the writeXV2 builders read.
+        if ($this->v2Enabled()) {
+            $this->heartbeat?->enter('pg:dict-warm');
+            $this->dict->warm($pdo, $this->collectDictMisses($grouped));
+        }
+
         $this->heartbeat?->enter('pg:begin');
 
         // beginTransaction() is INSIDE the try. It is a network round trip like any
@@ -538,8 +566,12 @@ final class RecordWriter
             // All writes in this batch committed — publish the landed tables so the
             // drain worker can clear those tables' poison-breaker streaks.
             $this->lastWrittenTables = array_keys($this->pendingWrittenTables);
+            // Publish any dict ids the defensive in-txn path resolved — same
+            // publication point as the tables list, for the same reason.
+            $this->dict->promotePending();
         } catch (\Throwable $e) {
             $this->notifier->clearPending(); // Discard — data was rolled back
+            $this->dict->discardPending();   // Staged dict ids die with the txn
 
             // Classify BEFORE touching the connection. rollBack() on a handle the
             // socket deadline just killed THROWS (inTransaction() reports true, then
@@ -1051,6 +1083,9 @@ final class RecordWriter
         // time; $nowTs is only the fallback clock for rows with no numeric timestamp.
         $nowTs = time();
 
+        if ($this->v2Enabled()) {
+            $this->writeRequestsV2($records, $nowTs);
+        } else {
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'user_id', 'method', 'url', 'route_name', 'route_methods',
@@ -1112,6 +1147,7 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_requests', $columns, $rows);
+        }
 
         if ($this->rollupEnabled('nightowl_request_rollups')) {
             $this->writeRollup($records, RollupSpecs::requests(), $nowTs);
@@ -1135,6 +1171,9 @@ final class RecordWriter
         // timestamp (created_at was previously left to the column's useCurrent()).
         $nowTs = time();
 
+        if ($this->v2Enabled()) {
+            $this->writeQueriesV2($records, $nowTs);
+        } else {
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
@@ -1167,12 +1206,670 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_queries', $columns, $rows);
+        }
 
         if ($this->rollupEnabled('nightowl_query_rollups')) {
             $this->writeQueryRollups($records, $nowTs);
         }
 
         $this->checkThresholds('query', $records, 'connection');
+    }
+
+    // ================================================================ v2 path
+    //
+    // Storage format v2 (migrations 000066/000067): each writeX above branches
+    // to its writeXV2 twin when the v2 family exists. The v2 builders feed the
+    // SAME copyBatch/insertBatch funnel — clamp, Swoole fallback, heartbeat and
+    // error attribution are all inherited. Rollups and threshold checks stay
+    // OUTSIDE the branch: they consume the in-memory records, not the tables,
+    // so aggregates are byte-identical in both modes.
+
+    /**
+     * Whether this tenant stores v2. Gated first on the top-level
+     * `nightowl.storage_v2` config (the operational kill switch — flipping it
+     * false reverts the drain to v1 without a schema change), then on an
+     * all-11-parents catalog probe cached for the process life (run
+     * nightowl:migrate then restart to flip, same discipline as
+     * rollupEnabled). A THROWN probe returns false for this call uncached, so
+     * a transient failure can't pin the tenant to v1.
+     */
+    private function v2Enabled(): bool
+    {
+        if (! $this->storageV2Config) {
+            return false;
+        }
+        if ($this->v2Checked !== null) {
+            return $this->v2Checked;
+        }
+
+        try {
+            $enabled = StorageV2::enabled($this->pdo());
+        } catch (\Throwable $e) {
+            error_log('[NightOwl Agent] storage-v2 probe failed (writing v1 for this batch): '.$e->getMessage());
+
+            return false;
+        }
+
+        if (! $enabled) {
+            error_log('[NightOwl Agent] storage-v2 tables not found — writing v1. '
+                .'Run `php artisan nightowl:migrate` and restart the agent to enable v2.');
+        }
+
+        return $this->v2Checked = $enabled;
+    }
+
+    /**
+     * Pre-transaction dictionary sweep. Walks the grouped batch with the SAME
+     * extractors the writeXV2 builders use (values are stashed on the records
+     * — `_v2_sql_hash`, `_v2_route_hash`, `_v2_trace_hash`, `_key_pattern` —
+     * so warm and write cannot disagree), and returns the dictionary misses
+     * for DictionaryCache::warm. Runs in autocommit BEFORE doWrite()'s BEGIN;
+     * see DictionaryCache for why that ordering is the invariant.
+     *
+     * @param  array<string, array<int, array>>  $grouped  mutated in place (stashes)
+     */
+    private function collectDictMisses(array &$grouped): array
+    {
+        $misses = ['string' => [], 'sql' => [], 'route' => [], 'trace' => []];
+        $seen = ['string' => [], 'sql' => [], 'route' => [], 'trace' => []];
+
+        $needString = function (string $kind, mixed $value) use (&$misses, &$seen): void {
+            if ($value === null || $value === '' || ! is_string($value)) {
+                return;
+            }
+            $key = $kind."\0".$value;
+            if (isset($seen['string'][$key]) || $this->dict->stringId($kind, $value) !== null) {
+                return;
+            }
+            $seen['string'][$key] = true;
+            $misses['string'][] = [$kind, $value];
+        };
+
+        $needString('environment', $this->environment);
+
+        static $labelMap = [
+            'request' => ['deploy' => 'deploy', 'server' => 'server', 'method' => 'method'],
+            'query' => ['deploy' => 'deploy', 'server' => 'server', 'execution_source' => 'execution_source', 'execution_stage' => 'execution_stage', 'connection' => 'connection', 'connection_type' => 'connection_type'],
+            'exception' => ['deploy' => 'deploy', 'server' => 'server', 'execution_source' => 'execution_source', 'execution_stage' => 'execution_stage'],
+            'command' => ['deploy' => 'deploy', 'server' => 'server'],
+            'queued-job' => ['deploy' => 'deploy', 'server' => 'server', 'execution_source' => 'execution_source', 'execution_stage' => 'execution_stage', 'queue' => 'queue', 'connection' => 'connection', 'status' => 'status'],
+            'job-attempt' => ['deploy' => 'deploy', 'server' => 'server', 'execution_source' => 'execution_source', 'execution_stage' => 'execution_stage', 'queue' => 'queue', 'connection' => 'connection', 'status' => 'status'],
+            'cache-event' => ['deploy' => 'deploy', 'server' => 'server', 'execution_source' => 'execution_source', 'execution_stage' => 'execution_stage', 'store' => 'store'],
+            'mail' => ['deploy' => 'deploy', 'server' => 'server', 'execution_source' => 'execution_source', 'execution_stage' => 'execution_stage'],
+            'notification' => ['deploy' => 'deploy', 'server' => 'server', 'execution_source' => 'execution_source', 'execution_stage' => 'execution_stage', 'channel' => 'channel'],
+            'outgoing-request' => ['deploy' => 'deploy', 'server' => 'server', 'execution_source' => 'execution_source', 'execution_stage' => 'execution_stage', 'host' => 'host', 'method' => 'method'],
+            'scheduled-task' => ['deploy' => 'deploy', 'server' => 'server', 'status' => 'status'],
+            'log' => ['deploy' => 'deploy', 'server' => 'server', 'execution_source' => 'execution_source', 'execution_stage' => 'execution_stage', 'channel' => 'channel'],
+        ];
+
+        foreach ($grouped as $type => &$records) {
+            $labels = $labelMap[$type] ?? null;
+
+            foreach ($records as &$r) {
+                if ($labels !== null) {
+                    foreach ($labels as $kind => $field) {
+                        $needString($kind, $r[$field] ?? null);
+                    }
+                }
+
+                switch ($type) {
+                    case 'query':
+                        $sql = (string) ($r['sql'] ?? '');
+                        $file = $r['file'] ?? null;
+                        $line = $r['line'] ?? null;
+                        $hash = hash('xxh128', $sql."\0".($file ?? '')."\0".($line ?? ''));
+                        $r['_v2_sql_hash'] = $hash;
+                        if (! isset($seen['sql'][$hash]) && $this->dict->sqlId($hash) === null) {
+                            $seen['sql'][$hash] = true;
+                            $misses['sql'][] = [$hash, $sql, $file, $line === null ? null : (int) $line];
+                        }
+                        break;
+
+                    case 'request':
+                        if (($r['route_path'] ?? null) === null
+                            && ($r['route_name'] ?? null) === null
+                            && ($r['route_action'] ?? null) === null) {
+                            $r['_v2_route_hash'] = null; // unrouted (404s etc.) — no dict row
+                            break;
+                        }
+                        $method = (string) ($r['method'] ?? 'GET');
+                        $domain = $r['route_domain'] ?? null;
+                        $path = $r['route_path'] ?? null;
+                        $name = $r['route_name'] ?? null;
+                        $action = $r['route_action'] ?? null;
+                        $methods = json_encode($r['route_methods'] ?? []);
+                        $hash = hash('xxh128', $method."\0".($domain ?? '')."\0".($path ?? '')."\0".($name ?? '')."\0".($action ?? '')."\0".$methods);
+                        $r['_v2_route_hash'] = $hash;
+                        if (! isset($seen['route'][$hash]) && $this->dict->routeId($hash) === null) {
+                            $seen['route'][$hash] = true;
+                            $misses['route'][] = [$hash, $method, $domain, $path, $name, $action, $methods];
+                        }
+                        break;
+
+                    case 'exception':
+                        $trace = $r['trace'] ?? null;
+                        if (! is_string($trace) || $trace === '') {
+                            $r['_v2_trace_hash'] = null;
+                            break;
+                        }
+                        $hash = hash('xxh128', $trace);
+                        $r['_v2_trace_hash'] = $hash;
+                        // Unlike the other three dicts, traces are ALWAYS warmed
+                        // (no `traceId($hash) === null` LRU short-circuit), only
+                        // de-duped within the batch. Traces are the one GC'd
+                        // dictionary (nightowl:gc-dict-traces), so every batch
+                        // that references a trace must re-touch its created_at
+                        // (the warm's ON CONFLICT DO UPDATE) to keep it out of GC
+                        // range — and re-resolve its id, because a trace the LRU
+                        // still remembers may have been GC'd and would otherwise
+                        // hand a dangling trace_ref to the exception write. The
+                        // warm re-creates a GC'd trace and returns the live id.
+                        if (! isset($seen['trace'][$hash])) {
+                            $seen['trace'][$hash] = true;
+                            $misses['trace'][] = [$hash, StorageV2::deflateOrNull($trace) ?? '\x'.bin2hex(gzdeflate($trace, 6))];
+                        }
+                        break;
+
+                    case 'queued-job':
+                    case 'job-attempt':
+                        $needString('job_class', $r['name'] ?? $r['job_class'] ?? 'Unknown');
+                        break;
+
+                    case 'cache-event':
+                        $needString('event_type', $r['type'] ?? 'unknown');
+                        if ($this->cacheKeyTemplateEnabled) {
+                            $r['_key_pattern'] = CacheKeyTemplate::template((string) ($r['key'] ?? ''));
+                            $needString('cache_pattern', $r['_key_pattern']);
+                        }
+                        break;
+
+                    case 'log':
+                        $needString('level', $r['level'] ?? 'info');
+                        break;
+                }
+            }
+            unset($r);
+        }
+        unset($records);
+
+        return array_filter($misses, fn (array $m): bool => $m !== []);
+    }
+
+    /**
+     * Dictionary-string id for a v2 row. Post-warm this always hits the LRU;
+     * the in-transaction resolve is defense in depth (staged, promoted only
+     * on commit). A value that still can't resolve stores NULL — the reader
+     * shows a visible missing-dict marker rather than the row vanishing.
+     */
+    private function v2Sid(string $kind, mixed $value): ?int
+    {
+        if ($value === null || $value === '' || ! is_string($value)) {
+            return null;
+        }
+
+        $id = $this->dict->stringId($kind, $value);
+        if ($id !== null) {
+            return $id;
+        }
+
+        try {
+            return $this->dict->resolveStringInTxn($this->pdo(), $kind, $value);
+        } catch (\Throwable $e) {
+            error_log("[NightOwl Agent] dict resolve failed for {$kind} (stored NULL): ".$e->getMessage());
+
+            return null;
+        }
+    }
+
+    private function writeRequestsV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'group_hash',
+            'environment_id', 'server_id', 'deploy_id', 'user_id',
+            'method_id', 'route_id', 'url', 'ip',
+            'duration', 'status_code', 'request_size', 'response_size',
+            'bootstrap', 'before_middleware', 'action', 'render', 'after_middleware', 'sending', 'terminating',
+            'exceptions', 'logs', 'queries', 'jobs_queued', 'mail', 'notifications', 'outgoing_requests', 'cache_events',
+            'peak_memory_usage', 'exception_preview', 'context_z', 'headers_z', 'payload_z',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $routeHash = $r['_v2_route_hash'] ?? null;
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::uuidOrNull($r['trace_id'] ?? null, 'trace_id'),
+                StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $r['user'] ?? null,
+                $this->v2Sid('method', $r['method'] ?? 'GET'),
+                $routeHash === null ? null : $this->dict->routeId($routeHash),
+                $r['url'] ?? '/',
+                $r['ip'] ?? null,
+                $r['duration'] ?? null,
+                $r['status_code'] ?? 200,
+                $r['request_size'] ?? null,
+                $r['response_size'] ?? null,
+                $r['bootstrap'] ?? null,
+                $r['before_middleware'] ?? null,
+                $r['action'] ?? null,
+                $r['render'] ?? null,
+                $r['after_middleware'] ?? null,
+                $r['sending'] ?? null,
+                $r['terminating'] ?? null,
+                $r['exceptions'] ?? 0,
+                $r['logs'] ?? 0,
+                $r['queries'] ?? 0,
+                $r['jobs_queued'] ?? 0,
+                $r['mail'] ?? 0,
+                $r['notifications'] ?? 0,
+                $r['outgoing_requests'] ?? 0,
+                $r['cache_events'] ?? 0,
+                $r['peak_memory_usage'] ?? 0,
+                $r['exception_preview'] ?? null,
+                StorageV2::deflateOrNull($r['context'] ?? null),
+                StorageV2::deflateOrNull($r['headers'] ?? null),
+                StorageV2::deflateOrNull($r['payload'] ?? null),
+            ];
+        }
+
+        $this->copyBatch('nightowl_requests_v2', $columns, $rows);
+    }
+
+    private function writeQueriesV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'execution_id', 'group_hash',
+            'environment_id', 'server_id', 'deploy_id', 'execution_source_id', 'execution_stage_id',
+            'execution_preview', 'user_id', 'sql_id', 'duration', 'connection_id', 'connection_type_id',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $sqlHash = $r['_v2_sql_hash'] ?? null;
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::traceIdFor($r),
+                StorageV2::uuidOrNull($r['execution_id'] ?? null, 'execution_id'),
+                StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $this->v2Sid('execution_source', $r['execution_source'] ?? null),
+                $this->v2Sid('execution_stage', $r['execution_stage'] ?? null),
+                $r['execution_preview'] ?? null,
+                $r['user'] ?? null,
+                $sqlHash === null ? null : $this->dict->sqlId($sqlHash),
+                $r['duration'] ?? null,
+                $this->v2Sid('connection', $r['connection'] ?? null),
+                $this->v2Sid('connection_type', $r['connection_type'] ?? null),
+            ];
+        }
+
+        $this->copyBatch('nightowl_queries_v2', $columns, $rows);
+    }
+
+    private function writeCommandsV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'group_hash',
+            'environment_id', 'server_id', 'deploy_id', 'user_id',
+            'class', 'name', 'command', 'exit_code', 'duration',
+            'bootstrap', 'action', 'terminating',
+            'exceptions', 'logs', 'queries', 'jobs_queued', 'mail', 'notifications', 'outgoing_requests', 'cache_events',
+            'peak_memory_usage', 'exception_preview', 'context_z',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::uuidOrNull($r['trace_id'] ?? null, 'trace_id'),
+                StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $r['user'] ?? null,
+                $r['class'] ?? null,
+                $r['name'] ?? null,
+                $r['command'] ?? 'unknown',
+                $r['exit_code'] ?? null,
+                $r['duration'] ?? null,
+                $r['bootstrap'] ?? null,
+                $r['action'] ?? null,
+                $r['terminating'] ?? null,
+                $r['exceptions'] ?? 0,
+                $r['logs'] ?? 0,
+                $r['queries'] ?? 0,
+                $r['jobs_queued'] ?? 0,
+                $r['mail'] ?? 0,
+                $r['notifications'] ?? 0,
+                $r['outgoing_requests'] ?? 0,
+                $r['cache_events'] ?? 0,
+                $r['peak_memory_usage'] ?? 0,
+                $r['exception_preview'] ?? null,
+                StorageV2::deflateOrNull($r['context'] ?? null),
+            ];
+        }
+
+        $this->copyBatch('nightowl_commands_v2', $columns, $rows);
+    }
+
+    private function writeJobsV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'execution_id', 'group_hash',
+            'environment_id', 'server_id', 'deploy_id', 'execution_source_id', 'execution_stage_id',
+            'execution_preview', 'user_id',
+            'job_id', 'attempt_id', 'attempt', 'job_class_id', 'queue_id', 'connection_id', 'status_id',
+            'duration', 'attempts',
+            'exceptions', 'logs', 'queries', 'jobs_queued', 'mail', 'notifications', 'outgoing_requests', 'cache_events',
+            'peak_memory_usage', 'exception_preview', 'context_z',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::traceIdFor($r),
+                StorageV2::uuidOrNull($r['execution_id'] ?? null, 'execution_id'),
+                StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $this->v2Sid('execution_source', $r['execution_source'] ?? null),
+                $this->v2Sid('execution_stage', $r['execution_stage'] ?? null),
+                $r['execution_preview'] ?? null,
+                $r['user'] ?? null,
+                StorageV2::uuidOrNull($r['job_id'] ?? null, 'job_id'),
+                StorageV2::uuidOrNull($r['attempt_id'] ?? null, 'attempt_id'),
+                $r['attempt'] ?? null,
+                $this->v2Sid('job_class', $r['name'] ?? $r['job_class'] ?? 'Unknown'),
+                $this->v2Sid('queue', $r['queue'] ?? null),
+                $this->v2Sid('connection', $r['connection'] ?? null),
+                $this->v2Sid('status', $r['status'] ?? null),
+                $r['duration'] ?? null,
+                $r['attempts'] ?? 1,
+                $r['exceptions'] ?? 0,
+                $r['logs'] ?? 0,
+                $r['queries'] ?? 0,
+                $r['jobs_queued'] ?? 0,
+                $r['mail'] ?? 0,
+                $r['notifications'] ?? 0,
+                $r['outgoing_requests'] ?? 0,
+                $r['cache_events'] ?? 0,
+                $r['peak_memory_usage'] ?? 0,
+                $r['exception_preview'] ?? null,
+                StorageV2::deflateOrNull($r['context'] ?? null),
+            ];
+        }
+
+        $this->copyBatch('nightowl_jobs_v2', $columns, $rows);
+    }
+
+    private function writeCacheEventsV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'execution_id', 'group_hash',
+            'environment_id', 'server_id', 'deploy_id', 'execution_source_id', 'execution_stage_id',
+            'execution_preview', 'user_id',
+            'event_type_id', 'key', 'pattern_id', 'store_id', 'ttl', 'duration',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $pattern = $r['_key_pattern'] ?? null;
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::traceIdFor($r),
+                StorageV2::uuidOrNull($r['execution_id'] ?? null, 'execution_id'),
+                StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $this->v2Sid('execution_source', $r['execution_source'] ?? null),
+                $this->v2Sid('execution_stage', $r['execution_stage'] ?? null),
+                $r['execution_preview'] ?? null,
+                $r['user'] ?? null,
+                $this->v2Sid('event_type', $r['type'] ?? 'unknown'),
+                $r['key'] ?? '',
+                $pattern === null ? null : $this->v2Sid('cache_pattern', $pattern),
+                $this->v2Sid('store', $r['store'] ?? null),
+                $r['ttl'] ?? null,
+                $r['duration'] ?? null,
+            ];
+        }
+
+        $this->copyBatch('nightowl_cache_events_v2', $columns, $rows);
+    }
+
+    private function writeMailV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'execution_id', 'group_hash',
+            'environment_id', 'server_id', 'deploy_id', 'execution_source_id', 'execution_stage_id',
+            'execution_preview', 'user_id',
+            'mailer', 'recipients', 'cc', 'bcc', 'attachments', 'subject', 'mailable',
+            'duration', 'failed', 'queued',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::traceIdFor($r),
+                StorageV2::uuidOrNull($r['execution_id'] ?? null, 'execution_id'),
+                StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $this->v2Sid('execution_source', $r['execution_source'] ?? null),
+                $this->v2Sid('execution_stage', $r['execution_stage'] ?? null),
+                $r['execution_preview'] ?? null,
+                $r['user'] ?? null,
+                $r['mailer'] ?? null,
+                is_array($r['to'] ?? null) ? json_encode($r['to']) : ($r['to'] ?? null),
+                $r['cc'] ?? 0,
+                $r['bcc'] ?? 0,
+                $r['attachments'] ?? 0,
+                $r['subject'] ?? null,
+                $r['class'] ?? $r['mailable'] ?? null,
+                $r['duration'] ?? null,
+                filter_var($r['failed'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
+                filter_var($r['queued'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
+            ];
+        }
+
+        $this->copyBatch('nightowl_mail_v2', $columns, $rows);
+    }
+
+    private function writeNotificationsV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'execution_id', 'group_hash',
+            'environment_id', 'server_id', 'deploy_id', 'execution_source_id', 'execution_stage_id',
+            'execution_preview', 'user_id',
+            'notification', 'channel_id', 'notifiable_type', 'notifiable_id',
+            'duration', 'failed', 'queued',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::traceIdFor($r),
+                StorageV2::uuidOrNull($r['execution_id'] ?? null, 'execution_id'),
+                StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $this->v2Sid('execution_source', $r['execution_source'] ?? null),
+                $this->v2Sid('execution_stage', $r['execution_stage'] ?? null),
+                $r['execution_preview'] ?? null,
+                $r['user'] ?? null,
+                $r['class'] ?? $r['notification'] ?? null,
+                $this->v2Sid('channel', $r['channel'] ?? null),
+                $r['notifiable_type'] ?? null,
+                $r['notifiable_id'] ?? null,
+                $r['duration'] ?? null,
+                filter_var($r['failed'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
+                filter_var($r['queued'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
+            ];
+        }
+
+        $this->copyBatch('nightowl_notifications_v2', $columns, $rows);
+    }
+
+    private function writeOutgoingRequestsV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'execution_id', 'group_hash',
+            'environment_id', 'server_id', 'deploy_id', 'execution_source_id', 'execution_stage_id',
+            'execution_preview', 'user_id',
+            'host_id', 'method_id', 'url', 'status_code', 'duration', 'request_size', 'response_size', 'headers_z',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::traceIdFor($r),
+                StorageV2::uuidOrNull($r['execution_id'] ?? null, 'execution_id'),
+                StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $this->v2Sid('execution_source', $r['execution_source'] ?? null),
+                $this->v2Sid('execution_stage', $r['execution_stage'] ?? null),
+                $r['execution_preview'] ?? null,
+                $r['user'] ?? null,
+                $this->v2Sid('host', $r['host'] ?? null),
+                $this->v2Sid('method', $r['method'] ?? 'GET'),
+                $r['url'] ?? '',
+                $r['status_code'] ?? null,
+                $r['duration'] ?? null,
+                $r['request_size'] ?? null,
+                $r['response_size'] ?? null,
+                StorageV2::deflateOrNull($r['request_headers'] ?? null),
+            ];
+        }
+
+        $this->copyBatch('nightowl_outgoing_requests_v2', $columns, $rows);
+    }
+
+    private function writeScheduledTasksV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'group_hash',
+            'environment_id', 'server_id', 'deploy_id', 'user_id',
+            'command', 'expression', 'timezone', 'repeat_seconds',
+            'without_overlapping', 'on_one_server', 'run_in_background', 'even_in_maintenance_mode',
+            'status_id', 'duration', 'exit_code',
+            'exceptions', 'logs', 'queries', 'jobs_queued', 'mail', 'notifications', 'outgoing_requests', 'cache_events',
+            'peak_memory_usage', 'exception_preview', 'context_z',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::uuidOrNull($r['trace_id'] ?? null, 'trace_id'),
+                StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $r['user'] ?? null,
+                $r['name'] ?? $r['command'] ?? 'unknown',
+                $r['cron'] ?? $r['expression'] ?? null,
+                $r['timezone'] ?? null,
+                $r['repeat_seconds'] ?? 0,
+                ($r['without_overlapping'] ?? false) ? 't' : 'f',
+                ($r['on_one_server'] ?? false) ? 't' : 'f',
+                ($r['run_in_background'] ?? false) ? 't' : 'f',
+                ($r['even_in_maintenance_mode'] ?? false) ? 't' : 'f',
+                $this->v2Sid('status', $r['status'] ?? null),
+                $r['duration'] ?? null,
+                $r['exit_code'] ?? null,
+                $r['exceptions'] ?? 0,
+                $r['logs'] ?? 0,
+                $r['queries'] ?? 0,
+                $r['jobs_queued'] ?? 0,
+                $r['mail'] ?? 0,
+                $r['notifications'] ?? 0,
+                $r['outgoing_requests'] ?? 0,
+                $r['cache_events'] ?? 0,
+                $r['peak_memory_usage'] ?? 0,
+                $r['exception_preview'] ?? null,
+                StorageV2::deflateOrNull($r['context'] ?? null),
+            ];
+        }
+
+        $this->copyBatch('nightowl_scheduled_tasks_v2', $columns, $rows);
+    }
+
+    private function writeLogsV2(array $records, int $nowTs): void
+    {
+        $columns = [
+            'created_at', 'ts_us', 'trace_id', 'execution_id',
+            'environment_id', 'server_id', 'deploy_id', 'execution_source_id', 'execution_stage_id',
+            'execution_preview', 'user_id',
+            'level_id', 'message', 'context_z', 'extra_z', 'channel_id',
+        ];
+
+        $envId = $this->v2Sid('environment', $this->environment);
+
+        $rows = [];
+        foreach ($records as $r) {
+            $rows[] = [
+                $this->eventCreatedAt($r, $nowTs),
+                StorageV2::tsMicros($r, $nowTs),
+                StorageV2::traceIdFor($r),
+                StorageV2::uuidOrNull($r['execution_id'] ?? null, 'execution_id'),
+                $envId,
+                $this->v2Sid('server', $r['server'] ?? null),
+                $this->v2Sid('deploy', $r['deploy'] ?? null),
+                $this->v2Sid('execution_source', $r['execution_source'] ?? null),
+                $this->v2Sid('execution_stage', $r['execution_stage'] ?? null),
+                $r['execution_preview'] ?? null,
+                $r['user'] ?? null,
+                $this->v2Sid('level', $r['level'] ?? 'info'),
+                $r['message'] ?? null,
+                StorageV2::deflateOrNull($r['context'] ?? null),
+                StorageV2::deflateOrNull($r['extra'] ?? null),
+                $this->v2Sid('channel', $r['channel'] ?? null),
+            ];
+        }
+
+        $this->copyBatch('nightowl_logs_v2', $columns, $rows);
     }
 
     /**
@@ -1262,7 +1959,8 @@ final class RecordWriter
             if ($got) {
                 // Returns (never throws) the per-table failures it already isolated and
                 // logged; the commit still lands every healthy table's children.
-                $failures = RawPartitions::ensureFutureChildren($pdo);
+                // v1 + any existing v2 parents — both families need children.
+                $failures = RawPartitions::ensureFutureChildren($pdo, RawPartitions::tablesIncludingV2($pdo));
             }
 
             $pdo->commit();
@@ -1397,6 +2095,7 @@ final class RecordWriter
                 $nowTs + ConcurrencyRollup::END_CEIL_FUTURE_SECONDS,
                 $bucketLow,
                 $bucketHigh,
+                includeV2: $this->v2Enabled(),
             );
             $pdo->prepare($q['sql'])->execute($q['bindings']);
 
@@ -1418,7 +2117,11 @@ final class RecordWriter
     {
         try {
             $failures = [];
-            $healed = RawPartitions::healConversionLeftovers($this->pdo(), null, $failures);
+            $healed = RawPartitions::healConversionLeftovers(
+                $this->pdo(),
+                RawPartitions::tablesIncludingV2($this->pdo()),
+                $failures,
+            );
 
             // Safe to announce unconditionally: healConversionLeftovers appends a
             // table only once its OWN transaction has committed the DROP.
@@ -2255,8 +2958,28 @@ final class RecordWriter
 
     private function writeExceptions(array $records): void
     {
-        $this->markWriteTarget('nightowl_exceptions');
-        $stmt = $this->pdo()->prepare('INSERT INTO nightowl_exceptions (
+        // v1-vs-v2 changes ONLY the INSERT target and the per-row shape.
+        // Fingerprint derivation, $issueGroups (hex strings — issues stay
+        // varchar), the snapshot/sync/notify flow, and the three exception
+        // rollups are byte-identical in both modes.
+        $v2 = $this->v2Enabled();
+
+        $this->markWriteTarget($v2 ? 'nightowl_exceptions_v2' : 'nightowl_exceptions');
+        $stmt = $v2
+            ? $this->pdo()->prepare('INSERT INTO nightowl_exceptions_v2 (
+                created_at, ts_us, trace_id, execution_id, group_hash,
+                environment_id, server_id, deploy_id, execution_source_id, execution_stage_id,
+                execution_preview, user_id,
+                class, message, code, file, line, trace_ref,
+                php_version, laravel_version, handled, fingerprint
+            ) VALUES (
+                :created_at, :ts_us, :trace_id, :execution_id, :group_hash,
+                :environment_id, :server_id, :deploy_id, :execution_source_id, :execution_stage_id,
+                :execution_preview, :user_id,
+                :class, :message, :code, :file, :line, :trace_ref,
+                :php_version, :laravel_version, :handled, decode(:fingerprint, \'hex\')
+            )')
+            : $this->pdo()->prepare('INSERT INTO nightowl_exceptions (
             v, trace_id, timestamp, deploy, environment, server, group_hash,
             execution_source, execution_id, execution_stage, execution_preview, user_id,
             class, message, code, file, line, trace,
@@ -2286,9 +3009,43 @@ final class RecordWriter
             $fingerprint = ! empty($r['_group'])
                 ? (string) $r['_group']
                 : md5(($r['class'] ?? '').'|'.($r['code'] ?? '').'|'.($r['file'] ?? '').'|'.($r['line'] ?? ''));
+            if ($v2 && preg_match('/^[0-9a-fA-F]{32}$/', $fingerprint) !== 1) {
+                // v2 stores fingerprint as bytea via decode(...,'hex') — a
+                // corrupt non-hex _group would 22P02 the whole batch. md5 of
+                // the garbage is hex-safe and grouping-stable, and issues use
+                // the same normalized value so the join key stays consistent.
+                $fingerprint = md5($fingerprint);
+            }
             $deploy = $r['deploy'] ?? null;
             $groupKey = $fingerprint.'|'.$this->environment;
 
+            if ($v2) {
+                $traceHash = $r['_v2_trace_hash'] ?? null;
+                $stmt->execute($this->clampParams('nightowl_exceptions_v2', [
+                    'created_at' => $this->eventCreatedAt($r, $nowTs),
+                    'ts_us' => StorageV2::tsMicros($r, $nowTs),
+                    'trace_id' => StorageV2::traceIdFor($r),
+                    'execution_id' => StorageV2::uuidOrNull($r['execution_id'] ?? null, 'execution_id'),
+                    'group_hash' => StorageV2::hex16OrNull($r['_group'] ?? null, 'group_hash'),
+                    'environment_id' => $this->v2Sid('environment', $this->environment),
+                    'server_id' => $this->v2Sid('server', $r['server'] ?? null),
+                    'deploy_id' => $this->v2Sid('deploy', $deploy),
+                    'execution_source_id' => $this->v2Sid('execution_source', $r['execution_source'] ?? null),
+                    'execution_stage_id' => $this->v2Sid('execution_stage', $r['execution_stage'] ?? null),
+                    'execution_preview' => $r['execution_preview'] ?? null,
+                    'user_id' => $r['user'] ?? null,
+                    'class' => $r['class'] ?? 'Unknown',
+                    'message' => $r['message'] ?? null,
+                    'code' => $r['code'] ?? null,
+                    'file' => $r['file'] ?? null,
+                    'line' => $r['line'] ?? null,
+                    'trace_ref' => $traceHash === null ? null : $this->dict->traceId($traceHash),
+                    'php_version' => $r['php_version'] ?? null,
+                    'laravel_version' => $r['laravel_version'] ?? null,
+                    'handled' => filter_var($r['handled'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',
+                    'fingerprint' => strtolower($fingerprint),
+                ]));
+            } else {
             $stmt->execute($this->clampParams('nightowl_exceptions', [
                 'v' => $r['v'] ?? null,
                 'trace_id' => $r['trace_id'] ?? null,
@@ -2314,6 +3071,7 @@ final class RecordWriter
                 'fingerprint' => $fingerprint,
                 'created_at' => $this->eventCreatedAt($r, $nowTs),
             ]));
+            }
 
             if (! isset($issueGroups[$groupKey])) {
                 $issueGroups[$groupKey] = [
@@ -2364,9 +3122,52 @@ final class RecordWriter
      */
     private function syncIssuesToExceptions(array $issueGroups, array $reopenIds = []): void
     {
-        // users_count uses a subquery on nightowl_exceptions to compute the
+        // users_count uses a subquery on the raw exceptions to compute the
         // actual distinct user count, instead of blindly accumulating per batch
         // (which inflates the count when the same user appears across batches).
+        // In v2 mode the subquery unions BOTH families: pre-fence occurrences
+        // live in v1, post-fence in v2, and the count must span the fence. The
+        // v1 leg is emitted only while the v1 table still exists (prune's EOL
+        // step eventually drops it), re-probed per prepare — never cached for
+        // the process life, because the drop can happen under a running daemon.
+        $usersCountSql = '(
+                    SELECT COUNT(DISTINCT user_id) FROM nightowl_exceptions
+                    WHERE fingerprint = EXCLUDED.group_hash
+                      AND environment IS NOT DISTINCT FROM EXCLUDED.environment
+                      AND user_id IS NOT NULL
+                )';
+        if ($this->v2Enabled()) {
+            $v1Exists = false;
+            try {
+                $v1Exists = (bool) $this->pdo()
+                    ->query("SELECT to_regclass('public.nightowl_exceptions') IS NOT NULL AS e")
+                    ->fetchColumn();
+            } catch (\Throwable) {
+                // Inconclusive — keep the v2-only shape; one batch with a
+                // slightly stale count beats a poisoned upsert.
+            }
+
+            $v2Leg = '
+                        SELECT user_id FROM nightowl_exceptions_v2
+                        WHERE fingerprint = decode(EXCLUDED.group_hash, \'hex\')
+                          AND (environment_id = (SELECT id FROM nightowl_dict_string
+                                                  WHERE kind = \'environment\' AND value = EXCLUDED.environment)
+                               OR (EXCLUDED.environment IS NULL AND environment_id IS NULL))
+                          AND user_id IS NOT NULL';
+            $v1Leg = '
+                        SELECT user_id FROM nightowl_exceptions
+                        WHERE fingerprint = EXCLUDED.group_hash
+                          AND environment IS NOT DISTINCT FROM EXCLUDED.environment
+                          AND user_id IS NOT NULL';
+
+            $usersCountSql = '(
+                    SELECT COUNT(DISTINCT user_id) FROM ('
+                        .($v1Exists ? $v1Leg.' UNION ALL' : '')
+                        .$v2Leg.'
+                    ) u
+                )';
+        }
+
         $upsertStmt = $this->pdo()->prepare('
             INSERT INTO nightowl_issues (
                 type, deploy, environment, status, exception_class, exception_message, group_hash,
@@ -2381,12 +3182,7 @@ final class RecordWriter
                 exception_message = EXCLUDED.exception_message,
                 last_seen_at = GREATEST(nightowl_issues.last_seen_at, EXCLUDED.last_seen_at),
                 occurrences_count = nightowl_issues.occurrences_count + EXCLUDED.occurrences_count,
-                users_count = (
-                    SELECT COUNT(DISTINCT user_id) FROM nightowl_exceptions
-                    WHERE fingerprint = EXCLUDED.group_hash
-                      AND environment IS NOT DISTINCT FROM EXCLUDED.environment
-                      AND user_id IS NOT NULL
-                ),
+                users_count = '.$usersCountSql.',
                 status = CASE
                     WHEN :should_reopen::boolean AND nightowl_issues.status = \'resolved\'
                         THEN \'open\'
@@ -2431,6 +3227,9 @@ final class RecordWriter
         // default, which resolves in the tenant DB's session timezone. See writeExceptions().
         $nowTs = time();
 
+        if ($this->v2Enabled()) {
+            $this->writeCommandsV2($records, $nowTs);
+        } else {
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'user_id', 'class', 'name', 'command', 'exit_code', 'duration',
@@ -2457,6 +3256,7 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_commands', $columns, $rows);
+        }
 
         if ($this->rollupEnabled('nightowl_command_rollups')) {
             $this->writeRollup($records, RollupSpecs::commands(), $nowTs);
@@ -2469,6 +3269,9 @@ final class RecordWriter
     {
         $nowTs = time();
 
+        if ($this->v2Enabled()) {
+            $this->writeJobsV2($records, $nowTs);
+        } else {
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
@@ -2498,6 +3301,7 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_jobs', $columns, $rows);
+        }
 
         if ($this->rollupEnabled('nightowl_job_rollups')) {
             $this->writeRollup($records, RollupSpecs::jobs(), $nowTs);
@@ -2515,6 +3319,11 @@ final class RecordWriter
     {
         $nowTs = time();
 
+        if ($this->v2Enabled()) {
+            // v2: pattern_id is always on the table; the _key_pattern stash
+            // (for the rollup spec's PHP arm) happened in collectDictMisses.
+            $this->writeCacheEventsV2($records, $nowTs);
+        } else {
         // Key templating (CacheKeyTemplate): computed ONCE here at ingest,
         // stored on the raw row (key_pattern) AND stashed on the in-flight
         // record (_key_pattern) for the rollup group. The rollup spec's SQL
@@ -2551,6 +3360,7 @@ final class RecordWriter
         unset($r);
 
         $this->copyBatch('nightowl_cache_events', $columns, $rows);
+        }
 
         if ($this->rollupEnabled('nightowl_cache_rollups')) {
             $this->writeRollup($records, RollupSpecs::cacheEvents(), $nowTs);
@@ -2590,6 +3400,9 @@ final class RecordWriter
         // default, which resolves in the tenant DB's session timezone. See writeExceptions().
         $nowTs = time();
 
+        if ($this->v2Enabled()) {
+            $this->writeMailV2($records, $nowTs);
+        } else {
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
@@ -2611,6 +3424,7 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_mail', $columns, $rows);
+        }
 
         if ($this->rollupEnabled('nightowl_mail_rollups')) {
             $this->writeRollup($records, RollupSpecs::mail(), $nowTs);
@@ -2625,6 +3439,9 @@ final class RecordWriter
         // default, which resolves in the tenant DB's session timezone. See writeExceptions().
         $nowTs = time();
 
+        if ($this->v2Enabled()) {
+            $this->writeNotificationsV2($records, $nowTs);
+        } else {
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
@@ -2644,6 +3461,7 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_notifications', $columns, $rows);
+        }
 
         if ($this->rollupEnabled('nightowl_notification_rollups')) {
             $this->writeRollup($records, RollupSpecs::notifications(), $nowTs);
@@ -2656,6 +3474,9 @@ final class RecordWriter
     {
         $nowTs = time();
 
+        if ($this->v2Enabled()) {
+            $this->writeOutgoingRequestsV2($records, $nowTs);
+        } else {
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'execution_source', 'execution_id', 'execution_stage', 'execution_preview', 'user_id',
@@ -2676,6 +3497,7 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_outgoing_requests', $columns, $rows);
+        }
 
         if ($this->rollupEnabled('nightowl_outgoing_request_rollups')) {
             $this->writeRollup($records, RollupSpecs::outgoingRequests(), $nowTs);
@@ -2687,6 +3509,12 @@ final class RecordWriter
     private function writeLogs(array $records): void
     {
         $nowTs = time();
+
+        if ($this->v2Enabled()) {
+            $this->writeLogsV2($records, $nowTs);
+
+            return;
+        }
 
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server',
@@ -2756,6 +3584,9 @@ final class RecordWriter
         // default, which resolves in the tenant DB's session timezone. See writeExceptions().
         $nowTs = time();
 
+        if ($this->v2Enabled()) {
+            $this->writeScheduledTasksV2($records, $nowTs);
+        } else {
         $columns = [
             'v', 'trace_id', 'timestamp', 'deploy', 'environment', 'server', 'group_hash',
             'user_id', 'command', 'expression',
@@ -2786,6 +3617,7 @@ final class RecordWriter
         }
 
         $this->copyBatch('nightowl_scheduled_tasks', $columns, $rows);
+        }
 
         if ($this->rollupEnabled('nightowl_scheduled_task_rollups')) {
             $this->writeRollup($records, RollupSpecs::scheduledTasks(), $nowTs);

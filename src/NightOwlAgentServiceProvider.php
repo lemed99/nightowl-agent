@@ -19,6 +19,7 @@ use NightOwl\Commands\BackfillRollupsCommand;
 use NightOwl\Commands\ClearCommand;
 use NightOwl\Commands\DrainWorkerCommand;
 use NightOwl\Commands\DropV1HistogramsCommand;
+use NightOwl\Commands\GcDictTracesCommand;
 use NightOwl\Commands\InstallCommand;
 use NightOwl\Commands\MigrateCommand;
 use NightOwl\Commands\PartitionCommand;
@@ -270,6 +271,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 DropV1HistogramsCommand::class,
                 BackfillRollupsCommand::class,
                 ClearCommand::class,
+                GcDictTracesCommand::class,
             ];
 
             // The synthetic-traffic feeder commands (simulator-loop/backfill) live in

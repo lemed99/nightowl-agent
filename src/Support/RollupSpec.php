@@ -226,7 +226,14 @@ final class RollupSpec
      *
      * @return array{sql: string}  parameterised on [since, until]
      */
-    public function sketchBackfillSql(string $rollupTable): array
+    /**
+     * @param  ?string  $fromSql  Alternate FROM source (StorageV2::unionFrom's
+     *                            v1+v2 compat union). When given, it already
+     *                            carries the created_at window INSIDE each arm
+     *                            — this SQL then binds the window per arm and
+     *                            adds no outer created_at predicate.
+     */
+    public function sketchBackfillSql(string $rollupTable, ?string $fromSql = null): array
     {
         $g = DDSketchHistogram::GAMMA;
         $idxExpr = sprintf(
@@ -269,9 +276,10 @@ final class RollupSpec
                            COALESCE(environment, '') AS env,
                            {$idxExpr} AS idx,
                            COUNT(*) AS c
-                    FROM {$this->source}
+                    FROM ".($fromSql ?? "{$this->source}
                     WHERE created_at >= ? AND created_at < ?
-                      AND {$this->durationField} IS NOT NULL{$predicate}
+                      AND 1=1")."
+                    ".($fromSql !== null ? 'WHERE' : 'AND')." {$this->durationField} IS NOT NULL{$predicate}
                     GROUP BY ".implode(', ', range(1, $groupByCount + 1))."
                 ) g
                 GROUP BY {$gAliases}, bucket, env

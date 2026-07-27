@@ -39,9 +39,13 @@ final class MigrationRunner
         // with its own static state. Probe the NEWEST migration's observable
         // effect — probing an early artifact would skip every migration added
         // since the test DB was first provisioned. Update this probe whenever
-        // a migration is added (currently 000063 concurrency rollup, 000064
-        // mail/notification composites, 000065 cache key_pattern).
-        if (Schema::connection('nightowl')->hasTable('nightowl_request_hourly_rollups')
+        // a migration is added (currently 000068 dict_trace.created_at; before
+        // that 000066 dictionaries + 000067 raw v2 family; 000063 concurrency
+        // rollup, 000064 mail/notification composites, 000065 cache key_pattern).
+        if (Schema::connection('nightowl')->hasTable('nightowl_dict_string')
+            && Schema::connection('nightowl')->hasColumn('nightowl_dict_trace', 'created_at')
+            && Schema::connection('nightowl')->hasTable('nightowl_requests_v2')
+            && Schema::connection('nightowl')->hasTable('nightowl_request_hourly_rollups')
             && Schema::connection('nightowl')->hasColumn('nightowl_query_rollups', 'sketch')
             && Schema::connection('nightowl')->hasTable('nightowl_logs_pdefault')
             && Schema::connection('nightowl')->hasColumn('nightowl_mail_rollups', 'duration_count')

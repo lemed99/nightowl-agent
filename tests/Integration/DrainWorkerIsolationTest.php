@@ -144,7 +144,7 @@ class DrainWorkerIsolationTest extends TestCase
         $this->appendRequest('good-4');
         $this->appendRequest('good-5');
 
-        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
         $worker = $this->worker(quarantine: true);
 
         $this->assertTrue($this->drainOnce($worker, $writer));
@@ -175,7 +175,7 @@ class DrainWorkerIsolationTest extends TestCase
             $this->appendPoison('poison-'.$i);
         }
 
-        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
         $worker = $this->worker(quarantine: true, breakerThreshold: 3);
 
         $this->assertFalse($this->drainOnce($worker, $writer), 'breaker trips → batch reported as not-progressed');
@@ -193,7 +193,7 @@ class DrainWorkerIsolationTest extends TestCase
         $this->appendRequest('good-a');
         $this->appendPoison('poison');
 
-        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
         $worker = $this->worker(quarantine: false);
 
         // Phase-1 behavior: the whole batch fails (all-or-nothing), nothing is
@@ -219,7 +219,7 @@ class DrainWorkerIsolationTest extends TestCase
      */
     public function test_a_skipped_partition_sweep_does_not_spend_the_hour(): void
     {
-        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
         $worker = $this->worker(quarantine: false);
 
         $gate = new ReflectionMethod($worker, 'maintainPartitionsIfDue');

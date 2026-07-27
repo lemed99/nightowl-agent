@@ -5,6 +5,80 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.0.0] - unreleased
+
+### Added
+
+- **Storage format v2 — the definitive raw-telemetry format** (migrations
+  000066/000067; ships together with the 000063–000065 concurrency-rollup /
+  cache-key-pattern work below). Every raw table gains a `{table}_v2`
+  partitioned twin born in its final shape:
+  - the varchar wire `timestamp` becomes `ts_us bigint` (event time, µs,
+    eventEpoch-guarded — closes the poison-varchar hole for good);
+  - `trace_id`/`execution_id`/`job_id`/`attempt_id` become native `uuid`
+    (16 B vs 37 B text), with `trace_id` stored NULL when it equals
+    `execution_id` (the SDK duplicates them on request-sourced children;
+    readers reconstruct via COALESCE — exact and lossless);
+  - `group_hash`/`fingerprint` become 16-byte `bytea`;
+  - repeated low-cardinality labels (environment, server, deploy, source,
+    stage, connection, queue, status, event_type, method, level, channel,
+    store, host, job_class, cache pattern) become small int ids into the new
+    append-only `nightowl_dict_string`;
+  - each distinct `(sql, file, line)` is stored ONCE in `nightowl_dict_sql`
+    (measured production: 28M query rows/day over 225 distinct statements),
+    route tuples in `nightowl_dict_route` (content-hash keyed — a renamed
+    controller action creates a NEW entry, history never rewrites), exception
+    stack traces deflated in `nightowl_dict_trace`;
+  - request/command/job/log JSON blobs are agent-side-deflated `bytea`,
+    stored NULL when they were only a `''`/`'{}'`/`'null'`/`'[]'` placeholder
+    (server-side TOAST compression cannot fire on sub-2 KB rows — measured);
+  - `v` (constant wire version) is not carried. Nothing else is dropped:
+    every v1 value is byte-recoverable from a v2 row plus the dictionaries.
+
+  The drain writes v2 whenever the parents exist (probe cached per process,
+  fail-open toward v1; `NIGHTOWL_STORAGE_V2=false` is the operational kill
+  switch — reverts to v1 with no schema change). Dictionary ids resolve in an
+  autocommit warm pass BEFORE the batch transaction (a rollback can never
+  poison the cache); concurrent workers converge via `ON CONFLICT DO NOTHING`
+  + re-select. The cutover instant is recorded once as the `v2_fence` settings
+  row; the API reads v1, v2, or their union per window. Rollups, issues,
+  users and settings tables are unchanged (hex-text keys, bridged with
+  `decode(...,'hex')`), and drain-time rollup rows are byte-identical in both
+  modes (they aggregate the in-memory records, not the tables — pinned by
+  test).
+
+  `nightowl:backfill-rollups` scans both families through a per-table
+  v1-compat projection UNION, so a window straddling the cutover backfills
+  byte-identically to an all-v1 control (pinned, DDSketch bytes included).
+  Partition maintenance, heal, prune and clear all operate on both families;
+  the dictionaries are never pruned or cleared (append-only value stores).
+
+- **v1 end-of-life, prune-integrated.** Once the `v2_fence` is older than the
+  prune retention window AND a v1 table is empty AND its v2 twin exists,
+  `nightowl:prune` drops the v1 parent (instant on empty; `--keep-v1` opts
+  out). Emptiness doubles as the mixed-fleet guard: an old agent still
+  draining v1 keeps rows younger than retention, so the drop can never fire
+  under it. Post-EOL, every table list (maintenance, prune, migrate baseline,
+  issue upserts, alert enrichment) probes existence rather than assuming v1.
+
+- **`dict_trace` garbage collection** (`nightowl:gc-dict-traces`, migration
+  000068). `nightowl_dict_trace` is the one dictionary that can be reclaimed:
+  a deflated stack trace is only ever pointed at by `nightowl_exceptions_v2`
+  rows, which age out at retention, so once every referencing exception is
+  pruned the trace is dead weight (the other three dicts hold
+  unbounded-lifetime keys and stay append-only forever). A trace is deleted
+  only when it is BOTH unreferenced (anti-join on `trace_ref`) AND older than
+  the quarantine window (`NIGHTOWL_DICT_TRACE_GC_QUARANTINE_DAYS`, default 7).
+  The GC needs no lock: migration 000068 adds a `created_at` clock that the
+  drain's warm pass now bumps (`ON CONFLICT DO UPDATE SET created_at = now()`)
+  on every batch that references a trace — the collector always re-warms
+  traces rather than trusting its LRU — so an in-flight trace is always young,
+  and the single-statement DELETE re-checks `created_at` (a concurrent
+  reference spares the row; a lost race re-creates it append-only with a fresh
+  id, so no exception is ever left with a dangling `trace_ref`). Rides the
+  existing `nightowl:prune` schedule; `--dry-run`, `--quarantine-days`,
+  `--chunk`; a no-op on any tenant without the v2 twin or the 000068 column.
+
 ## [1.5.0] - 2026-07-20
 
 ### Added

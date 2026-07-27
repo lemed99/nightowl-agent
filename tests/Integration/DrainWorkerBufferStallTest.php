@@ -158,7 +158,7 @@ class DrainWorkerBufferStallTest extends TestCase
         $this->appendRequest('r2');
         $this->appendRequest('r3');
 
-        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
         $worker = $this->worker();
 
         // Disk fills: writes to the buffer now fail, reads still work.

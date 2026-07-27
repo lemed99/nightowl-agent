@@ -18,6 +18,14 @@
             <directory>tests/System</directory>
         </testsuite>
     </testsuites>
+    <php>
+        <!-- The System harness subprocess reads this to choose the storage
+             family; the legacy System assertions target the v1 tables. Run
+             `NIGHTOWL_STORAGE_V2=true vendor/bin/phpunit -testsuite System`
+             for a v2-mode pass (Phase F wiring runs both). Integration tests
+             are unaffected: they pin the family per RecordWriter constructor. -->
+        <env name="NIGHTOWL_STORAGE_V2" value="false"/>
+    </php>
     <source>
         <include>
             <directory>src</directory>

@@ -100,7 +100,7 @@ final class ConcurrencyBackfillTest extends TestCase
 
     public function test_backfill_computes_exact_folds_from_raw(): void
     {
-        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
         $sim = new NightwatchSimulator('test-token');
 
         // An hour back — outside the cleanup tick's 20-min maintenance window,

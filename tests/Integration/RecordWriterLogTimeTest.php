@@ -58,7 +58,7 @@ class RecordWriterLogTimeTest extends TestCase
             $this->markTestSkipped('PostgreSQL not available. Set NIGHTOWL_TEST_DB_* env vars.');
         }
 
-        $this->writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $this->writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
         self::$pdo->exec('TRUNCATE nightowl_logs');
     }
 

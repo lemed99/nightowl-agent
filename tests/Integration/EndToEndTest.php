@@ -64,7 +64,7 @@ class EndToEndTest extends TestCase
             $this->markTestSkipped('PostgreSQL not available. Set NIGHTOWL_TEST_DB_* env vars.');
         }
 
-        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
 
         $this->handler = new ConnectionHandler(
             parser: new PayloadParser(gzipEnabled: true),

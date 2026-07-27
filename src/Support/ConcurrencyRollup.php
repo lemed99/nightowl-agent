@@ -58,6 +58,7 @@ final class ConcurrencyRollup
         int $endCeilEpoch,
         int $bucketLowEpoch,
         int $bucketHighEpoch,
+        bool $includeV2 = false,
     ): array {
         $guard = self::TS_GUARD;
         $leg = "SELECT timestamp::float8 AS ts, 1 AS delta
@@ -70,6 +71,23 @@ final class ConcurrencyRollup
                 WHERE created_at >= ? AND created_at < ?
                   AND duration IS NOT NULL AND duration >= 0 AND {$guard}
                   AND timestamp::float8 + duration / 1000000.0 <= ?";
+
+        if ($includeV2) {
+            // v2 legs: ts_us is a typed bigint (event µs) — no regex guard
+            // needed; duration/end-ceiling guards identical.
+            $leg .= " UNION ALL
+                SELECT ts_us / 1000000.0 AS ts, 1 AS delta
+                FROM nightowl_requests_v2
+                WHERE created_at >= ? AND created_at < ?
+                  AND duration IS NOT NULL AND duration >= 0
+                  AND ts_us / 1000000.0 + duration / 1000000.0 <= ?";
+            $endLeg .= " UNION ALL
+                SELECT ts_us / 1000000.0 + duration / 1000000.0, -1
+                FROM nightowl_requests_v2
+                WHERE created_at >= ? AND created_at < ?
+                  AND duration IS NOT NULL AND duration >= 0
+                  AND ts_us / 1000000.0 + duration / 1000000.0 <= ?";
+        }
 
         $sql = 'INSERT INTO '.self::TABLE." (bucket_start, delta_sum, max_prefix)
              SELECT to_timestamp(bucket) AT TIME ZONE 'UTC',
@@ -88,11 +106,16 @@ final class ConcurrencyRollup
              GROUP BY bucket
              HAVING bucket >= ? AND bucket < ?";
 
+        $windowBindings = [$scanFrom, $scanTo, $endCeilEpoch];
+        $perLeg = $includeV2
+            ? [...$windowBindings, ...$windowBindings]
+            : $windowBindings;
+
         return [
             'sql' => $sql,
             'bindings' => [
-                $scanFrom, $scanTo, $endCeilEpoch,
-                $scanFrom, $scanTo, $endCeilEpoch,
+                ...$perLeg,   // start leg (+ its v2 arm)
+                ...$perLeg,   // end leg (+ its v2 arm)
                 $bucketLowEpoch, $bucketHighEpoch,
             ],
         ];

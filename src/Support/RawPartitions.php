@@ -48,6 +48,39 @@ final class RawPartitions
     public const DAYS_AHEAD = 7;
 
     /**
+     * TABLES plus every storage-v2 parent that exists on this tenant — the
+     * list the maintenance tick (child sweep, leftover heal) and
+     * PartitionCommand should operate on post-cutover. v2 parents are born
+     * partitioned with the same created_at key and child-naming scheme, so
+     * every helper here treats them like any other parent; on a pre-v2 tenant
+     * the probe finds none and this degrades to TABLES exactly.
+     *
+     * One round trip; a probe failure returns plain TABLES (fail toward the
+     * v1-only behavior every caller already had).
+     */
+    public static function tablesIncludingV2(PDO $conn): array
+    {
+        // BOTH families are existence-probed: v2 twins appear only once
+        // migrated, and v1 names DISAPPEAR once prune's EOL retires them — a
+        // post-EOL tenant whose maintenance/prune kept naming dropped v1
+        // tables would 42P01 on every run, forever.
+        $terms = [];
+        foreach (self::TABLES as $table) {
+            $terms[] = "SELECT '{$table}' AS t WHERE to_regclass('{$table}') IS NOT NULL";
+            $terms[] = "SELECT '{$table}_v2' AS t WHERE to_regclass('{$table}_v2') IS NOT NULL";
+        }
+
+        try {
+            $stmt = $conn->query(implode(' UNION ALL ', $terms));
+            $found = $stmt === false ? null : $stmt->fetchAll(PDO::FETCH_COLUMN);
+        } catch (\Throwable) {
+            return self::TABLES; // probe failure → pre-v2 behavior
+        }
+
+        return $found === null || $found === [] ? self::TABLES : $found;
+    }
+
+    /**
      * Ceiling on every piece of DDL the DRAIN's maintenance ticks issue: the heal
      * sweep's ALTER TABLE ... DROP CONSTRAINT and DROP INDEX, and the hourly child
      * sweep's CREATE TABLE ... PARTITION OF. All of them need ACCESS EXCLUSIVE on

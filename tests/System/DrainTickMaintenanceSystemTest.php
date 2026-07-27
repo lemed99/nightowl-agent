@@ -284,7 +284,7 @@ class DrainTickMaintenanceSystemTest extends TestCase
         use NightOwl\\Agent\\DrainWorker;
 
         \$container = new Container();
-        \$container->instance('config', new Repository([]));
+        \$container->instance('config', new Repository(['nightowl' => ['storage_v2' => false]]));
         Container::setInstance(\$container);
 
         (new DrainWorker(

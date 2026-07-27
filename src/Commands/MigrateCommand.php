@@ -247,7 +247,7 @@ class MigrateCommand extends Command
             return true;
         }
 
-        $rawMin = $conn->table('nightowl_requests')->min('created_at');
+        $rawMin = \NightOwl\Support\StorageV2::rawMinCreatedAt($conn->getPdo(), 'nightowl_requests');
         if ($rawMin === null) {
             return false;
         }
@@ -263,7 +263,7 @@ class MigrateCommand extends Command
             return true; // empty
         }
 
-        $rawMin = $conn->table($spec->source)->min('created_at');
+        $rawMin = \NightOwl\Support\StorageV2::rawMinCreatedAt($conn->getPdo(), $spec->source);
         if ($rawMin === null) {
             return false; // no raw history to be missing
         }
@@ -349,7 +349,10 @@ class MigrateCommand extends Command
         $all = $this->packageMigrationNames($migrationsPath);
         $nightowlHistory = $repository->getRan();
         $primaryHistory = self::primaryHistory();
-        $tableExists = Schema::connection('nightowl')->hasTable('nightowl_requests');
+        // Either family counts: a post-EOL tenant (v1 retired by prune) must
+        // still baseline-adopt, or it would misread its own DB as fresh.
+        $tableExists = Schema::connection('nightowl')->hasTable('nightowl_requests')
+            || Schema::connection('nightowl')->hasTable('nightowl_requests_v2');
 
         $toRecord = self::migrationsToRecord($all, $nightowlHistory, $primaryHistory, $tableExists);
 

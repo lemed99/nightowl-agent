@@ -58,7 +58,7 @@ class PartitionCommand extends Command
         $schema = Schema::connection('nightowl');
         $only = $this->option('table');
 
-        $tables = $only !== null ? [$only] : RawPartitions::TABLES;
+        $tables = $only !== null ? [$only] : RawPartitions::tablesIncludingV2($conn->getPdo());
         if ($only !== null && ! in_array($only, RawPartitions::TABLES, true)) {
             $this->error("{$only} is not a partitionable raw table.");
 

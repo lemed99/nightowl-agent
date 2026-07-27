@@ -321,15 +321,42 @@ final class AlertNotifier
 
         if ($issueType === 'exception') {
             try {
-                $stmt = $pdo->prepare('
-                    SELECT file, line, server, php_version, laravel_version, handled
-                    FROM nightowl_exceptions
-                    WHERE fingerprint = ? AND environment IS NOT DISTINCT FROM ?
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                ');
-                $stmt->execute([$fingerprint, $environment]);
-                $exc = $stmt->fetch(PDO::FETCH_ASSOC);
+                // Storage v2 first (fingerprint is bytea, server is a dict
+                // id): recent occurrences land there post-cutover, and the
+                // enrichment wants the LATEST one. Falls through to the v1
+                // query when v2 is absent or has no row for this fingerprint
+                // — both probes are best-effort like everything here.
+                $exc = false;
+                try {
+                    $stmt = $pdo->prepare("
+                        SELECT e.file, e.line, s.value AS server,
+                               e.php_version, e.laravel_version, e.handled
+                        FROM nightowl_exceptions_v2 e
+                        LEFT JOIN nightowl_dict_string s ON s.id = e.server_id
+                        WHERE e.fingerprint = decode(?, 'hex')
+                          AND (e.environment_id = (SELECT id FROM nightowl_dict_string
+                                                    WHERE kind = 'environment' AND value = ?)
+                               OR (?::text IS NULL AND e.environment_id IS NULL))
+                        ORDER BY e.created_at DESC
+                        LIMIT 1
+                    ");
+                    $stmt->execute([$fingerprint, $environment, $environment]);
+                    $exc = $stmt->fetch(PDO::FETCH_ASSOC);
+                } catch (\Throwable) {
+                    // v2 absent (42P01) or non-hex fingerprint — use v1.
+                }
+
+                if (! $exc) {
+                    $stmt = $pdo->prepare('
+                        SELECT file, line, server, php_version, laravel_version, handled
+                        FROM nightowl_exceptions
+                        WHERE fingerprint = ? AND environment IS NOT DISTINCT FROM ?
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    ');
+                    $stmt->execute([$fingerprint, $environment]);
+                    $exc = $stmt->fetch(PDO::FETCH_ASSOC);
+                }
 
                 if ($exc) {
                     $group['server'] = ! empty($exc['server']) ? $exc['server'] : null;

@@ -72,7 +72,7 @@ class RecordWriterTest extends TestCase
             $this->markTestSkipped('PostgreSQL not available. Set NIGHTOWL_TEST_DB_* env vars.');
         }
 
-        $this->writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $this->writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
         $this->sim = new NightwatchSimulator('test-token');
 
         self::truncateAllTables();
@@ -1404,7 +1404,7 @@ class RecordWriterTest extends TestCase
 
         try {
             // Fresh writer so the table-exists probe re-runs and observes the drop.
-            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
             $writer->write([
                 $this->sim->makeQuery(['trace_id' => 'no-rollup-tbl', 'sql' => 'SELECT 1', 'duration' => 1000]),
             ]);
@@ -1434,7 +1434,7 @@ class RecordWriterTest extends TestCase
 
         try {
             // Fresh writer so the column probe re-runs and observes the drop.
-            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
             $writer->write([
                 $this->sim->makeQuery(['trace_id' => 'q-missing-col', 'sql' => 'SELECT 1', 'duration' => 1000]),
             ]);
@@ -1459,8 +1459,8 @@ class RecordWriterTest extends TestCase
             'duration' => $duration, 'connection' => 'pgsql',
         ]);
 
-        $writerA = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
-        $writerB = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $writerA = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
+        $writerB = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
 
         $writerA->write([$make('mw-a1', 1000), $make('mw-a2', 200000)]); // bins for 1000 and 200000
         $writerB->write([$make('mw-b1', 1000)]);
@@ -1838,7 +1838,7 @@ class RecordWriterTest extends TestCase
         date_default_timezone_set('America/Bogota'); // UTC-5
 
         try {
-            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
             $writer->write([
                 $this->sim->makeJob(['trace_id' => 'utc-created-at-1']),
             ]);
@@ -1891,7 +1891,7 @@ class RecordWriterTest extends TestCase
         self::$pdo->exec('ALTER DATABASE '.self::$database." SET timezone = 'Asia/Dhaka'");
 
         try {
-            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
             $writer->write([
                 $this->sim->makeRequest(['trace_id' => 'tz-req']),
                 $this->sim->makeQuery(['trace_id' => 'tz-qry']),
@@ -2162,6 +2162,7 @@ class RecordWriterTest extends TestCase
             self::$host, self::$port, self::$database, self::$username, self::$password,
             86400,
             new \NightOwl\Agent\AlertNotifier(86400, '', null, 24),
+            storageV2Config: false,
         );
 
         $writer->write([$this->sim->makeException(array_merge($base, ['trace_id' => 'c1']))]);

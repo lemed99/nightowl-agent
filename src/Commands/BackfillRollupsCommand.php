@@ -305,7 +305,10 @@ class BackfillRollupsCommand extends Command
             $until = $safetyCeiling->copy();
         }
 
-        $sinceOption = $this->option('since') ?: $conn->table($spec->source)->min('created_at');
+        // Raw floor spans BOTH storage families post-cutover: pre-fence rows
+        // live in v1, post-fence in the v2 twin.
+        $sinceOption = $this->option('since')
+            ?: \NightOwl\Support\StorageV2::rawMinCreatedAt($conn->getPdo(), $spec->source);
         if ($sinceOption === null) {
             $this->line("  {$spec->table}: no source rows.");
 
@@ -400,14 +403,27 @@ class BackfillRollupsCommand extends Command
                 ->where('bucket_start', '<', $end)
                 ->delete();
 
+            // The scan source is the v1 table UNION ALL'd with the v2 compat
+            // projection when the v2 twin exists (StorageV2::unionFrom) — a
+            // replace-per-bucket chunk must aggregate over BOTH families in
+            // one statement, or the second pass would replace the first. The
+            // projection presents v2 under the v1 column names, so every
+            // RollupSpec SQL expression (and the resulting rollup keys) stays
+            // byte-identical across storage families.
+            [$fromSql, $armCount] = \NightOwl\Support\StorageV2::unionFrom(
+                $conn->getPdo(),
+                $spec->source,
+                'created_at >= ? AND created_at < ?',
+            );
+            $windowBindings = array_merge(...array_fill(0, $armCount, [$start, $end]));
+
             $conn->statement(
                 "INSERT INTO {$spec->table} ({$columns})
                  SELECT {$selects}
-                 FROM {$spec->source}
-                 WHERE created_at >= ? AND created_at < ?
+                 FROM {$fromSql}
                  GROUP BY {$groupBy}
                  {$onConflict}",
-                [$start, $end]
+                $windowBindings
             );
 
             // v2 DDSketch recompute for the same window — SQL-side (index CASE
@@ -415,7 +431,10 @@ class BackfillRollupsCommand extends Command
             // would not scale on exactly the tenants that need backfill.
             if ($spec->hasHistogram
                 && $conn->getSchemaBuilder()->hasColumn($spec->table, 'sketch')) {
-                $conn->statement($spec->sketchBackfillSql($spec->table)['sql'], [$start, $end]);
+                $conn->statement(
+                    $spec->sketchBackfillSql($spec->table, $fromSql)['sql'],
+                    $windowBindings
+                );
             }
 
             return (int) $conn->table($spec->table)
@@ -452,7 +471,8 @@ class BackfillRollupsCommand extends Command
             $until = $safetyCeiling->copy();
         }
 
-        $sinceOption = $this->option('since') ?: $conn->table('nightowl_requests')->min('created_at');
+        $sinceOption = $this->option('since')
+            ?: \NightOwl\Support\StorageV2::rawMinCreatedAt($conn->getPdo(), 'nightowl_requests');
         if ($sinceOption === null) {
             $this->line("  {$table}: no source rows.");
 
@@ -499,6 +519,9 @@ class BackfillRollupsCommand extends Command
                     now()->getTimestamp() + ConcurrencyRollup::END_CEIL_FUTURE_SECONDS,
                     $bucketLowEpoch,
                     $bucketHighEpoch,
+                    includeV2: (bool) $conn->getPdo()->query(
+                        "SELECT to_regclass('nightowl_requests_v2') IS NOT NULL AS e"
+                    )->fetchColumn(),
                 );
                 $conn->statement($q['sql'], $q['bindings']);
             });

@@ -14,7 +14,8 @@ class PruneCommand extends Command
         {--days= : Number of days to retain raw telemetry}
         {--hours= : Number of HOURS to retain raw telemetry (overrides --days; for aggressive demo-feeder retention on a sub-day cadence)}
         {--rollup-days= : Number of days to retain query rollups (defaults to far longer than raw)}
-        {--delete-chunk=100000 : Rows per DELETE statement for raw-table trims (smaller = shorter transactions, more statements)}';
+        {--delete-chunk=100000 : Rows per DELETE statement for raw-table trims (smaller = shorter transactions, more statements)}
+        {--keep-v1 : Never retire empty v1 raw tables, even when the storage-v2 cutover has aged past retention}';
 
     protected $description = 'Prune old NightOwl monitoring data';
 
@@ -57,7 +58,22 @@ class PruneCommand extends Command
 
         $totalDeleted = 0;
 
-        foreach (self::TABLES as $table) {
+        // v1 raw tables + any storage-v2 twins this tenant has. The
+        // dictionary tables (nightowl_dict_*) are deliberately NEVER pruned:
+        // they are append-only value stores a running daemon's LRU caches
+        // ids from — removing rows under it would leave later telemetry
+        // referencing dead ids. They are tiny; dict_trace GC is a tracked
+        // follow-up.
+        $rawTables = RawPartitions::tablesIncludingV2($conn->getPdo());
+        $schemaBuilder = $conn->getSchemaBuilder();
+
+        foreach ($rawTables as $table) {
+            // Belt to tablesIncludingV2's probe: a table retired between the
+            // probe and this loop (or a stale fallback list) must be skipped,
+            // never allowed to abort the whole prune with 42P01.
+            if (! $schemaBuilder->hasTable($table)) {
+                continue;
+            }
             // Partitioned tables: DROP fully-expired daily children first —
             // instant, zero WAL amplification, zero vacuum debt — then let the
             // row-DELETE below clean only the boundary/historic/default
@@ -87,6 +103,8 @@ class PruneCommand extends Command
                 $this->line("  {$table}: dropped empty historic partition (pre-conversion space reclaimed)");
             }
         }
+
+        $this->retireEmptyV1Tables($conn, $cutoff);
 
         // Rollups are tiny, so they're retained far longer than raw telemetry —
         // pruning raw aggressively while keeping rollups gives long-range trend
@@ -146,6 +164,17 @@ class PruneCommand extends Command
         $this->newLine();
         $this->info("Pruned {$totalDeleted} records total.");
 
+        // Reclaim the one prunable dictionary. Pruning exception rows above is
+        // exactly what makes their stack traces collectable, so GC rides the
+        // same retention cadence — an unreferenced trace becomes eligible only
+        // after the exceptions pointing at it age out here. Guarded: a GC
+        // failure (e.g. a pre-000068 tenant) must never fail a completed prune.
+        try {
+            $this->call('nightowl:gc-dict-traces');
+        } catch (\Throwable $e) {
+            $this->warn("  dict-trace GC skipped ({$e->getMessage()})");
+        }
+
         return $this->finish($conn);
     }
 
@@ -188,6 +217,63 @@ class PruneCommand extends Command
         } while ($deleted >= $chunk);
 
         return $total;
+    }
+
+    /**
+     * v1 end-of-life: retire a v1 raw table only when ALL of these hold —
+     *
+     *   1. --keep-v1 was not passed (the operator escape hatch);
+     *   2. the storage-v2 cutover fence exists and is OLDER than this prune's
+     *      retention window (every possibly-live v1 row has aged out);
+     *   3. the v2 twin exists (this tenant genuinely runs v2);
+     *   4. the v1 parent is EMPTY.
+     *
+     * Gate 4 doubles as the mixed-fleet guard: an old agent still draining
+     * into v1 keeps rows younger than retention, so the drop can never fire
+     * under it. The seconds-wide check-then-drop race is accepted: an old
+     * agent losing it sees a visible 42P01 and its SQLite buffer retains the
+     * batch for retry after the operator intervenes.
+     *
+     * DROP TABLE on an empty partitioned parent is instant; the space of its
+     * (already pruned) children returned to the OS as they were dropped.
+     */
+    private function retireEmptyV1Tables($conn, string $cutoff): void
+    {
+        if ($this->option('keep-v1')) {
+            return;
+        }
+
+        $pdo = $conn->getPdo();
+
+        try {
+            $fence = \NightOwl\Support\StorageV2::fence($pdo);
+        } catch (\Throwable) {
+            return; // no settings table / probe failure — never EOL on a guess
+        }
+        if ($fence === null || $fence >= $cutoff) {
+            return; // no cutover, or cutover younger than retention
+        }
+
+        foreach (\NightOwl\Support\StorageV2::TABLES as $v1 => $v2) {
+            try {
+                $v1Exists = (bool) $pdo->query("SELECT to_regclass('{$v1}') IS NOT NULL AS e")->fetchColumn();
+                $v2Exists = (bool) $pdo->query("SELECT to_regclass('{$v2}') IS NOT NULL AS e")->fetchColumn();
+                if (! $v1Exists || ! $v2Exists) {
+                    continue;
+                }
+
+                $hasRows = (bool) $pdo->query("SELECT EXISTS (SELECT 1 FROM {$v1} LIMIT 1) AS e")->fetchColumn();
+                if ($hasRows) {
+                    continue; // gate 4 — possibly an old agent still writing v1
+                }
+
+                $conn->statement("DROP TABLE {$v1}");
+                $this->line("  {$v1}: v1 storage retired (v2 fence {$fence}, retention passed, no v1 rows)");
+            } catch (\Throwable $e) {
+                // Per-table isolation: an EOL failure must never fail the prune.
+                $this->warn("  {$v1}: v1 retirement skipped ({$e->getMessage()})");
+            }
+        }
     }
 
     private function finish($conn): int

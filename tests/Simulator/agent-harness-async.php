@@ -64,6 +64,18 @@ unset($pdo);
 
 // Apply the agent's migrations — single source of truth.
 MigrationRunner::migrate($dbHost, $dbPort, $dbName, $dbUser, $dbPass);
+
+// Deterministic config for the forked drain workers: config() in this
+// harness otherwise resolves every key to its default. NIGHTOWL_STORAGE_V2
+// controls the storage family (the System suite pins v1 via phpunit.xml env;
+// production parity — v2 — is the default when unset).
+\Illuminate\Container\Container::getInstance()->instance('config', new \Illuminate\Config\Repository([
+    'nightowl' => [
+        'storage_v2' => getenv('NIGHTOWL_STORAGE_V2') === false
+            ? true
+            : filter_var(getenv('NIGHTOWL_STORAGE_V2'), FILTER_VALIDATE_BOOLEAN),
+    ],
+]));
 fwrite(STDOUT, "Tables ready.\n");
 
 // SQLite buffer path — caller can pin a known path so tests can read the

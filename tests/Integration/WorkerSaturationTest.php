@@ -65,6 +65,7 @@ class WorkerSaturationTest extends TestCase
         $this->writer = new RecordWriter(
             self::$host, self::$port, self::$database, self::$username, self::$password,
             environment: 'production',
+            storageV2Config: false,
         );
 
         self::$pdo->exec('TRUNCATE nightowl_request_rollups');
@@ -288,6 +289,7 @@ class WorkerSaturationTest extends TestCase
         $writer2 = new RecordWriter(
             self::$host, self::$port, self::$database, self::$username, self::$password,
             environment: 'production',
+            storageV2Config: false,
         );
         $this->seedMinute(0, 120.0); // becomes irrelevant; minute 1 still breaches
         $writer2->checkWorkerSaturation();
@@ -313,6 +315,7 @@ class WorkerSaturationTest extends TestCase
         $writer2 = new RecordWriter(
             self::$host, self::$port, self::$database, self::$username, self::$password,
             environment: 'production',
+            storageV2Config: false,
         );
         $writer2->checkWorkerSaturation();
 
@@ -331,6 +334,7 @@ class WorkerSaturationTest extends TestCase
         $writer2 = new RecordWriter(
             self::$host, self::$port, self::$database, self::$username, self::$password,
             environment: 'production',
+            storageV2Config: false,
         );
         $writer2->checkWorkerSaturation();
 

@@ -91,6 +91,47 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Storage Format v2
+    |--------------------------------------------------------------------------
+    |
+    | The operational kill switch for the v2 raw-telemetry format (dictionary
+    | ids, native uuid/bytea, deflated blobs — migrations 000066/000067).
+    | With the v2 tables present the drain writes v2; flipping this to false
+    | reverts it to the v1 tables WITHOUT any schema change, and the API's
+    | dual-read keeps every row visible either way. Top-level key on purpose:
+    | mergeConfigFrom() is a shallow array_merge, so a key nested under
+    | 'database' would be swallowed by any published config.
+    |
+    */
+
+    'storage_v2' => (bool) env('NIGHTOWL_STORAGE_V2', true),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Trace-dictionary GC
+    |--------------------------------------------------------------------------
+    |
+    | nightowl_dict_trace is the one dictionary that can be reclaimed: a
+    | deflated stack trace is only ever pointed at by exception rows, which age
+    | out at retention, so once every referencing exception is pruned the trace
+    | is dead weight (the other three dicts hold unbounded-lifetime keys and are
+    | never pruned). nightowl:gc-dict-traces deletes traces that are BOTH
+    | unreferenced by any nightowl_exceptions_v2 row AND older than the
+    | quarantine window below.
+    |
+    | The quarantine is not a correctness knob — the drain bumps a trace's
+    | created_at on every reference, so an in-flight batch can never race the
+    | GC (see 000068). It only controls how long an already-unreferenced trace
+    | lingers before reclamation; a week keeps recently-hot traces around for a
+    | recurrence without re-deflating them. TOP-LEVEL key (shallow-merge rule).
+    |
+    */
+    'dict_trace_gc' => [
+        'quarantine_days' => (int) env('NIGHTOWL_DICT_TRACE_GC_QUARANTINE_DAYS', 7),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Table Statistics Reporting
     |--------------------------------------------------------------------------
     |

@@ -220,6 +220,9 @@ final class DrainWorker
             // turns it off for a tenant the rule hurts. Top-level key (shallow
             // merge rule).
             cacheKeyTemplateEnabled: (bool) config('nightowl.cache_key_template', true),
+            // Storage-v2 kill switch — false reverts the drain to the v1
+            // tables without a schema change. Top-level key (shallow merge).
+            storageV2Config: (bool) config('nightowl.storage_v2', true),
         );
 
         $workerLabel = $this->totalWorkers > 1

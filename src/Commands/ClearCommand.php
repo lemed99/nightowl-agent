@@ -81,6 +81,13 @@ class ClearCommand extends Command
 
         return array_values(array_unique([
             ...self::RAW_TABLES,
+            // Storage-v2 twins — truncated alongside their v1 tables (the
+            // per-table hasTable guard in handle() skips absent ones). The
+            // nightowl_dict_* tables are deliberately NOT cleared: a running
+            // daemon's DictionaryCache holds value→id entries, and truncating
+            // the dictionaries under it would make every subsequent v2 row
+            // reference a dead id. Dict values carry no per-event data.
+            ...array_values(\NightOwl\Support\StorageV2::TABLES),
             ...array_keys($rollups),
             // Bespoke rollup outside RollupSpecs::all() — hand-listed, like
             // its PruneCommand twin.

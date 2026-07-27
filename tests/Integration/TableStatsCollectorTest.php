@@ -93,7 +93,14 @@ final class TableStatsCollectorTest extends TestCase
 
         $this->assertArrayHasKey('nightowl_zz_future_feature', $tables,
             'a brand-new table with ZERO registration anywhere must appear in the sample');
-        $this->assertSame(25, $tables['nightowl_zz_future_feature']['live']);
+        // n_live_tup is an ESTIMATE under PG15+'s shared-memory stats: the
+        // ANALYZE snapshot and the insert's own flushed delta land separately,
+        // so right after CREATE+INSERT+ANALYZE the value reads 25 or 50
+        // depending on arrival order (observed flapping run-to-run). The
+        // collector's job is approximate sizing — assert presence and
+        // magnitude, not exactness.
+        $this->assertGreaterThanOrEqual(25, $tables['nightowl_zz_future_feature']['live']);
+        $this->assertLessThanOrEqual(50, $tables['nightowl_zz_future_feature']['live']);
         $this->assertGreaterThan(0, $tables['nightowl_zz_future_feature']['bytes']);
     }
 
