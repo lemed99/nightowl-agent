@@ -150,10 +150,19 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 tokenHash: $tokenHash,
             );
 
+            // Both modes go through MultiIngest — single-agent mode wraps a lone
+            // ingest purely for its fail-open write path. A monitoring package
+            // must never take the host application down: Nightwatch's own hooks
+            // guard every call site they own, but that is their guarantee to
+            // maintain, not ours to inherit. Anything that reaches
+            // Core::$ingest through a path they haven't wrapped (a customer
+            // calling Nightwatch::report(), a future hook, an older SDK) would
+            // otherwise surface an unreachable-agent socket error inside an
+            // unrelated customer request. (Reported by @TheDaveKent, #4.)
             if (config('nightowl.parallel_with_nightwatch', false)) {
                 $core->ingest = new MultiIngest($core->ingest, $nightowlIngest);
             } else {
-                $core->ingest = $nightowlIngest;
+                $core->ingest = new MultiIngest($nightowlIngest);
             }
         });
 

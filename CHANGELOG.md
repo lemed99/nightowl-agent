@@ -126,6 +126,38 @@ in the git tags.
   than one running slightly stale code. Restarting stays your call. Opt out with
   `NIGHTOWL_UPDATE_CHECK=false`.
 
+### Fixed
+
+- **An unreachable agent socket can no longer surface inside a host request.**
+  Single-agent mode (the default) assigned Nightwatch's `Ingest` straight onto
+  `Core::$ingest`, so a failed acknowledgement from the agent — a dead socket, a
+  wrong `NIGHTOWL_INGEST_URI` — threw out of `Ingest::write()` on whatever
+  telemetry call happened to fill the buffer. Both modes now go through
+  `Support\MultiIngest`, which absorbs transport failures on every method it
+  fans out except `ping` — `write`, `writeNow`, `digest`, `flush` and the two
+  sampling setters. Nightwatch guards the call sites it owns, so
+  this was already contained in practice; it is contained by construction now,
+  including on paths they haven't wrapped (a customer calling
+  `Nightwatch::report()`, a future hook, an older SDK). Single-agent mode still
+  transmits exactly once — the wrapper holds one ingest.
+  (Reported and fixed by [@TheDaveKent](https://github.com/TheDaveKent), #4.)
+
+- **`nightwatch:status` no longer reports a healthy agent over a dead socket.**
+  `MultiIngest::ping()` swallowed transport failures like every other method,
+  but `ping()` is a diagnostic, not telemetry: `nightwatch:status` decides
+  reachability purely by whether it throws, so the one command a customer runs
+  to check connectivity printed "the agent is running and accepting
+  connections" and exited `0` while nothing was listening. It now probes every
+  target and rethrows the first failure. Affected parallel mode since the
+  adapter was introduced.
+
+- **A swallowed transport failure still reaches
+  `Nightwatch::handleUnrecoverableExceptionsUsing()`.** That callback is the
+  documented place to observe telemetry failures, and the exceptions reached it
+  on their own before the ingest was wrapped. `MultiIngest` now forwards
+  everything it absorbs there in addition to the `error_log` line, so wrapping
+  cannot silently unregister a hook the customer set.
+
 **Upgrade steps:** `composer update nightowl/agent`, then restart the agent.
 The `nightowl:migrate` step now happens on boot; running it in your deploy
 pipeline is still worthwhile, since a pipeline run does the rollup backfill

@@ -63,6 +63,7 @@ Laravel package installed in customer apps. Receives telemetry from `laravel/nig
 
 - `NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=true` enables dual ingestion
 - `NightOwlAgentServiceProvider` boot hook detects `Core::ingest` binding and wraps it with `Support\MultiIngest` (fan-out to both Nightwatch hosted ingest and NightOwl TCP agent)
+- **Both** modes go through `MultiIngest` — single-agent mode wraps a lone ingest for its fail-open path, so an unreachable agent socket can never throw inside a host request. Exception: `ping()` deliberately rethrows (`nightwatch:status` reads reachability off it); absorbed failures go to `error_log` **and** `Nightwatch::handleUnrecoverableExceptionsUsing()`
 - `laravel/nightwatch ^1.26` is now a hard require (was `suggest`), enabling one-step install
 
 ## Key Files
@@ -84,7 +85,7 @@ src/Agent/
   Server.php             — Sync fallback (stream_select)
   ConnectionHandler.php  — Sync payload handler
 src/Support/
-  MultiIngest.php        — Nightwatch coexistence adapter (fan-out wrapper)
+  MultiIngest.php        — Nightwatch coexistence adapter (fan-out wrapper). Also the fail-open boundary in single-agent mode: write/writeNow/digest/flush absorb transport failures, ping() rethrows
   InstalledVersionReader.php — Fresh read of vendor/composer/installed.php via file_get_contents+regex (NEVER include/require: opcache validate_timestamps=0 serves a stale compile forever; never InstalledVersions: static-cached). Returns raw "pretty_version#reference" tuple; null on any failure
   QueryHistogram.php     — Frozen √2-spaced duration bin edges + bin assignment for rollups; MUST stay byte-identical to nightowl-api's App\Support\QueryHistogram (checksum-guarded both sides)
   RollupSpec.php / RollupSpecs.php — Declarative per-type rollup config (group cols, counters w/ PHP predicate + SQL condition, representatives, duration/histogram flags) driving RecordWriter::writeRollup + BackfillRollupsCommand. One spec each for queries/requests/jobs/outgoing/cache.
