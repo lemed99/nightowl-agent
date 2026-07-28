@@ -172,7 +172,15 @@ class AgentCommand extends Command
     private function pendingNightowlMigrations(): ?array
     {
         try {
-            if (! Schema::connection('nightowl')->hasTable('nightowl_requests')) {
+            // Either family counts, same rule as MigrateCommand::
+            // baselineExistingSchema: on a post-EOL tenant prune has DROPped the
+            // v1 parents, and probing v1 alone reads an initialised schema as
+            // fresh — null then means no boot migrate AND no warning, so a new
+            // rollup migration never lands and nothing says why.
+            $initialised = Schema::connection('nightowl')->hasTable('nightowl_requests')
+                || Schema::connection('nightowl')->hasTable('nightowl_requests_v2');
+
+            if (! $initialised) {
                 return null; // not initialised — handled by the onboarding path, not drift
             }
 
@@ -241,7 +249,7 @@ class AgentCommand extends Command
      * sees a healthy "running" process. A child process gives us a kill
      * switch: on deadline we SIGTERM it (aborting the lock wait server-side)
      * and start ingesting against the old schema — warn-and-continue, the
-     * pre-1.5.0 contract. The migrations stay pending, so the next boot
+     * pre-2.0.0 contract. The migrations stay pending, so the next boot
      * retries.
      */
     private function runBootMigrate(): int

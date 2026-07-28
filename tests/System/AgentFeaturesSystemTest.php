@@ -3,6 +3,7 @@
 namespace NightOwl\Tests\System;
 
 use NightOwl\Tests\Integration\MigrationRunner;
+use NightOwl\Tests\System\Concerns\ReadsRawFamily;
 use NightOwl\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
@@ -21,6 +22,8 @@ use PHPUnit\Framework\TestCase;
  */
 class AgentFeaturesSystemTest extends TestCase
 {
+    use ReadsRawFamily;
+
     private const TOKEN = 'features-test-token-2025';
 
     private const AGENT_HOST = '127.0.0.1';
@@ -218,45 +221,9 @@ class AgentFeaturesSystemTest extends TestCase
 
     // ─── Helpers ──────────────────────────────────────────────
 
-    private static function truncateAllTables(): void
+    protected static function pdo(): PDO
     {
-        $tables = [
-            'nightowl_issue_activity', 'nightowl_issue_comments', 'nightowl_issues',
-            'nightowl_requests', 'nightowl_queries', 'nightowl_exceptions',
-            'nightowl_commands', 'nightowl_jobs', 'nightowl_cache_events',
-            'nightowl_mail', 'nightowl_notifications', 'nightowl_outgoing_requests',
-            'nightowl_scheduled_tasks', 'nightowl_logs', 'nightowl_users',
-            'nightowl_settings', 'nightowl_alert_channels',
-        ];
-        foreach ($tables as $table) {
-            self::$pdo->exec("TRUNCATE TABLE {$table} CASCADE");
-        }
-    }
-
-    private static function rowCount(string $table, string $where = '1=1'): int
-    {
-        return (int) self::$pdo->query("SELECT COUNT(*) FROM {$table} WHERE {$where}")->fetchColumn();
-    }
-
-    private static function fetch(string $table, string $where): ?array
-    {
-        $row = self::$pdo->query("SELECT * FROM {$table} WHERE {$where}")->fetch(PDO::FETCH_ASSOC);
-
-        return $row ?: null;
-    }
-
-    private function waitForDrain(string $table, string $where, int $expectedCount, float $timeout = self::DRAIN_TIMEOUT): void
-    {
-        $deadline = microtime(true) + $timeout;
-        $actual = 0;
-        while (microtime(true) < $deadline) {
-            $actual = self::rowCount($table, $where);
-            if ($actual >= $expectedCount) {
-                return;
-            }
-            usleep(200_000);
-        }
-        $this->fail("Drain timeout after {$timeout}s: expected {$expectedCount} rows in {$table} WHERE {$where}, got {$actual}.");
+        return self::$pdo;
     }
 
     private function sendTcp(string $wire): string|false
@@ -298,7 +265,7 @@ class AgentFeaturesSystemTest extends TestCase
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         ");
 
-        $traceId = 'feat-thresh-route-'.uniqid();
+        $traceId = self::uuid();
 
         // Send a slow request (500ms = 500,000 us) with exception to bypass sampling
         $response = $this->sim->send([
@@ -312,7 +279,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'route_methods' => json_encode(['GET']),
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-thresh-exc-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $traceId,
                 'class' => 'RuntimeException',
                 'file' => 'app/Threshold.php',
@@ -322,7 +289,7 @@ class AgentFeaturesSystemTest extends TestCase
 
         $this->assertSame('2:OK', $response);
 
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $traceId), 1);
 
         // Give threshold check time to process
         usleep(1_000_000);
@@ -345,7 +312,7 @@ class AgentFeaturesSystemTest extends TestCase
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         ");
 
-        $traceId = 'feat-thresh-fast-'.uniqid();
+        $traceId = self::uuid();
 
         // Send a fast request (50ms = 50,000 us) — below threshold, with exception to bypass sampling
         $response = $this->sim->send([
@@ -356,7 +323,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'duration' => 50_000, // 50ms — below 1000ms threshold
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-thresh-fast-exc-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $traceId,
                 'class' => 'RuntimeException',
                 'file' => 'app/Threshold.php',
@@ -366,7 +333,7 @@ class AgentFeaturesSystemTest extends TestCase
 
         $this->assertSame('2:OK', $response);
 
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $traceId), 1);
         usleep(1_000_000);
 
         // Should NOT create a performance issue (duration below threshold)
@@ -383,7 +350,7 @@ class AgentFeaturesSystemTest extends TestCase
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         ");
 
-        $traceId = 'feat-thresh-job-'.uniqid();
+        $traceId = self::uuid();
 
         // Send a slow failed job (5s = 5,000,000 us) with exception to bypass sampling
         $response = $this->sim->send([
@@ -395,7 +362,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'exceptions' => 1,
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-thresh-job-exc-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $traceId,
                 'execution_source' => 'job',
                 'class' => 'App\\Exceptions\\JobTimeout',
@@ -406,7 +373,7 @@ class AgentFeaturesSystemTest extends TestCase
 
         $this->assertSame('2:OK', $response);
 
-        $this->waitForDrain('nightowl_jobs', "trace_id = '{$traceId}'", 1);
+        $this->waitForDrain('nightowl_jobs', self::traceEq('nightowl_jobs', $traceId), 1);
         usleep(1_000_000);
 
         $perfIssues = self::$pdo->query(
@@ -429,7 +396,7 @@ class AgentFeaturesSystemTest extends TestCase
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         ");
 
-        $traceId = 'feat-combined-'.uniqid();
+        $traceId = self::uuid();
         $excClass = 'App\\Exceptions\\CombinedTest';
         $file = 'app/Combined.php';
         $line = 42;
@@ -448,7 +415,7 @@ class AgentFeaturesSystemTest extends TestCase
                 'route_methods' => json_encode(['POST']),
             ]),
             $this->sim->makeException([
-                'trace_id' => 'feat-combined-exc-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $traceId,
                 'class' => $excClass,
                 'message' => 'Combined test error',
@@ -459,11 +426,11 @@ class AgentFeaturesSystemTest extends TestCase
 
         $this->assertSame('2:OK', $response);
 
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $traceId), 1);
         usleep(1_000_000);
 
         // 1. SAMPLING: payload arrived (exception bypass worked)
-        $request = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
+        $request = self::fetch('nightowl_requests', self::traceEq('nightowl_requests', $traceId));
         $this->assertNotNull($request, 'Exception payload must bypass sampling');
 
         // 2. THRESHOLDS: performance issue created

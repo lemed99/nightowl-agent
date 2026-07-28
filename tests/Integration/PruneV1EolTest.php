@@ -55,6 +55,31 @@ class PruneV1EolTest extends TestCase
         }
     }
 
+    /**
+     * Hand the shared test DB back with its REAL schema, not a column-compatible
+     * stand-in.
+     *
+     * tearDown's `LIKE` restore is enough for this class (it only needs a
+     * writable mail table between methods, and method order is not fixed —
+     * executionOrder="defects" can run the retiring test first), but a `LIKE`
+     * clone is a PLAIN table: it drops the partitioning the migrations built.
+     * PartitioningTest asserts that no unpartitioned raw table holds rows, so it
+     * failed or passed purely on class order — nightowl_mail arrived either as
+     * the migrations' partitioned parent or as this class's flat copy of it.
+     *
+     * A replay is the only equivalent restore: nothing here knows the shape,
+     * and MigrationRunner's warm-DB probe cannot detect the loss (see
+     * MigrationRunner::rebuild).
+     */
+    public static function tearDownAfterClass(): void
+    {
+        if (self::$pdo !== null) {
+            MigrationRunner::rebuild(self::$host, self::$port, self::$database, self::$username, self::$password);
+        }
+
+        self::$pdo = null;
+    }
+
     protected function setUp(): void
     {
         if (self::$pdo === null) {

@@ -31,8 +31,18 @@ jobs:
         run: vendor/bin/phpunit --testsuite Unit
 
   integration:
-    name: Integration Tests
+    # Both storage families, because the drain writes only one of them and a
+    # read against the other returns zero rows rather than an error — a v2
+    # regression looks exactly like a slow drain. v1 is not legacy here: it is
+    # what un-migrated tenants run and what the NIGHTOWL_STORAGE_V2 kill switch
+    # falls back to, so it has to stay green on its own.
+    name: Integration Tests (storage ${{ matrix.storage }})
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        storage: ['v2', 'v1']
 
     services:
       postgres:
@@ -56,17 +66,28 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
-          extensions: pdo_sqlite, pdo_pgsql, zlib
+          # pcntl + posix are what the System suite forks the real agent with.
+          # Named explicitly rather than relied on: without them every System
+          # test calls markTestSkipped and the leg goes green having asserted
+          # nothing about either storage family.
+          extensions: pdo_sqlite, pdo_pgsql, zlib, pcntl, posix
           coverage: none
+
+      - name: Assert the System suite can actually run
+        run: php -r 'exit((int) ! (extension_loaded("pcntl") && extension_loaded("posix")));'
 
       - name: Install dependencies
         run: composer install --no-interaction --prefer-dist
 
-      - name: Run all tests (unit + integration)
+      - name: Run all tests (unit + integration + system)
         env:
           NIGHTOWL_TEST_DB_HOST: 127.0.0.1
           NIGHTOWL_TEST_DB_PORT: 5432
           NIGHTOWL_TEST_DB_DATABASE: nightowl_test
           NIGHTOWL_TEST_DB_USERNAME: nightowl_test
           NIGHTOWL_TEST_DB_PASSWORD: test123
+          # Overrides phpunit.xml's non-forced <env> pin. Read by the System
+          # harness subprocess AND by ReadsRawFamily, so the daemon writes and
+          # the assertions read the same family.
+          NIGHTOWL_STORAGE_V2: ${{ matrix.storage == 'v2' }}
         run: vendor/bin/phpunit

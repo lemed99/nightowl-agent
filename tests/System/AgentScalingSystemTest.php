@@ -3,6 +3,7 @@
 namespace NightOwl\Tests\System;
 
 use NightOwl\Tests\Integration\MigrationRunner;
+use NightOwl\Tests\System\Concerns\ReadsRawFamily;
 use NightOwl\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
@@ -22,6 +23,8 @@ use PHPUnit\Framework\TestCase;
  */
 class AgentScalingSystemTest extends TestCase
 {
+    use ReadsRawFamily;
+
     private const TOKEN = 'scaling-test-token-2025';
 
     private const AGENT_HOST = '127.0.0.1';
@@ -223,38 +226,9 @@ class AgentScalingSystemTest extends TestCase
 
     // ─── Helpers ──────────────────────────────────────────────
 
-    private static function truncateAllTables(): void
+    protected static function pdo(): PDO
     {
-        $tables = [
-            'nightowl_issue_activity', 'nightowl_issue_comments', 'nightowl_issues',
-            'nightowl_requests', 'nightowl_queries', 'nightowl_exceptions',
-            'nightowl_commands', 'nightowl_jobs', 'nightowl_cache_events',
-            'nightowl_mail', 'nightowl_notifications', 'nightowl_outgoing_requests',
-            'nightowl_scheduled_tasks', 'nightowl_logs', 'nightowl_users',
-            'nightowl_settings', 'nightowl_alert_channels',
-        ];
-        foreach ($tables as $table) {
-            self::$pdo->exec("TRUNCATE TABLE {$table} CASCADE");
-        }
-    }
-
-    private static function rowCount(string $table, string $where = '1=1'): int
-    {
-        return (int) self::$pdo->query("SELECT COUNT(*) FROM {$table} WHERE {$where}")->fetchColumn();
-    }
-
-    private function waitForDrain(string $table, string $where, int $expectedCount, float $timeout = self::DRAIN_TIMEOUT): void
-    {
-        $deadline = microtime(true) + $timeout;
-        $actual = 0;
-        while (microtime(true) < $deadline) {
-            $actual = self::rowCount($table, $where);
-            if ($actual >= $expectedCount) {
-                return;
-            }
-            usleep(200_000);
-        }
-        $this->fail("Drain timeout after {$timeout}s: expected {$expectedCount} in {$table} WHERE {$where}, got {$actual}.");
+        return self::$pdo;
     }
 
     private function sendTcp(array $records): string|false
@@ -285,66 +259,69 @@ class AgentScalingSystemTest extends TestCase
 
     public function test_multi_worker_drain_processes_all_records(): void
     {
-        $tag = 'scale-mw-'.uniqid();
+        $traces = self::uuids(40);
 
         // Send 40 requests — both drain workers should pick up work
-        for ($i = 0; $i < 40; $i++) {
+        foreach ($traces as $i => $traceId) {
             $response = $this->sendTcp([
-                $this->sim->makeRequest(['trace_id' => "{$tag}-{$i}"]),
+                $this->sim->makeRequest(['trace_id' => $traceId]),
             ]);
             $this->assertSame('2:OK', $response, "Payload {$i} should be accepted");
         }
 
         // Wait for all to drain (2 workers process in parallel)
-        $this->waitForDrain('nightowl_requests', "trace_id LIKE '{$tag}-%'", 40);
+        $where = self::traceIn('nightowl_requests', $traces);
+        $this->waitForDrain('nightowl_requests', $where, 40);
 
-        $count = self::rowCount('nightowl_requests', "trace_id LIKE '{$tag}-%'");
+        $count = self::rowCount('nightowl_requests', $where);
         $this->assertSame(40, $count, 'All 40 requests should arrive via multi-worker drain');
     }
 
     public function test_multi_worker_drain_no_duplicates(): void
     {
-        $tag = 'scale-nodup-'.uniqid();
+        $traces = self::uuids(30);
 
         // Send 30 requests that should be claimed by different workers
-        for ($i = 0; $i < 30; $i++) {
+        foreach ($traces as $traceId) {
             $this->sendTcp([
-                $this->sim->makeRequest(['trace_id' => "{$tag}-{$i}"]),
+                $this->sim->makeRequest(['trace_id' => $traceId]),
             ]);
         }
 
-        $this->waitForDrain('nightowl_requests', "trace_id LIKE '{$tag}-%'", 30);
+        $where = self::traceIn('nightowl_requests', $traces);
+        $this->waitForDrain('nightowl_requests', $where, 30);
 
         // Verify no duplicates — each trace_id should appear exactly once
-        $count = self::rowCount('nightowl_requests', "trace_id LIKE '{$tag}-%'");
+        $count = self::rowCount('nightowl_requests', $where);
         $this->assertSame(30, $count, 'No duplicates from multi-worker claiming');
 
         // Double-check: count distinct trace_ids
-        $distinct = (int) self::$pdo->query(
-            "SELECT COUNT(DISTINCT trace_id) FROM nightowl_requests WHERE trace_id LIKE '{$tag}-%'"
-        )->fetchColumn();
+        $distinct = self::distinctTraceCount('nightowl_requests', $where);
         $this->assertSame(30, $distinct, 'All trace_ids should be unique (no claiming overlap)');
     }
 
     public function test_multi_worker_drain_mixed_types(): void
     {
-        $tag = 'scale-mix-'.uniqid();
+        $reqTraces = self::uuids(10);
+        $qryTraces = self::uuids(10);
+        $jobTraces = self::uuids(10);
+        $excTraces = self::uuids(5);
 
         // Mixed payload: requests, queries, jobs, exceptions — all should be
         // processed correctly regardless of which worker picks up the batch
         for ($i = 0; $i < 10; $i++) {
             $this->sendTcp([
-                $this->sim->makeRequest(['trace_id' => "{$tag}-req-{$i}"]),
-                $this->sim->makeQuery(['trace_id' => "{$tag}-qry-{$i}"]),
-                $this->sim->makeJob(['trace_id' => "{$tag}-job-{$i}", 'status' => 'processed']),
+                $this->sim->makeRequest(['trace_id' => $reqTraces[$i]]),
+                $this->sim->makeQuery(['trace_id' => $qryTraces[$i]]),
+                $this->sim->makeJob(['trace_id' => $jobTraces[$i], 'status' => 'processed']),
             ]);
         }
 
         // Also send some exceptions to test issue upserts from multiple workers
-        for ($i = 0; $i < 5; $i++) {
+        foreach ($excTraces as $traceId) {
             $this->sendTcp([
                 $this->sim->makeException([
-                    'trace_id' => "{$tag}-exc-{$i}",
+                    'trace_id' => $traceId,
                     'class' => 'App\\Exceptions\\MultiWorkerTest',
                     'file' => 'app/MultiWorker.php',
                     'line' => 1,
@@ -352,13 +329,15 @@ class AgentScalingSystemTest extends TestCase
             ]);
         }
 
-        $this->waitForDrain('nightowl_requests', "trace_id LIKE '{$tag}-req-%'", 10);
-        $this->waitForDrain('nightowl_exceptions', "trace_id LIKE '{$tag}-exc-%'", 5);
+        $reqWhere = self::traceIn('nightowl_requests', $reqTraces);
+        $excWhere = self::traceIn('nightowl_exceptions', $excTraces);
+        $this->waitForDrain('nightowl_requests', $reqWhere, 10);
+        $this->waitForDrain('nightowl_exceptions', $excWhere, 5);
 
-        $this->assertSame(10, self::rowCount('nightowl_requests', "trace_id LIKE '{$tag}-req-%'"));
-        $this->assertSame(10, self::rowCount('nightowl_queries', "trace_id LIKE '{$tag}-qry-%'"));
-        $this->assertSame(10, self::rowCount('nightowl_jobs', "trace_id LIKE '{$tag}-job-%'"));
-        $this->assertSame(5, self::rowCount('nightowl_exceptions', "trace_id LIKE '{$tag}-exc-%'"));
+        $this->assertSame(10, self::rowCount('nightowl_requests', $reqWhere));
+        $this->assertSame(10, self::rowCount('nightowl_queries', self::traceIn('nightowl_queries', $qryTraces)));
+        $this->assertSame(10, self::rowCount('nightowl_jobs', self::traceIn('nightowl_jobs', $jobTraces)));
+        $this->assertSame(5, self::rowCount('nightowl_exceptions', $excWhere));
 
         // Issue upsert should work correctly even when two workers race
         $fp = md5('App\\Exceptions\\MultiWorkerTest'.'|'.'0'.'|'.'app/MultiWorker.php'.'|'.'1');
@@ -380,7 +359,10 @@ class AgentScalingSystemTest extends TestCase
         // Strategy: open N sockets simultaneously, write to all, then read responses.
         // This floods the SQLite buffer before drain workers can process.
 
-        $tag = 'scale-bp-'.uniqid();
+        // Pre-generated so the final drain check can name every id it sent,
+        // accepted or not — the burst is deliberately allowed to be rejected.
+        $burstTraces = self::uuids(5 * 20);
+        $lateTraces = self::uuids(30);
         $tokenHash = substr(hash('xxh128', self::TOKEN), 0, 7);
 
         $accepted = 0;
@@ -403,7 +385,7 @@ class AgentScalingSystemTest extends TestCase
                 }
                 stream_set_timeout($sock, 3);
 
-                $records = [$this->sim->makeRequest(['trace_id' => "{$tag}-{$idx}"])];
+                $records = [$this->sim->makeRequest(['trace_id' => $burstTraces[$idx]])];
                 $json = json_encode($records);
                 $body = "v1:{$tokenHash}:{$json}";
                 $wire = strlen($body).':'.$body;
@@ -433,9 +415,9 @@ class AgentScalingSystemTest extends TestCase
         if ($rejected === 0) {
             sleep(6);
 
-            for ($i = 0; $i < 30; $i++) {
+            foreach ($lateTraces as $traceId) {
                 $response = $this->sendTcp([
-                    $this->sim->makeRequest(['trace_id' => "{$tag}-late-{$i}"]),
+                    $this->sim->makeRequest(['trace_id' => $traceId]),
                 ]);
                 if ($response === '5:ERROR') {
                     $rejected++;
@@ -455,7 +437,11 @@ class AgentScalingSystemTest extends TestCase
         }
 
         // All accepted payloads must eventually drain to PG
-        $this->waitForDrain('nightowl_requests', "trace_id LIKE '{$tag}-%'", $accepted);
+        $this->waitForDrain(
+            'nightowl_requests',
+            self::traceIn('nightowl_requests', array_merge($burstTraces, $lateTraces)),
+            $accepted,
+        );
 
         // Agent must still be alive
         $response = $this->sim->ping();
@@ -464,12 +450,13 @@ class AgentScalingSystemTest extends TestCase
 
     public function test_back_pressure_recovery_accepts_after_drain(): void
     {
-        $tag = 'scale-bprecov-'.uniqid();
+        $fillTraces = self::uuids(80);
+        $afterTrace = self::uuid();
 
         // Fill buffer to trigger back-pressure
-        for ($i = 0; $i < 80; $i++) {
+        foreach ($fillTraces as $traceId) {
             $this->sendTcp([
-                $this->sim->makeRequest(['trace_id' => "{$tag}-fill-{$i}"]),
+                $this->sim->makeRequest(['trace_id' => $traceId]),
             ]);
         }
 
@@ -478,19 +465,19 @@ class AgentScalingSystemTest extends TestCase
 
         // Wait for drain to catch up (drain_interval=2000ms, batch_size=5000)
         // After drain processes the buffer, back-pressure should deactivate
-        $this->waitForDrain('nightowl_requests', "trace_id LIKE '{$tag}-fill-%'", 80);
+        $this->waitForDrain('nightowl_requests', self::traceIn('nightowl_requests', $fillTraces), 80);
 
         // Wait for next back-pressure check to clear the flag
         sleep(6);
 
         // Now the agent should accept payloads again
         $response = $this->sendTcp([
-            $this->sim->makeRequest(['trace_id' => "{$tag}-after"]),
+            $this->sim->makeRequest(['trace_id' => $afterTrace]),
         ]);
 
         $this->assertSame('2:OK', $response, 'Agent should accept payloads after back-pressure clears');
 
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$tag}-after'", 1);
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $afterTrace), 1);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -502,12 +489,12 @@ class AgentScalingSystemTest extends TestCase
 
     public function test_zz_graceful_shutdown_drains_remaining_rows(): void
     {
-        $tag = 'scale-shutdown-'.uniqid();
+        $traces = self::uuids(10);
 
         // Send payloads
-        for ($i = 0; $i < 10; $i++) {
+        foreach ($traces as $traceId) {
             $response = $this->sendTcp([
-                $this->sim->makeRequest(['trace_id' => "{$tag}-{$i}"]),
+                $this->sim->makeRequest(['trace_id' => $traceId]),
             ]);
             $this->assertSame('2:OK', $response);
         }
@@ -530,7 +517,7 @@ class AgentScalingSystemTest extends TestCase
         }
 
         // Verify all rows made it to PG (drained during shutdown)
-        $count = self::rowCount('nightowl_requests', "trace_id LIKE '{$tag}-%'");
+        $count = self::rowCount('nightowl_requests', self::traceIn('nightowl_requests', $traces));
         $this->assertSame(10, $count, 'All rows should be drained during graceful shutdown');
 
         // Mark process as stopped so tearDownAfterClass doesn't try again

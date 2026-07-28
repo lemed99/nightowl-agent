@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use NightOwl\Support\RollupSpecs;
 use NightOwl\Support\RollupTiers;
+use NightOwl\Support\V2SequenceFence;
 
 class MigrateCommand extends Command
 {
@@ -42,6 +43,14 @@ class MigrateCommand extends Command
             '--force' => true,
         ]);
 
+        // Unconditional, and not gated on $exit: the v2 id sequences drift
+        // whenever a v1 insert lands after the fence was set, which has nothing
+        // to do with whether a migration was pending this run. Re-applying it
+        // here on EVERY invocation — every deploy step, nightowl:install, and
+        // the daemon's boot auto-migrate whenever that fires — is what heals a
+        // mixed fleet while it lasts; the 000069 migration alone runs once.
+        $this->refenceV2Sequences();
+
         if ($exit === self::SUCCESS && ! $this->option('no-backfill')) {
             $this->backfillEmptyRollups();
         }
@@ -52,6 +61,55 @@ class MigrateCommand extends Command
         }
 
         return $exit;
+    }
+
+    /**
+     * Re-apply the storage-v2 id-sequence fence (V2SequenceFence): keep every
+     * v2 sequence above its v1 twin's id range so the API's v1+v2 union pages
+     * can never see two rows sharing a (created_at, id) cursor — a COPY batch
+     * stamps one created_at across its rows, so a colliding id makes "Next"
+     * skip or repeat rows.
+     *
+     * Migration 000067 fences at v2-table creation only; a v1 insert after that
+     * instant (mixed fleet, or a NIGHTOWL_STORAGE_V2=false excursion) overtakes
+     * it. Re-running it here is the self-healing half.
+     *
+     * Advisory work — a failure warns and continues, exactly like the
+     * unpartitioned and sketch checks. Nothing here may fail a schema sync, and
+     * the daemon's boot-migrate rides this same path.
+     */
+    private function refenceV2Sequences(): void
+    {
+        try {
+            $result = V2SequenceFence::apply(DB::connection('nightowl')->getPdo());
+        } catch (\Throwable $e) {
+            $this->warn("Storage-v2 id sequence fence skipped ({$e->getMessage()}).");
+
+            return;
+        }
+
+        foreach ($result['failures'] as $table => $message) {
+            $this->warn("  {$table}: id sequence fence skipped ({$message})");
+        }
+
+        if ($result['refenced'] !== []) {
+            $this->line(sprintf(
+                'Re-fenced %d storage-v2 id sequence(s) above the v1 id range (%s).',
+                count($result['refenced']),
+                implode(', ', array_keys($result['refenced'])),
+            ));
+        }
+
+        // Ids already handed out cannot be renumbered; say so once, by name.
+        if ($result['overlapping'] !== []) {
+            $this->warn(sprintf(
+                'Storage-v2 and v1 id ranges already overlap on %s: rows written before this fence took '
+                .'ids the other family also used, so wide list views (requests, exception occurrences) may '
+                .'skip or repeat a row while both families still hold them. Those rows cannot be renumbered; '
+                .'the fence stops it recurring and the overlap clears as they age out at retention.',
+                implode(', ', $result['overlapping']),
+            ));
+        }
     }
 
     /**

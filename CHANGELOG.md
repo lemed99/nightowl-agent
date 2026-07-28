@@ -196,6 +196,69 @@ in the git tags.
 
 ### Fixed
 
+- **Wide list views could skip or repeat a row while a tenant held both storage
+  families.** The API pages raw lists on `(created_at, id)`, and a COPY batch
+  stamps one `created_at` across every row it writes — so `id` is what orders
+  rows inside a batch, and it has to be unique across the union. Migration
+  000067 setvals each `{table}_v2` sequence above its v1 twin's `MAX(id)`, which
+  is true at the instant the v2 tables are created and stops being true
+  afterwards: any v1 insert landing later walks the v1 sequence back into the v2
+  range (a mixed fleet where one host still runs a pre-2.0.0 agent, or a
+  `NIGHTOWL_STORAGE_V2=false` excursion). New migration 000069 re-applies the
+  fence, and `nightowl:migrate` re-applies it on EVERY run — every deploy step,
+  `nightowl:install`, and the daemon's boot auto-migrate — which is what heals
+  the drift for as long as the fleet stays mixed. Sequences that still hold
+  headroom are left alone. Ids already handed out cannot be renumbered: where
+  the ranges have already overlapped, migrate names the affected tables and says
+  so, and the overlap clears as those rows age out at retention.
+
+- **A drain batch carrying more distinct SQL statements, routes or stack traces
+  than the dictionary cache holds silently lost those links.** The dictionary
+  maps trim to a cap, and the trim ran inside the warm pass's chunk loop — so a
+  batch wide enough to overflow a cap evicted its OWN earliest-warmed ids before
+  the write read them back. The collector deliberately omits every value the
+  cache already holds, so an id evicted mid-batch is never re-warmed: the write
+  bound NULL into a nullable `sql_id` / `route_id` / `trace_ref`, the dictionary
+  row stayed behind with nothing pointing at it, and nothing errored. What a
+  customer saw was a query with a blank SQL card, a request with no route, or an
+  exception with no stack trace. Eviction now happens at exactly one point —
+  where a batch's outcome is published — so nothing can be dropped between the
+  collect and the write. Peak map size becomes the cap plus one batch's distinct
+  values, released when that batch ends. An unresolved hash-keyed link is now
+  logged as well (once per process per column) instead of stored in silence.
+
+- **A drain wedged on the dictionary tables grew those maps without bound.** The
+  warm pass runs before the batch transaction, outside the try/catch that
+  publishes a batch's outcome — so a warm that died part-way (statement timeout,
+  lost connection) left its succeeded chunks staged in the maps and reached
+  neither the promote nor the discard path. That leaked one partial batch's
+  worth of entries per attempt, in precisely the situation where the attempts do
+  not stop. The warm now discards its staged ids before rethrowing.
+
+- **`nightowl:backfill-rollups` deleted rollup buckets it then never
+  repopulated, on any app whose `app.timezone` is not UTC.** Every column the
+  command compares against is UTC wall time — raw `created_at` and rollup
+  `bucket_start` are written with `gmdate()` and come back out of Postgres as
+  naive `timestamp` strings — while `now()` and `Carbon::parse()` render in
+  `app.timezone`. So the window bounds were in the wrong wall clock, and the
+  concurrency pass mixed both clocks inside one chunk: the scan window came from
+  Carbon strings, the DELETE and `HAVING` bucket window from `gmdate()` of the
+  same epochs. The two disagreed by the UTC offset, and the offset-wide head of
+  every chunk was cleared with no scanned rows left to rebuild it from. Every
+  instant the command builds is now born UTC, and one helper derives all four
+  bounds of a concurrency chunk from the same two epochs, so containment (bucket
+  window inside scan window) holds by construction. `--since`/`--until` are read
+  as UTC unless the string carries its own offset.
+
+- **Boot-migrate went quiet on a tenant that had passed v1 end-of-life.** The
+  daemon decides whether the schema is behind by first confirming the schema
+  exists at all, and it probed `nightowl_requests` — a table `nightowl:prune`
+  DROPs once the v1 EOL gates open. A post-EOL tenant therefore read as
+  never-initialised, which is the one verdict meaning "not drift, don't warn":
+  no boot migrate ran and nothing said why, so a new rollup migration would
+  never land. Either family now counts, the same rule `nightowl:migrate` already
+  uses to adopt an existing schema.
+
 - **A resolved issue with no resolve-activity row could never reopen, and never
   alerted again.** The reopen cooldown reads the most recent
   `status_changed → resolved` row out of `nightowl_issue_activity`; when there

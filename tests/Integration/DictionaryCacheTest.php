@@ -217,6 +217,100 @@ class DictionaryCacheTest extends TestCase
         $this->assertSame($id, $cache->stringId('environment', 'staging'));
     }
 
+    public function test_a_single_warm_past_the_sql_cap_evicts_nothing(): void
+    {
+        // The eviction discipline, stated as the failure it prevents: one drain
+        // batch with more distinct sql sites than SQL_CAP (4096) must still hand
+        // the write phase an id for EVERY hash. Per-chunk eviction dropped the
+        // earliest-warmed ids here, and writeQueriesV2 has no in-txn fallback —
+        // those rows COPY in with sql_id NULL against a dict row that exists,
+        // which is unrecoverable and logs nothing. The hash is xxh128 over
+        // sql+file+line, so a batch this wide is routine (every whereIn arity
+        // and every call site is its own entry).
+        $cache = new DictionaryCache;
+        $misses = [];
+        $hashes = [];
+        for ($i = 0; $i < 4600; $i++) {
+            $hash = md5("sql-site-{$i}");
+            $hashes[] = $hash;
+            $misses[] = [$hash, "select * from t{$i} where id = ?", "/app/Repo{$i}.php", $i];
+        }
+
+        $cache->warm(self::$pdo, ['sql' => $misses]);
+
+        $lost = [];
+        foreach ($hashes as $i => $hash) {
+            if ($cache->sqlId($hash) === null) {
+                $lost[] = $i;
+            }
+        }
+        $this->assertCount(0, $lost, sprintf(
+            '%d of %d sql ids were evicted before the write could read them back (first: #%d)',
+            count($lost), count($hashes), $lost[0] ?? -1,
+        ));
+        $this->assertSame(4600, (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_dict_sql')->fetchColumn());
+    }
+
+    public function test_a_single_warm_past_the_route_and_trace_caps_evicts_nothing(): void
+    {
+        // Same rule for the other two hash-keyed dicts — route_id (4096) on the
+        // request write, trace_ref (2048) on the exception write — and warmed in
+        // ONE call, because it is the batch, not the table, that must be atomic.
+        $cache = new DictionaryCache;
+        $routes = [];
+        $routeHashes = [];
+        for ($i = 0; $i < 4200; $i++) {
+            $hash = md5("GET|/users/{$i}");
+            $routeHashes[] = $hash;
+            $routes[] = [$hash, 'GET', null, "/users/{$i}", "users.show.{$i}", "UserController@show{$i}", '["GET"]'];
+        }
+        $traces = [];
+        $traceHashes = [];
+        for ($i = 0; $i < 2100; $i++) {
+            $hash = md5("#0 /app/Boom{$i}.php(1): boom()");
+            $traceHashes[] = $hash;
+            $traces[] = [$hash, '\x'.bin2hex(gzdeflate("#0 /app/Boom{$i}.php(1): boom()", 6))];
+        }
+
+        $cache->warm(self::$pdo, ['route' => $routes, 'trace' => $traces]);
+
+        $lostRoutes = array_filter($routeHashes, fn (string $h): bool => $cache->routeId($h) === null);
+        $lostTraces = array_filter($traceHashes, fn (string $h): bool => $cache->traceId($h) === null);
+        $this->assertCount(0, $lostRoutes, count($lostRoutes).' of 4200 route ids were evicted mid-batch');
+        $this->assertCount(0, $lostTraces, count($lostTraces).' of 2100 trace ids were evicted mid-batch');
+    }
+
+    public function test_the_maps_are_trimmed_to_their_caps_once_the_batch_outcome_is_published(): void
+    {
+        // Deferring eviction is not skipping it: both outcome publishers trim, so
+        // an over-cap batch cannot leave the LRU over-cap for the next one. The
+        // trim is memory-only — the dict rows it forgets stay in the table and
+        // are simply re-warmed when a later batch references them again.
+        foreach (['promote', 'discard'] as $outcome) {
+            self::$pdo->exec('DELETE FROM nightowl_dict_sql');
+            $cache = new DictionaryCache;
+            $misses = [];
+            $hashes = [];
+            for ($i = 0; $i < 4600; $i++) {
+                $hash = md5("{$outcome}|select {$i}");
+                $hashes[] = $hash;
+                $misses[] = [$hash, "select {$i}", null, null];
+            }
+            $cache->warm(self::$pdo, ['sql' => $misses]);
+
+            if ($outcome === 'promote') {
+                $cache->promotePending();
+            } else {
+                $cache->discardPending();
+            }
+
+            // Insertion order is warm order, so the earliest entries are coldest.
+            $this->assertNull($cache->sqlId($hashes[0]), "{$outcome}: over-cap tail should be trimmed");
+            $this->assertNotNull($cache->sqlId($hashes[4599]), "{$outcome}: hottest entry must survive");
+            $this->assertSame(4600, (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_dict_sql')->fetchColumn());
+        }
+    }
+
     public function test_dicts_are_append_only_across_batches(): void
     {
         // A second batch with a "renamed" route tuple must create a NEW row,

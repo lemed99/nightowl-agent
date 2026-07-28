@@ -15,8 +15,8 @@ use RuntimeException;
 class BackfillRollupsCommand extends Command
 {
     protected $signature = 'nightowl:backfill-rollups
-        {--since= : Start datetime (default: earliest source row)}
-        {--until= : End datetime (default: now minus the safety margin)}
+        {--since= : Start datetime, UTC unless it carries an offset (default: earliest source row)}
+        {--until= : End datetime, UTC unless it carries an offset (default: now minus the safety margin)}
         {--chunk-days=1 : Days of source data processed per transaction}
         {--type= : Restrict to one rollup table (e.g. nightowl_request_rollups)}
         {--tiers-only : Skip the raw→minute pass and rebuild only the hourly/daily tiers from the minute rollups}';
@@ -30,6 +30,34 @@ class BackfillRollupsCommand extends Command
      * safely DELETE-then-INSERT (replace-per-bucket) without a watermark.
      */
     private const SAFETY_MARGIN_SECONDS = 600;
+
+    /**
+     * Every column this command compares against is UTC wall time: raw
+     * `created_at` and rollup `bucket_start` are written with gmdate()
+     * (RecordWriter::eventCreatedAt / eventBucket) and come back out of Postgres
+     * as naive `timestamp` strings. Carbon's now()/parse() use app.timezone, so
+     * on a non-UTC app every bound rendered here was in the wrong wall clock and
+     * every ->timestamp epoch belonged to an instant the data never had — and
+     * backfillConcurrency mixed BOTH inside one chunk (scan window from Carbon
+     * wall strings, DELETE + HAVING bucket window from gmdate() of those
+     * epochs), so the two disagreed by the UTC offset and the offset-wide head
+     * of every chunk was deleted and never repopulated. Every instant this
+     * command builds is therefore born UTC, here.
+     */
+    private function nowUtc(): Carbon
+    {
+        return Carbon::now('UTC');
+    }
+
+    /**
+     * A DB timestamp string (naive UTC) or a --since/--until option, as UTC.
+     * An offset carried by the option string wins and is converted, so an
+     * operator can pass either their own offset or bare UTC.
+     */
+    private function parseUtc(string $value): Carbon
+    {
+        return Carbon::parse($value, 'UTC')->utc();
+    }
 
     public function handle(): int
     {
@@ -192,8 +220,8 @@ class BackfillRollupsCommand extends Command
                 continue;
             }
 
-            $since = Carbon::parse($sinceOption);
-            $until = now();
+            $since = $this->parseUtc((string) $sinceOption);
+            $until = $this->nowUtc();
             $unit = RollupTiers::TRUNC_UNIT[$tier];
 
             $this->info("Backfilling {$tierTable} from {$sourceTable}...");
@@ -298,9 +326,9 @@ class BackfillRollupsCommand extends Command
 
     private function backfillSpec($conn, RollupSpec $spec, int $chunkDays): void
     {
-        $safetyCeiling = now()->subSeconds(self::SAFETY_MARGIN_SECONDS);
+        $safetyCeiling = $this->nowUtc()->subSeconds(self::SAFETY_MARGIN_SECONDS);
 
-        $until = $this->option('until') ? Carbon::parse($this->option('until')) : $safetyCeiling->copy();
+        $until = $this->option('until') ? $this->parseUtc($this->option('until')) : $safetyCeiling->copy();
         if ($until->greaterThan($safetyCeiling)) {
             $until = $safetyCeiling->copy();
         }
@@ -314,7 +342,7 @@ class BackfillRollupsCommand extends Command
 
             return;
         }
-        $since = Carbon::parse($sinceOption);
+        $since = $this->parseUtc($sinceOption);
 
         if ($since->greaterThanOrEqualTo($until)) {
             $this->line("  {$spec->table}: nothing to backfill.");
@@ -322,7 +350,7 @@ class BackfillRollupsCommand extends Command
             return;
         }
 
-        $this->info("Backfilling {$spec->table} from {$since->toDateTimeString()} to {$until->toDateTimeString()}...");
+        $this->info("Backfilling {$spec->table} from {$since->toDateTimeString()} to {$until->toDateTimeString()} UTC...");
 
         // Precompute the INSERT…SELECT shape once per spec.
         // Empty when the table went sketch-only (nightowl:drop-v1-histograms).
@@ -385,7 +413,7 @@ class BackfillRollupsCommand extends Command
         // A row's bucket truncates created_at down to the minute, so clear from
         // the minute containing $start (not $start) to avoid colliding with a
         // stale partial-minute bucket from an earlier run.
-        $bucketLow = Carbon::parse($start)->startOfMinute()->toDateTimeString();
+        $bucketLow = $this->parseUtc($start)->startOfMinute()->toDateTimeString();
 
         $pk = [...$spec->groupColumnNames(), 'bucket_start', 'environment'];
         $updateCols = array_values(array_diff(array_map('trim', explode(',', $columns)), $pk));
@@ -445,9 +473,40 @@ class BackfillRollupsCommand extends Command
     }
 
     /**
+     * Every bound of one concurrency chunk, derived from the SAME two UTC
+     * epochs so no two of them can end up in different clocks: the DELETE +
+     * HAVING bucket window is gmdate() (the clock the writer buckets in, see
+     * RecordWriter::maintainConcurrencyRollup) and the created_at scan window
+     * is that window widened by the margin. The invariant the arithmetic
+     * exists to hold is containment — bucket window INSIDE scan window — or the
+     * chunk deletes buckets it has no scanned rows to rebuild from.
+     *
+     * The scan anchors on $bucketLow, not on the raw cursor: the cursor is
+     * rarely minute-aligned (it starts at MIN(created_at)), and the low bucket
+     * needs the full margin ahead of the bucket the DELETE clears, not ahead of
+     * some point inside it.
+     *
+     * @return array{scanFrom: string, scanTo: string, deleteFrom: string, deleteTo: string, bucketLow: int, bucketHigh: int}
+     */
+    public static function concurrencyChunkBounds(int $cursorEpoch, int $chunkEndEpoch, int $margin): array
+    {
+        $bucketLow = intdiv($cursorEpoch, 60) * 60;
+
+        return [
+            'scanFrom' => gmdate('Y-m-d H:i:s', $bucketLow - $margin),
+            'scanTo' => gmdate('Y-m-d H:i:s', $chunkEndEpoch + $margin),
+            'deleteFrom' => gmdate('Y-m-d H:i:s', $bucketLow),
+            'deleteTo' => gmdate('Y-m-d H:i:s', $chunkEndEpoch),
+            'bucketLow' => $bucketLow,
+            'bucketHigh' => $chunkEndEpoch,
+        ];
+    }
+
+    /**
      * Bespoke raw→minute backfill for nightowl_request_concurrency_rollups —
      * the (delta_sum, max_prefix) fold of the in-flight running count (see
-     * RecordWriter::writeConcurrencyRollup for the full contract).
+     * ConcurrencyRollup for the full contract; recompute-from-raw is the only
+     * writer, so there is no per-batch writer method to point at).
      *
      * Unlike the live drain's batch-append approximation, this recompute is
      * EXACT per bucket: the window function orders the chunk's full event
@@ -464,9 +523,9 @@ class BackfillRollupsCommand extends Command
     private function backfillConcurrency($conn, int $chunkDays): void
     {
         $table = 'nightowl_request_concurrency_rollups';
-        $safetyCeiling = now()->subSeconds(self::SAFETY_MARGIN_SECONDS);
+        $safetyCeiling = $this->nowUtc()->subSeconds(self::SAFETY_MARGIN_SECONDS);
 
-        $until = $this->option('until') ? Carbon::parse($this->option('until')) : $safetyCeiling->copy();
+        $until = $this->option('until') ? $this->parseUtc($this->option('until')) : $safetyCeiling->copy();
         if ($until->greaterThan($safetyCeiling)) {
             $until = $safetyCeiling->copy();
         }
@@ -478,7 +537,7 @@ class BackfillRollupsCommand extends Command
 
             return;
         }
-        $since = Carbon::parse($sinceOption);
+        $since = $this->parseUtc($sinceOption);
 
         if ($since->greaterThanOrEqualTo($until)) {
             $this->line("  {$table}: nothing to backfill.");
@@ -486,7 +545,7 @@ class BackfillRollupsCommand extends Command
             return;
         }
 
-        $this->info("Backfilling {$table} from {$since->toDateTimeString()} to {$until->toDateTimeString()}...");
+        $this->info("Backfilling {$table} from {$since->toDateTimeString()} to {$until->toDateTimeString()} UTC...");
 
         $margin = ConcurrencyRollup::SCAN_MARGIN_SECONDS;
 
@@ -497,28 +556,25 @@ class BackfillRollupsCommand extends Command
                 $chunkEnd = $until->copy();
             }
 
-            $scanFrom = $cursor->copy()->subSeconds($margin)->toDateTimeString();
-            $scanTo = $chunkEnd->copy()->addSeconds($margin)->toDateTimeString();
-            $bucketLowEpoch = intdiv($cursor->timestamp, 60) * 60;
-            $bucketHighEpoch = $chunkEnd->timestamp;
+            $bounds = self::concurrencyChunkBounds($cursor->timestamp, $chunkEnd->timestamp, $margin);
 
-            $conn->transaction(function () use ($conn, $table, $scanFrom, $scanTo, $bucketLowEpoch, $bucketHighEpoch): void {
+            $conn->transaction(function () use ($conn, $table, $bounds): void {
                 $conn->statement('SELECT pg_advisory_xact_lock(hashtext(?))', ['nightowl_rollup:'.$table]);
 
                 $conn->table($table)
-                    ->where('bucket_start', '>=', gmdate('Y-m-d H:i:s', $bucketLowEpoch))
-                    ->where('bucket_start', '<', gmdate('Y-m-d H:i:s', $bucketHighEpoch))
+                    ->where('bucket_start', '>=', $bounds['deleteFrom'])
+                    ->where('bucket_start', '<', $bounds['deleteTo'])
                     ->delete();
 
                 // The ONE shared recompute (ConcurrencyRollup) — identical SQL
                 // to the drain's cleanup-tick maintenance, so backfilled and
                 // live buckets can never diverge.
                 $q = ConcurrencyRollup::recompute(
-                    $scanFrom,
-                    $scanTo,
-                    now()->getTimestamp() + ConcurrencyRollup::END_CEIL_FUTURE_SECONDS,
-                    $bucketLowEpoch,
-                    $bucketHighEpoch,
+                    $bounds['scanFrom'],
+                    $bounds['scanTo'],
+                    $this->nowUtc()->getTimestamp() + ConcurrencyRollup::END_CEIL_FUTURE_SECONDS,
+                    $bounds['bucketLow'],
+                    $bounds['bucketHigh'],
                     includeV2: (bool) $conn->getPdo()->query(
                         "SELECT to_regclass('nightowl_requests_v2') IS NOT NULL AS e"
                     )->fetchColumn(),

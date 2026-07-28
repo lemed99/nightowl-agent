@@ -25,6 +25,24 @@ final class MigrationRunner
 
     private static ?Container $container = null;
 
+    /**
+     * Migrations that leave NO schema artifact the probe below could assert, so
+     * the warm-DB fast path replays them instead of proving them.
+     *
+     * Only safe for a body that is idempotent AND forward-only by construction,
+     * which is verified per entry, not assumed:
+     *  - 000069 delegates to V2SequenceFence::apply, which skips any sequence
+     *    still holding MIN_HEADROOM and otherwise setvals it to
+     *    MAX(v1.id) + GAP — strictly above the value it just read, since it only
+     *    acts when that value is below MAX(v1.id) + GAP/2. Replaying it on a DB
+     *    already at 000069 is a no-op.
+     *
+     * @var list<string>
+     */
+    private const REPLAY_ALWAYS = [
+        '2024_01_01_000069_refence_raw_v2_id_sequences.php',
+    ];
+
     public static function migrate(string $host, int $port, string $database, string $username, string $password): void
     {
         self::bootCapsule($host, $port, $database, $username, $password);
@@ -39,9 +57,11 @@ final class MigrationRunner
         // with its own static state. Probe the NEWEST migration's observable
         // effect — probing an early artifact would skip every migration added
         // since the test DB was first provisioned. Update this probe whenever
-        // a migration is added (currently 000068 dict_trace.created_at; before
-        // that 000066 dictionaries + 000067 raw v2 family; 000063 concurrency
-        // rollup, 000064 mail/notification composites, 000065 cache key_pattern).
+        // a migration is added (high-water 000069 v2 id-sequence re-fence, which
+        // is artifact-less and rides REPLAY_ALWAYS instead of a clause; last
+        // probeable artifact 000068 dict_trace.created_at; before that 000066
+        // dictionaries + 000067 raw v2 family; 000063 concurrency rollup, 000064
+        // mail/notification composites, 000065 cache key_pattern).
         if (Schema::connection('nightowl')->hasTable('nightowl_dict_string')
             && Schema::connection('nightowl')->hasColumn('nightowl_dict_trace', 'created_at')
             && Schema::connection('nightowl')->hasTable('nightowl_requests_v2')
@@ -57,6 +77,11 @@ final class MigrationRunner
             && Schema::connection('nightowl')->getConnection()->selectOne(
                 "SELECT to_regprocedure('nightowl_ddsketch_count(bytea)') IS NOT NULL AS present"
             )->present) {
+            // Warm DB: the glob/replay loop below never runs, so an
+            // artifact-less migration would never execute in CI once the test DB
+            // reached the previous high-water mark. Run those here.
+            self::replayArtifactless();
+
             self::$migrated = true;
 
             return;
@@ -66,17 +91,68 @@ final class MigrationRunner
         // guards, so the chain can't be re-run over them. This is a throwaway
         // test DB — drop every nightowl_* table and migrate fresh.
         if (Schema::connection('nightowl')->hasTable('nightowl_requests')) {
-            $conn = Schema::connection('nightowl')->getConnection();
-            $tables = $conn->select(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE 'nightowl\\_%'"
-            );
-            foreach ($tables as $t) {
-                $conn->statement("DROP TABLE IF EXISTS {$t->tablename} CASCADE");
-            }
+            self::dropEveryTable();
         }
 
-        $migrationsDir = __DIR__.'/../../database/migrations';
-        $files = glob($migrationsDir.'/*.php') ?: [];
+        self::replayChain();
+
+        self::$migrated = true;
+    }
+
+    /**
+     * Drop every nightowl_* relation and replay the whole chain, mid-run.
+     *
+     * For the one test class that RETIRES schema rather than merely writing to
+     * it: PruneV1EolTest proves the prune-integrated v1 EOL step by letting it
+     * DROP v1 parents, and it cannot put them back. Its `CREATE TABLE (LIKE …)`
+     * shape backup copies columns and NOT NULLs, which is all that class needs,
+     * but it does not copy PARTITIONING — so the restored table is a plain
+     * table, and PartitioningTest asserts exactly that distinction ("no
+     * unpartitioned table holds rows"). Whether the suite passed came down to
+     * which class PHPUnit ran first, and executionOrder="defects" makes that
+     * vary between otherwise identical runs.
+     *
+     * migrate()'s warm-DB probe cannot rescue it either: every artifact it
+     * checks (dictionaries, the v2 family, rollup columns, the log partition,
+     * the ddsketch function) survives a v1 parent drop untouched, so the fast
+     * path short-circuits and the dropped parents are never recreated for the
+     * rest of the process.
+     *
+     * Only the migrations know the real shape, so replay them. Called from
+     * tearDownAfterClass, which bounds the cost to once per run.
+     */
+    public static function rebuild(string $host, int $port, string $database, string $username, string $password): void
+    {
+        self::bootCapsule($host, $port, $database, $username, $password);
+
+        self::dropEveryTable();
+        self::replayChain();
+
+        self::$migrated = true;
+    }
+
+    /**
+     * Every nightowl_* table plus the `__{table}_shape_backup` scratch tables
+     * PruneV1EolTest leaves behind — those do NOT match the nightowl_ prefix,
+     * and leaving one would make the next rebuild's replay collide on a name
+     * that is not supposed to exist.
+     */
+    private static function dropEveryTable(): void
+    {
+        $conn = Schema::connection('nightowl')->getConnection();
+        $tables = $conn->select(
+            "SELECT tablename FROM pg_tables
+             WHERE schemaname = 'public'
+               AND (tablename LIKE 'nightowl\\_%' OR tablename LIKE '\\_\\_nightowl\\_%')"
+        );
+        foreach ($tables as $t) {
+            $conn->statement("DROP TABLE IF EXISTS \"{$t->tablename}\" CASCADE");
+        }
+    }
+
+    private static function replayChain(): void
+    {
+        $files = glob(__DIR__.'/../../database/migrations/*.php') ?: [];
         sort($files);
 
         foreach ($files as $file) {
@@ -85,8 +161,20 @@ final class MigrationRunner
                 $migration->up();
             }
         }
+    }
 
-        self::$migrated = true;
+    /**
+     * Replay the REPLAY_ALWAYS migrations. Reached only from the warm-DB fast
+     * path — the cold path's glob loop already includes them, in file order.
+     */
+    private static function replayArtifactless(): void
+    {
+        foreach (self::REPLAY_ALWAYS as $name) {
+            $migration = require __DIR__.'/../../database/migrations/'.$name;
+            if ($migration instanceof Migration) {
+                $migration->up();
+            }
+        }
     }
 
     private static function bootCapsule(string $host, int $port, string $database, string $username, string $password): void

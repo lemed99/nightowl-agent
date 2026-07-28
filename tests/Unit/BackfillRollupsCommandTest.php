@@ -159,6 +159,48 @@ final class BackfillRollupsCommandTest extends TestCase
         ));
     }
 
+    /**
+     * The concurrency chunk hands SQL two kinds of bound — wall strings for the
+     * created_at scan, epochs for the DELETE + HAVING bucket window — and every
+     * column behind them is written in UTC (RecordWriter::eventCreatedAt).
+     * Pre-fix the two came from different clocks (Carbon wall strings vs
+     * gmdate() of app-time epochs), so on a non-UTC app the bucket window sat an
+     * offset OUTSIDE the window that was scanned: each chunk cleared buckets it
+     * then had no scanned rows to rebuild, and the chart lost the offset-wide
+     * head of every chunk.
+     */
+    public function test_concurrency_chunk_bounds_are_utc_under_a_non_utc_app_timezone(): void
+    {
+        $cursor = strtotime('2026-01-15 08:00:30 UTC');   // deliberately not minute-aligned
+        $chunkEnd = strtotime('2026-01-16 08:00:00 UTC'); // New York is -5h on these dates
+        $margin = 900;
+
+        $appTz = date_default_timezone_get();
+
+        try {
+            date_default_timezone_set('UTC');
+            $underUtc = BackfillRollupsCommand::concurrencyChunkBounds($cursor, $chunkEnd, $margin);
+
+            date_default_timezone_set('America/New_York');
+            $bounds = BackfillRollupsCommand::concurrencyChunkBounds($cursor, $chunkEnd, $margin);
+        } finally {
+            date_default_timezone_set($appTz);
+        }
+
+        $this->assertSame($underUtc, $bounds, 'the bounds must not move with app.timezone');
+
+        // The DELETE floor is the wall string OF the epoch the HAVING filter
+        // gets — that pair living in two clocks is the whole defect.
+        $this->assertSame('2026-01-15 08:00:00', $bounds['deleteFrom']);
+        $this->assertSame($bounds['bucketLow'], strtotime($bounds['deleteFrom'].' UTC'));
+        $this->assertSame($bounds['bucketHigh'], strtotime($bounds['deleteTo'].' UTC'));
+
+        // Containment: everything the DELETE clears is inside what gets scanned,
+        // widened by exactly the margin on both ends.
+        $this->assertSame($bounds['bucketLow'] - $margin, strtotime($bounds['scanFrom'].' UTC'));
+        $this->assertSame($bounds['bucketHigh'] + $margin, strtotime($bounds['scanTo'].' UTC'));
+    }
+
     public function test_spec_flags_still_gate_columns_the_type_never_writes(): void
     {
         // A count-only type has no duration columns at all — a stray hist_00 on

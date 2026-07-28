@@ -3,6 +3,7 @@
 namespace NightOwl\Tests\System;
 
 use NightOwl\Simulator\NightwatchSimulator;
+use NightOwl\Tests\System\Concerns\ReadsRawFamily;
 use PDO;
 use PHPUnit\Framework\TestCase;
 
@@ -30,6 +31,8 @@ use PHPUnit\Framework\TestCase;
  */
 class AgentPgOutageSystemTest extends TestCase
 {
+    use ReadsRawFamily;
+
     private const TOKEN = 'chaos-test-token-2025';
 
     private const AGENT_HOST = '127.0.0.1';
@@ -41,6 +44,9 @@ class AgentPgOutageSystemTest extends TestCase
     private const PG_RECOVERY_TIMEOUT = 30;
 
     private const DRAIN_CATCHUP_TIMEOUT = 30;
+
+    /** ReadsRawFamily::waitForDrain's default deadline. */
+    private const DRAIN_TIMEOUT = 15;
 
     // Small enough that back-pressure trips quickly in test time.
     private const MAX_PENDING_ROWS = 500;
@@ -138,12 +144,12 @@ class AgentPgOutageSystemTest extends TestCase
     public function test_agent_survives_pg_outage_and_drains_on_recovery(): void
     {
         // 1. Baseline: pg up, a few rows make it through normally.
-        $traceA = 'chaos-baseline-'.uniqid();
+        $traceA = self::uuid();
         $response = $this->sim->send([
             $this->sim->makeRequest(['trace_id' => $traceA, 'method' => 'GET', 'status_code' => 200]),
         ]);
         $this->assertSame('2:OK', $response, 'baseline ingest should succeed before outage');
-        $this->waitForRow('nightowl_requests', "trace_id = '{$traceA}'", 15);
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $traceA), 1);
 
         // 2. Stop pg — graceful shutdown so libpq sees a clean refusal
         // on the drain worker's next attempt (paused containers hang
@@ -163,7 +169,7 @@ class AgentPgOutageSystemTest extends TestCase
         for ($i = 0; $i < $burstSize; $i++) {
             $resp = $this->sim->send([
                 $this->sim->makeRequest([
-                    'trace_id' => 'chaos-outage-'.$i,
+                    'trace_id' => self::uuid(),
                     'method' => 'POST',
                     'status_code' => 500,
                 ]),
@@ -186,7 +192,7 @@ class AgentPgOutageSystemTest extends TestCase
         for ($i = 0; $i < 30; $i++) {
             $resp = $this->sim->send([
                 $this->sim->makeRequest([
-                    'trace_id' => 'chaos-probe-'.$i,
+                    'trace_id' => self::uuid(),
                     'method' => 'POST',
                     'status_code' => 500,
                 ]),
@@ -224,7 +230,7 @@ class AgentPgOutageSystemTest extends TestCase
         $this->waitForDrainCatchup(self::DRAIN_CATCHUP_TIMEOUT);
 
         // 6. Verify ingest is healthy again — back-pressure should lift.
-        $traceB = 'chaos-recovery-'.uniqid();
+        $traceB = self::uuid();
         $recoveryResp = null;
         $deadline = microtime(true) + 10;
         while (microtime(true) < $deadline) {
@@ -237,7 +243,7 @@ class AgentPgOutageSystemTest extends TestCase
             usleep(500_000);
         }
         $this->assertSame('2:OK', $recoveryResp, 'agent should accept ingest again after recovery');
-        $this->waitForRow('nightowl_requests', "trace_id = '{$traceB}'", 15);
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $traceB), 1);
 
         // 7. Verify the checkpoint path actually ran. With CHECKPOINT_INTERVAL_SECONDS=3
         // + CHECKPOINT_TRUNCATE_BYTES=256KB, TRUNCATE should have fired multiple times
@@ -445,32 +451,9 @@ class AgentPgOutageSystemTest extends TestCase
         self::$pdo->exec('DROP TABLE IF EXISTS "migrations" CASCADE');
     }
 
-    private static function truncateAllTables(): void
+    protected static function pdo(): PDO
     {
-        $tables = [
-            'nightowl_issue_activity', 'nightowl_issue_comments', 'nightowl_issues',
-            'nightowl_requests', 'nightowl_queries', 'nightowl_exceptions',
-            'nightowl_commands', 'nightowl_jobs', 'nightowl_cache_events',
-            'nightowl_mail', 'nightowl_notifications', 'nightowl_outgoing_requests',
-            'nightowl_scheduled_tasks', 'nightowl_logs', 'nightowl_users',
-            'nightowl_settings', 'nightowl_alert_channels',
-        ];
-        foreach ($tables as $t) {
-            self::$pdo->exec("TRUNCATE TABLE {$t} CASCADE");
-        }
-    }
-
-    private function waitForRow(string $table, string $where, float $timeout): void
-    {
-        $deadline = microtime(true) + $timeout;
-        while (microtime(true) < $deadline) {
-            $n = (int) self::$pdo->query("SELECT COUNT(*) FROM {$table} WHERE {$where}")->fetchColumn();
-            if ($n >= 1) {
-                return;
-            }
-            usleep(200_000);
-        }
-        $this->fail("drain timeout: no row in {$table} WHERE {$where}");
+        return self::$pdo;
     }
 
     private function waitForDrainCatchup(float $timeout): void

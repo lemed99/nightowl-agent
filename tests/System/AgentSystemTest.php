@@ -3,6 +3,7 @@
 namespace NightOwl\Tests\System;
 
 use NightOwl\Tests\Integration\MigrationRunner;
+use NightOwl\Tests\System\Concerns\ReadsRawFamily;
 use NightOwl\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
@@ -34,6 +35,8 @@ use PHPUnit\Framework\TestCase;
  */
 class AgentSystemTest extends TestCase
 {
+    use ReadsRawFamily;
+
     private const TOKEN = 'system-test-token-2025';
 
     private const AGENT_HOST = '127.0.0.1';
@@ -246,55 +249,9 @@ class AgentSystemTest extends TestCase
 
     // ─── Helpers ──────────────────────────────────────────────
 
-    private static function truncateAllTables(): void
+    protected static function pdo(): PDO
     {
-        $tables = [
-            'nightowl_issue_activity', 'nightowl_issue_comments', 'nightowl_issues',
-            'nightowl_requests', 'nightowl_queries', 'nightowl_exceptions',
-            'nightowl_commands', 'nightowl_jobs', 'nightowl_cache_events',
-            'nightowl_mail', 'nightowl_notifications', 'nightowl_outgoing_requests',
-            'nightowl_scheduled_tasks', 'nightowl_logs', 'nightowl_users',
-            'nightowl_settings', 'nightowl_alert_channels',
-        ];
-
-        foreach ($tables as $table) {
-            self::$pdo->exec("TRUNCATE TABLE {$table} CASCADE");
-        }
-    }
-
-    private static function rowCount(string $table, string $where = '1=1'): int
-    {
-        return (int) self::$pdo->query("SELECT COUNT(*) FROM {$table} WHERE {$where}")->fetchColumn();
-    }
-
-    private static function fetch(string $table, string $where): ?array
-    {
-        $row = self::$pdo->query("SELECT * FROM {$table} WHERE {$where}")->fetch(PDO::FETCH_ASSOC);
-
-        return $row ?: null;
-    }
-
-    /**
-     * Poll PostgreSQL until a condition is met or timeout expires.
-     * The drain worker runs in a separate process with its own schedule,
-     * so we must wait for it to flush SQLite → PG.
-     */
-    private function waitForDrain(string $table, string $where, int $expectedCount, float $timeout = self::DRAIN_TIMEOUT): void
-    {
-        $deadline = microtime(true) + $timeout;
-        $actual = 0;
-
-        while (microtime(true) < $deadline) {
-            $actual = self::rowCount($table, $where);
-            if ($actual >= $expectedCount) {
-                return;
-            }
-            usleep(200_000); // 200ms poll
-        }
-
-        $this->fail(
-            "Drain timeout after {$timeout}s: expected {$expectedCount} rows in {$table} WHERE {$where}, got {$actual}."
-        );
+        return self::$pdo;
     }
 
     /**
@@ -321,15 +278,15 @@ class AgentSystemTest extends TestCase
 
     public function test_single_request_flows_through_entire_pipeline(): void
     {
-        $traceId = 'sys-req-'.uniqid();
+        $traceId = self::uuid();
 
         $this->sendAndExpectOk([
             $this->sim->makeRequest(['trace_id' => $traceId, 'method' => 'GET', 'status_code' => 200]),
         ]);
 
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $traceId), 1);
 
-        $row = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
+        $row = self::fetch('nightowl_requests', self::traceEq('nightowl_requests', $traceId));
         $this->assertNotNull($row);
         $this->assertSame('GET', $row['method']);
         $this->assertSame(200, (int) $row['status_code']);
@@ -339,7 +296,7 @@ class AgentSystemTest extends TestCase
 
     public function test_request_lifecycle_with_child_records(): void
     {
-        $traceId = 'sys-lifecycle-'.uniqid();
+        $traceId = self::uuid();
         $userId = 'sys-user-'.uniqid();
 
         $this->sendAndExpectOk([
@@ -351,25 +308,25 @@ class AgentSystemTest extends TestCase
                 'status_code' => 201,
             ]),
             $this->sim->makeQuery([
-                'trace_id' => 'sys-q1-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $traceId,
                 'execution_source' => 'request',
                 'sql' => 'INSERT INTO orders (user_id, total) VALUES (?, ?)',
             ]),
             $this->sim->makeQuery([
-                'trace_id' => 'sys-q2-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $traceId,
                 'execution_source' => 'request',
                 'sql' => 'SELECT * FROM products WHERE id = ?',
             ]),
             $this->sim->makeCacheEvent([
-                'trace_id' => 'sys-c1-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $traceId,
                 'type' => 'hit',
                 'key' => 'products:list',
             ]),
             $this->sim->makeLog([
-                'trace_id' => 'sys-l1-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $traceId,
                 'level' => 'info',
                 'message' => 'Order created',
@@ -378,17 +335,17 @@ class AgentSystemTest extends TestCase
         ]);
 
         // Wait for the request (parent record) — child records arrive in the same batch
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $traceId), 1);
 
         // Verify parent
-        $request = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
+        $request = self::fetch('nightowl_requests', self::traceEq('nightowl_requests', $traceId));
         $this->assertSame('POST', $request['method']);
         $this->assertSame(201, (int) $request['status_code']);
 
         // Verify children linked by execution_id
-        $this->assertSame(2, self::rowCount('nightowl_queries', "execution_id = '{$traceId}'"));
-        $this->assertSame(1, self::rowCount('nightowl_cache_events', "execution_id = '{$traceId}'"));
-        $this->assertSame(1, self::rowCount('nightowl_logs', "execution_id = '{$traceId}'"));
+        $this->assertSame(2, self::rowCount('nightowl_queries', self::execEq($traceId)));
+        $this->assertSame(1, self::rowCount('nightowl_cache_events', self::execEq($traceId)));
+        $this->assertSame(1, self::rowCount('nightowl_logs', self::execEq($traceId)));
 
         // Verify user
         $user = self::fetch('nightowl_users', "user_id = '{$userId}'");
@@ -399,7 +356,7 @@ class AgentSystemTest extends TestCase
 
     public function test_exception_creates_issue_automatically(): void
     {
-        $traceId = 'sys-exc-'.uniqid();
+        $traceId = self::uuid();
         $exceptionClass = 'App\\Exceptions\\SystemTestException';
         $file = 'app/Services/Payment.php';
         $line = 42;
@@ -412,7 +369,7 @@ class AgentSystemTest extends TestCase
                 'exceptions' => 1,
             ]),
             $this->sim->makeException([
-                'trace_id' => 'sys-exc-detail-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $traceId,
                 'class' => $exceptionClass,
                 'message' => 'Payment gateway timeout',
@@ -421,10 +378,10 @@ class AgentSystemTest extends TestCase
             ]),
         ]);
 
-        $this->waitForDrain('nightowl_exceptions', "execution_id = '{$traceId}'", 1);
+        $this->waitForDrain('nightowl_exceptions', self::execEq($traceId), 1);
 
         // Exception record stored
-        $exception = self::fetch('nightowl_exceptions', "execution_id = '{$traceId}'");
+        $exception = self::fetch('nightowl_exceptions', self::execEq($traceId));
         $this->assertSame($exceptionClass, $exception['class']);
         $this->assertSame($fingerprint, $exception['fingerprint']);
 
@@ -449,7 +406,7 @@ class AgentSystemTest extends TestCase
         for ($i = 0; $i < 5; $i++) {
             $this->sendAndExpectOk([
                 $this->sim->makeException([
-                    'trace_id' => 'sys-dup-'.uniqid(),
+                    'trace_id' => self::uuid(),
                     'class' => $exceptionClass,
                     'file' => $file,
                     'line' => $line,
@@ -458,7 +415,7 @@ class AgentSystemTest extends TestCase
             ]);
         }
 
-        $this->waitForDrain('nightowl_exceptions', "fingerprint = '{$fingerprint}'", 5);
+        $this->waitForDrain('nightowl_exceptions', self::fingerprintEq($fingerprint), 5);
 
         $issue = self::fetch('nightowl_issues', "group_hash = '{$fingerprint}'");
         $this->assertSame(5, (int) $issue['occurrences_count']);
@@ -470,47 +427,44 @@ class AgentSystemTest extends TestCase
 
     public function test_all_twelve_record_types_arrive_in_postgres(): void
     {
-        $tag = 'sys-all-'.uniqid();
+        $userId = 'sys-all-user-'.uniqid();
+
+        // One trace id per logical table, so each assertion below names the
+        // exact row it expects rather than counting whatever landed.
+        $traces = [];
+        foreach ([
+            'nightowl_requests', 'nightowl_queries', 'nightowl_exceptions',
+            'nightowl_commands', 'nightowl_jobs', 'nightowl_cache_events',
+            'nightowl_mail', 'nightowl_notifications', 'nightowl_outgoing_requests',
+            'nightowl_scheduled_tasks', 'nightowl_logs',
+        ] as $table) {
+            $traces[$table] = self::uuid();
+        }
 
         $this->sendAndExpectOk([
-            $this->sim->makeRequest(['trace_id' => "{$tag}-req"]),
-            $this->sim->makeQuery(['trace_id' => "{$tag}-qry"]),
-            $this->sim->makeException(['trace_id' => "{$tag}-exc"]),
-            $this->sim->makeCommand(['trace_id' => "{$tag}-cmd"]),
-            $this->sim->makeJob(['trace_id' => "{$tag}-job"]),
-            $this->sim->makeCacheEvent(['trace_id' => "{$tag}-cache"]),
-            $this->sim->makeMail(['trace_id' => "{$tag}-mail"]),
-            $this->sim->makeNotification(['trace_id' => "{$tag}-notif"]),
-            $this->sim->makeOutgoingRequest(['trace_id' => "{$tag}-out"]),
-            $this->sim->makeScheduledTask(['trace_id' => "{$tag}-task"]),
-            $this->sim->makeLog(['trace_id' => "{$tag}-log"]),
-            $this->sim->makeUser("{$tag}-user"),
+            $this->sim->makeRequest(['trace_id' => $traces['nightowl_requests']]),
+            $this->sim->makeQuery(['trace_id' => $traces['nightowl_queries']]),
+            $this->sim->makeException(['trace_id' => $traces['nightowl_exceptions']]),
+            $this->sim->makeCommand(['trace_id' => $traces['nightowl_commands']]),
+            $this->sim->makeJob(['trace_id' => $traces['nightowl_jobs']]),
+            $this->sim->makeCacheEvent(['trace_id' => $traces['nightowl_cache_events']]),
+            $this->sim->makeMail(['trace_id' => $traces['nightowl_mail']]),
+            $this->sim->makeNotification(['trace_id' => $traces['nightowl_notifications']]),
+            $this->sim->makeOutgoingRequest(['trace_id' => $traces['nightowl_outgoing_requests']]),
+            $this->sim->makeScheduledTask(['trace_id' => $traces['nightowl_scheduled_tasks']]),
+            $this->sim->makeLog(['trace_id' => $traces['nightowl_logs']]),
+            $this->sim->makeUser($userId),
         ]);
 
         // Wait for the slowest table (exception triggers issue upsert)
-        $this->waitForDrain('nightowl_exceptions', "trace_id = '{$tag}-exc'", 1);
+        $this->waitForDrain('nightowl_exceptions', self::traceEq('nightowl_exceptions', $traces['nightowl_exceptions']), 1);
 
-        // Verify every table
-        $checks = [
-            'nightowl_requests' => "{$tag}-req",
-            'nightowl_queries' => "{$tag}-qry",
-            'nightowl_exceptions' => "{$tag}-exc",
-            'nightowl_commands' => "{$tag}-cmd",
-            'nightowl_jobs' => "{$tag}-job",
-            'nightowl_cache_events' => "{$tag}-cache",
-            'nightowl_mail' => "{$tag}-mail",
-            'nightowl_notifications' => "{$tag}-notif",
-            'nightowl_outgoing_requests' => "{$tag}-out",
-            'nightowl_scheduled_tasks' => "{$tag}-task",
-            'nightowl_logs' => "{$tag}-log",
-        ];
-
-        foreach ($checks as $table => $traceId) {
-            $count = self::rowCount($table, "trace_id = '{$traceId}'");
+        foreach ($traces as $table => $traceId) {
+            $count = self::rowCount($table, self::traceEq($table, $traceId));
             $this->assertSame(1, $count, "Expected 1 row in {$table} for trace_id {$traceId}");
         }
 
-        $this->assertSame(1, self::rowCount('nightowl_users', "user_id = '{$tag}-user'"));
+        $this->assertSame(1, self::rowCount('nightowl_users', "user_id = '{$userId}'"));
         // Exception should have created an issue
         $this->assertGreaterThanOrEqual(1, self::rowCount('nightowl_issues'));
     }
@@ -523,11 +477,11 @@ class AgentSystemTest extends TestCase
             $this->markTestSkipped('ext-zlib not available');
         }
 
-        $traceId = 'sys-gzip-'.uniqid();
+        $traceId = self::uuid();
 
         $records = [
             $this->sim->makeRequest(['trace_id' => $traceId, 'method' => 'PUT', 'status_code' => 200]),
-            $this->sim->makeQuery(['trace_id' => 'sys-gzq-'.uniqid(), 'execution_id' => $traceId]),
+            $this->sim->makeQuery(['trace_id' => self::uuid(), 'execution_id' => $traceId]),
         ];
 
         // Build gzip wire payload manually
@@ -550,9 +504,9 @@ class AgentSystemTest extends TestCase
 
         $this->assertSame('2:OK', $response);
 
-        $this->waitForDrain('nightowl_requests', "trace_id = '{$traceId}'", 1);
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $traceId), 1);
 
-        $row = self::fetch('nightowl_requests', "trace_id = '{$traceId}'");
+        $row = self::fetch('nightowl_requests', self::traceEq('nightowl_requests', $traceId));
         $this->assertSame('PUT', $row['method']);
     }
 
@@ -560,7 +514,7 @@ class AgentSystemTest extends TestCase
 
     public function test_invalid_token_rejected_over_tcp(): void
     {
-        $traceId = 'sys-reject-'.uniqid();
+        $traceId = self::uuid();
 
         $json = json_encode([$this->sim->makeRequest(['trace_id' => $traceId])]);
         $body = "v1:INVALID:{$json}";
@@ -581,44 +535,45 @@ class AgentSystemTest extends TestCase
 
         // Give drain a moment, then verify nothing was stored
         usleep(500_000);
-        $this->assertSame(0, self::rowCount('nightowl_requests', "trace_id = '{$traceId}'"));
+        $this->assertSame(0, self::rowCount('nightowl_requests', self::traceEq('nightowl_requests', $traceId)));
     }
 
     // ─── 8. Batch Throughput ──────────────────────────────────
 
     public function test_batch_of100_requests_drained_correctly(): void
     {
-        $tag = 'sys-batch-'.uniqid();
+        $traces = self::uuids(100);
 
         $records = [];
-        for ($i = 0; $i < 100; $i++) {
-            $records[] = $this->sim->makeRequest(['trace_id' => "{$tag}-{$i}"]);
+        foreach ($traces as $traceId) {
+            $records[] = $this->sim->makeRequest(['trace_id' => $traceId]);
         }
 
         $this->sendAndExpectOk($records);
 
-        $this->waitForDrain('nightowl_requests', "trace_id LIKE '{$tag}-%'", 100);
+        $where = self::traceIn('nightowl_requests', $traces);
+        $this->waitForDrain('nightowl_requests', $where, 100);
 
-        $count = self::rowCount('nightowl_requests', "trace_id LIKE '{$tag}-%'");
-        $this->assertSame(100, $count);
+        $this->assertSame(100, self::rowCount('nightowl_requests', $where));
     }
 
     // ─── 9. Sequential Payloads ───────────────────────────────
 
     public function test_multiple_sequential_payloads_all_arrive(): void
     {
-        $tag = 'sys-seq-'.uniqid();
         $total = 20;
+        $traces = self::uuids($total);
 
-        for ($i = 0; $i < $total; $i++) {
+        foreach ($traces as $traceId) {
             $this->sendAndExpectOk([
-                $this->sim->makeRequest(['trace_id' => "{$tag}-{$i}"]),
+                $this->sim->makeRequest(['trace_id' => $traceId]),
             ]);
         }
 
-        $this->waitForDrain('nightowl_requests', "trace_id LIKE '{$tag}-%'", $total);
+        $where = self::traceIn('nightowl_requests', $traces);
+        $this->waitForDrain('nightowl_requests', $where, $total);
 
-        $this->assertSame($total, self::rowCount('nightowl_requests', "trace_id LIKE '{$tag}-%'"));
+        $this->assertSame($total, self::rowCount('nightowl_requests', $where));
     }
 
     // ─── 10. Error Storm ──────────────────────────────────────
@@ -643,7 +598,7 @@ class AgentSystemTest extends TestCase
 
             $this->sendAndExpectOk([
                 $this->sim->makeException([
-                    'trace_id' => 'sys-storm-'.uniqid(),
+                    'trace_id' => self::uuid(),
                     'class' => $class,
                     'message' => "Storm error #{$i}",
                     'file' => $file,
@@ -672,8 +627,8 @@ class AgentSystemTest extends TestCase
 
     public function test_job_lifecycle_processed_and_failed(): void
     {
-        $successTrace = 'sys-job-ok-'.uniqid();
-        $failTrace = 'sys-job-fail-'.uniqid();
+        $successTrace = self::uuid();
+        $failTrace = self::uuid();
 
         // Successful job
         $this->sendAndExpectOk([
@@ -694,7 +649,7 @@ class AgentSystemTest extends TestCase
                 'exceptions' => 1,
             ]),
             $this->sim->makeException([
-                'trace_id' => 'sys-jexc-'.uniqid(),
+                'trace_id' => self::uuid(),
                 'execution_id' => $failTrace,
                 'execution_source' => 'job',
                 'class' => 'App\\Exceptions\\PaymentTimeout',
@@ -703,13 +658,13 @@ class AgentSystemTest extends TestCase
             ]),
         ]);
 
-        $this->waitForDrain('nightowl_jobs', "trace_id = '{$failTrace}'", 1);
+        $this->waitForDrain('nightowl_jobs', self::traceEq('nightowl_jobs', $failTrace), 1);
 
-        $successJob = self::fetch('nightowl_jobs', "trace_id = '{$successTrace}'");
+        $successJob = self::fetch('nightowl_jobs', self::traceEq('nightowl_jobs', $successTrace));
         $this->assertSame('processed', $successJob['status']);
         $this->assertSame('emails', $successJob['queue']);
 
-        $failedJob = self::fetch('nightowl_jobs', "trace_id = '{$failTrace}'");
+        $failedJob = self::fetch('nightowl_jobs', self::traceEq('nightowl_jobs', $failTrace));
         $this->assertSame('failed', $failedJob['status']);
 
         // Failed job's exception should create an issue
@@ -722,8 +677,8 @@ class AgentSystemTest extends TestCase
 
     public function test_concurrent_tcp_connections_all_accepted(): void
     {
-        $tag = 'sys-conc-'.uniqid();
         $concurrency = 10;
+        $traces = self::uuids($concurrency);
 
         // Open all connections first
         $sockets = [];
@@ -741,7 +696,7 @@ class AgentSystemTest extends TestCase
 
         // Send payloads on all connections
         foreach ($sockets as $i => $sock) {
-            $records = [$this->sim->makeRequest(['trace_id' => "{$tag}-{$i}"])];
+            $records = [$this->sim->makeRequest(['trace_id' => $traces[$i]])];
             $json = json_encode($records);
             $body = "v1:{$tokenHash}:{$json}";
             $wire = strlen($body).':'.$body;
@@ -760,38 +715,44 @@ class AgentSystemTest extends TestCase
 
         $this->assertSame($concurrency, $okCount, 'All concurrent connections should be accepted');
 
-        $this->waitForDrain('nightowl_requests', "trace_id LIKE '{$tag}-%'", $concurrency);
-        $this->assertSame($concurrency, self::rowCount('nightowl_requests', "trace_id LIKE '{$tag}-%'"));
+        $where = self::traceIn('nightowl_requests', $traces);
+        $this->waitForDrain('nightowl_requests', $where, $concurrency);
+        $this->assertSame($concurrency, self::rowCount('nightowl_requests', $where));
     }
 
     // ─── 13. Mixed Realistic Scenario ─────────────────────────
 
     public function test_realistic_mixed_traffic_scenario(): void
     {
-        $tag = 'sys-mix-'.uniqid();
+        $reqTraces = self::uuids(10);
+        $jobTraces = self::uuids(3);
+        $cmdTraces = self::uuids(2);
+        $taskTrace = self::uuid();
+        $errTrace = self::uuid();
 
         // Simulate 30 seconds of realistic traffic in fast-forward
         // 10 requests, 3 jobs, 2 commands, 1 scheduled task, 1 error
-        for ($i = 0; $i < 10; $i++) {
-            $this->sim->simulateRequest(['trace_id' => "{$tag}-req-{$i}"]);
+        foreach ($reqTraces as $traceId) {
+            $this->sim->simulateRequest(['trace_id' => $traceId]);
         }
-        for ($i = 0; $i < 3; $i++) {
-            $this->sim->simulateJob('processed', ['trace_id' => "{$tag}-job-{$i}"]);
+        foreach ($jobTraces as $traceId) {
+            $this->sim->simulateJob('processed', ['trace_id' => $traceId]);
         }
-        for ($i = 0; $i < 2; $i++) {
-            $this->sim->simulateCommand(['trace_id' => "{$tag}-cmd-{$i}"]);
+        foreach ($cmdTraces as $traceId) {
+            $this->sim->simulateCommand(['trace_id' => $traceId]);
         }
-        $this->sim->simulateScheduledTask(['trace_id' => "{$tag}-task-0"]);
-        $this->sim->simulateErrorRequest(['trace_id' => "{$tag}-err-0"]);
+        $this->sim->simulateScheduledTask(['trace_id' => $taskTrace]);
+        $this->sim->simulateErrorRequest(['trace_id' => $errTrace]);
 
         // Wait for the last items to arrive
-        $this->waitForDrain('nightowl_scheduled_tasks', "trace_id = '{$tag}-task-0'", 1);
+        $taskWhere = self::traceEq('nightowl_scheduled_tasks', $taskTrace);
+        $this->waitForDrain('nightowl_scheduled_tasks', $taskWhere, 1);
 
         // Verify the realistic spread
-        $this->assertSame(10, self::rowCount('nightowl_requests', "trace_id LIKE '{$tag}-req-%'"));
-        $this->assertSame(3, self::rowCount('nightowl_jobs', "trace_id LIKE '{$tag}-job-%'"));
-        $this->assertSame(2, self::rowCount('nightowl_commands', "trace_id LIKE '{$tag}-cmd-%'"));
-        $this->assertSame(1, self::rowCount('nightowl_scheduled_tasks', "trace_id = '{$tag}-task-0'"));
+        $this->assertSame(10, self::rowCount('nightowl_requests', self::traceIn('nightowl_requests', $reqTraces)));
+        $this->assertSame(3, self::rowCount('nightowl_jobs', self::traceIn('nightowl_jobs', $jobTraces)));
+        $this->assertSame(2, self::rowCount('nightowl_commands', self::traceIn('nightowl_commands', $cmdTraces)));
+        $this->assertSame(1, self::rowCount('nightowl_scheduled_tasks', $taskWhere));
 
         // Error request should have generated an exception + issue
         $this->assertGreaterThanOrEqual(1, self::rowCount('nightowl_exceptions'));
@@ -872,24 +833,28 @@ class AgentSystemTest extends TestCase
 
     public function test_large_payload_with_many_records(): void
     {
-        $tag = 'sys-large-'.uniqid();
+        $reqTraces = self::uuids(50);
+        $qryTraces = self::uuids(50);
+        $cacheTraces = self::uuids(50);
+        $logTraces = self::uuids(50);
 
         // 200 records in a single payload (requests + queries + cache + logs)
         $records = [];
         for ($i = 0; $i < 50; $i++) {
-            $records[] = $this->sim->makeRequest(['trace_id' => "{$tag}-r{$i}"]);
-            $records[] = $this->sim->makeQuery(['trace_id' => "{$tag}-q{$i}"]);
-            $records[] = $this->sim->makeCacheEvent(['trace_id' => "{$tag}-c{$i}"]);
-            $records[] = $this->sim->makeLog(['trace_id' => "{$tag}-l{$i}"]);
+            $records[] = $this->sim->makeRequest(['trace_id' => $reqTraces[$i]]);
+            $records[] = $this->sim->makeQuery(['trace_id' => $qryTraces[$i]]);
+            $records[] = $this->sim->makeCacheEvent(['trace_id' => $cacheTraces[$i]]);
+            $records[] = $this->sim->makeLog(['trace_id' => $logTraces[$i]]);
         }
 
         $this->sendAndExpectOk($records);
 
-        $this->waitForDrain('nightowl_requests', "trace_id LIKE '{$tag}-r%'", 50);
+        $reqWhere = self::traceIn('nightowl_requests', $reqTraces);
+        $this->waitForDrain('nightowl_requests', $reqWhere, 50);
 
-        $this->assertSame(50, self::rowCount('nightowl_requests', "trace_id LIKE '{$tag}-r%'"));
-        $this->assertSame(50, self::rowCount('nightowl_queries', "trace_id LIKE '{$tag}-q%'"));
-        $this->assertSame(50, self::rowCount('nightowl_cache_events', "trace_id LIKE '{$tag}-c%'"));
-        $this->assertSame(50, self::rowCount('nightowl_logs', "trace_id LIKE '{$tag}-l%'"));
+        $this->assertSame(50, self::rowCount('nightowl_requests', $reqWhere));
+        $this->assertSame(50, self::rowCount('nightowl_queries', self::traceIn('nightowl_queries', $qryTraces)));
+        $this->assertSame(50, self::rowCount('nightowl_cache_events', self::traceIn('nightowl_cache_events', $cacheTraces)));
+        $this->assertSame(50, self::rowCount('nightowl_logs', self::traceIn('nightowl_logs', $logTraces)));
     }
 }

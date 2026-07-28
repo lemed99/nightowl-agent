@@ -523,7 +523,18 @@ final class RecordWriter
         // (_v2_sql_hash etc.) are the same values the writeXV2 builders read.
         if ($this->v2Enabled()) {
             $this->heartbeat?->enter('pg:dict-warm');
-            $this->dict->warm($pdo, $this->collectDictMisses($grouped));
+            try {
+                $this->dict->warm($pdo, $this->collectDictMisses($grouped));
+            } catch (\Throwable $e) {
+                // The warm sits OUTSIDE the try below, so a warm that dies
+                // part-way reaches neither of the LRU's two trim points while
+                // leaving its succeeded chunks in the maps. Publish the failure
+                // here too — otherwise a drain wedged on the dict tables grows
+                // the maps by one partial batch per attempt, without bound.
+                $this->dict->discardPending();
+
+                throw $e;
+            }
         }
 
         $this->heartbeat?->enter('pg:begin');
@@ -1421,6 +1432,32 @@ final class RecordWriter
         }
     }
 
+    /** @var array<string, true> once-per-process log throttle, keyed by column */
+    private static array $dictLinkLossLogged = [];
+
+    /**
+     * Guard on a hash-keyed dictionary link (sql_id / route_id / trace_ref).
+     * Unlike v2Sid these have no in-transaction fallback — either this batch's
+     * warm pass resolved the hash or the collector found it already cached, and
+     * nothing evicts between the collect and the write, so by construction the
+     * id is there. A null therefore means the LRU dropped it anyway: the column
+     * is nullable so the row lands with NULL, the dictionary row survives
+     * with nothing pointing at it, and the value is unrecoverable (blank SQL
+     * card, routeless request, exception with no trace). Silent corruption has
+     * to be visible, so log it — once per process per column, not per row, and
+     * never as a throw: a poisoned batch must not wedge the drain.
+     */
+    private function dictLink(?int $id, string $column): ?int
+    {
+        if ($id === null && ! isset(self::$dictLinkLossLogged[$column])) {
+            self::$dictLinkLossLogged[$column] = true;
+            error_log("[NightOwl Agent] RecordWriter: {$column} unresolved for a hashed value; "
+                .'stored NULL — the dictionary row exists but the link is lost (logged once per process)');
+        }
+
+        return $id;
+    }
+
     private function writeRequestsV2(array $records, int $nowTs): void
     {
         $columns = [
@@ -1448,7 +1485,7 @@ final class RecordWriter
                 $this->v2Sid('deploy', $r['deploy'] ?? null),
                 $r['user'] ?? null,
                 $this->v2Sid('method', $r['method'] ?? 'GET'),
-                $routeHash === null ? null : $this->dict->routeId($routeHash),
+                $routeHash === null ? null : $this->dictLink($this->dict->routeId($routeHash), 'route_id'),
                 $r['url'] ?? '/',
                 $r['ip'] ?? null,
                 $r['duration'] ?? null,
@@ -1507,7 +1544,7 @@ final class RecordWriter
                 $this->v2Sid('execution_stage', $r['execution_stage'] ?? null),
                 $r['execution_preview'] ?? null,
                 $r['user'] ?? null,
-                $sqlHash === null ? null : $this->dict->sqlId($sqlHash),
+                $sqlHash === null ? null : $this->dictLink($this->dict->sqlId($sqlHash), 'sql_id'),
                 $r['duration'] ?? null,
                 $this->v2Sid('connection', $r['connection'] ?? null),
                 $this->v2Sid('connection_type', $r['connection_type'] ?? null),
@@ -3039,7 +3076,7 @@ final class RecordWriter
                     'code' => $r['code'] ?? null,
                     'file' => $r['file'] ?? null,
                     'line' => $r['line'] ?? null,
-                    'trace_ref' => $traceHash === null ? null : $this->dict->traceId($traceHash),
+                    'trace_ref' => $traceHash === null ? null : $this->dictLink($this->dict->traceId($traceHash), 'trace_ref'),
                     'php_version' => $r['php_version'] ?? null,
                     'laravel_version' => $r['laravel_version'] ?? null,
                     'handled' => filter_var($r['handled'] ?? false, FILTER_VALIDATE_BOOLEAN) ? 't' : 'f',

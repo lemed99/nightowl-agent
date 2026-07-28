@@ -20,11 +20,17 @@
     </testsuites>
     <php>
         <!-- The System harness subprocess reads this to choose the storage
-             family; the legacy System assertions target the v1 tables. Run
-             `NIGHTOWL_STORAGE_V2=true vendor/bin/phpunit -testsuite System`
-             for a v2-mode pass (Phase F wiring runs both). Integration tests
-             are unaffected: they pin the family per RecordWriter constructor. -->
-        <env name="NIGHTOWL_STORAGE_V2" value="false"/>
+             family, and tests/System/Concerns/ReadsRawFamily reads the same
+             variable so the assertions follow it. Pinned to the production
+             default so a bare local run exercises the format that ships; CI
+             runs the v1 leg too (`NIGHTOWL_STORAGE_V2=false`), because v1 is
+             still live for un-migrated tenants and as the kill switch.
+
+             The pin is not redundant with that default: unset would ALSO mean
+             v2, but stating it keeps the two readers provably in step.
+             Integration tests are unaffected — they pin the family per
+             RecordWriter constructor. -->
+        <env name="NIGHTOWL_STORAGE_V2" value="true"/>
     </php>
     <source>
         <include>

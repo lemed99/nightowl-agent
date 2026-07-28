@@ -18,6 +18,25 @@ use RuntimeException;
  * $pending and promoted at the same point doWrite() publishes
  * lastWrittenTables (post-commit), or discarded in the catch.
  *
+ * Eviction discipline: the maps are trimmed to their caps ONLY at the point a
+ * batch's outcome is published (promotePending / discardPending) — never during
+ * the warm pass or the write. Within one batch nothing may be dropped: the
+ * collector (RecordWriter::collectDictMisses) omits every value the LRU already
+ * holds, so an id evicted mid-batch is not re-warmed and the write reads back
+ * null into a NULLABLE sql_id/route_id/trace_ref. The dict row exists, the link
+ * is gone for good (blank SQL card, routeless request, traceless exception),
+ * and nothing errors — which is why the trim cannot live in warmTable's chunk
+ * loop, where a batch carrying more distinct values than a cap ate its own
+ * earliest-warmed ids. Peak map size is therefore cap + one batch's distinct
+ * values — and that overshoot is NOT bounded by NIGHTOWL_DRAIN_BATCH_SIZE.
+ * That knob bounds the SQLite payload ROWS a worker claims (DrainWorker's
+ * claimBatch/fetchPending); each row json_decodes into an ARRAY of records — a
+ * Nightwatch digest carries many events per payload — and they are flattened
+ * into the single $records array handed to write(). The real ceiling is
+ * batch rows × records per payload × the distinct values one record
+ * contributes, across all four maps. It is transient, not a leak: the trim at
+ * the batch's outcome frees it and nothing accumulates into the next batch.
+ *
  * Concurrent workers: INSERT ... ON CONFLICT DO NOTHING makes worker B's
  * speculative insert wait on worker A's in-flight tuple; after A commits,
  * B's insert no-ops and B's follow-up SELECT (fresh READ COMMITTED snapshot)
@@ -33,6 +52,14 @@ final class DictionaryCache
     private const ROUTE_CAP = 4096;
 
     private const TRACE_CAP = 2048;
+
+    /** map property → cap, so trim() is the single place any of them applies. */
+    private const CAPS = [
+        'strings' => self::STRING_CAP,
+        'sql' => self::SQL_CAP,
+        'routes' => self::ROUTE_CAP,
+        'traces' => self::TRACE_CAP,
+    ];
 
     /** Chunk VALUES lists well under the 65 535 bind-param cap. */
     private const INSERT_CHUNK = 500;
@@ -103,7 +130,7 @@ final class DictionaryCache
                 fn (array $r): array => [$r[0], $r[1]],
                 'SELECT id, kind, value FROM nightowl_dict_string WHERE (kind, value) IN (%s)',
                 fn (object $row): array => [$this->stringKey($row->kind, $row->value), (int) $row->id],
-                $this->strings, self::STRING_CAP,
+                $this->strings,
             );
         }
 
@@ -115,7 +142,7 @@ final class DictionaryCache
                 fn (array $r): array => [$r[0], $r[1], $r[2], $r[3]],
                 "SELECT id, encode(hash, 'hex') AS hash FROM nightowl_dict_sql WHERE hash IN (%s)",
                 fn (object $row): array => [$row->hash, (int) $row->id],
-                $this->sql, self::SQL_CAP,
+                $this->sql,
                 hashPlaceholder: "decode(?, 'hex')",
             );
         }
@@ -128,7 +155,7 @@ final class DictionaryCache
                 fn (array $r): array => $r,
                 "SELECT id, encode(hash, 'hex') AS hash FROM nightowl_dict_route WHERE hash IN (%s)",
                 fn (object $row): array => [$row->hash, (int) $row->id],
-                $this->routes, self::ROUTE_CAP,
+                $this->routes,
                 hashPlaceholder: "decode(?, 'hex')",
             );
         }
@@ -162,7 +189,7 @@ final class DictionaryCache
                 fn (array $r): array => [$r[0], $r[1]],
                 "SELECT id, encode(hash, 'hex') AS hash FROM nightowl_dict_trace WHERE hash IN (%s)",
                 fn (object $row): array => [$row->hash, (int) $row->id],
-                $this->traces, self::TRACE_CAP,
+                $this->traces,
                 hashPlaceholder: "decode(?, 'hex')",
             );
         }
@@ -205,20 +232,16 @@ final class DictionaryCache
     {
         foreach ($this->pending as [$map, $key, $id]) {
             $this->{$map}[$key] = $id;
-            $this->evict($this->{$map}, match ($map) {
-                'strings' => self::STRING_CAP,
-                'sql' => self::SQL_CAP,
-                'routes' => self::ROUTE_CAP,
-                default => self::TRACE_CAP,
-            });
         }
         $this->pending = [];
+        $this->trim();
     }
 
     /** Drop staged ids — call in doWrite()'s catch, before/after rollback. */
     public function discardPending(): void
     {
         $this->pending = [];
+        $this->trim();
     }
 
     // ------------------------------------------------------------- internals
@@ -252,9 +275,22 @@ final class DictionaryCache
     }
 
     /**
+     * Every map back to its cap. The ONLY eviction point — reached solely from
+     * the two outcome publishers, i.e. between batches (see the class's eviction
+     * discipline: a trim anywhere from the collect to the write drops links).
+     */
+    private function trim(): void
+    {
+        foreach (self::CAPS as $map => $cap) {
+            $this->evict($this->{$map}, $cap);
+        }
+    }
+
+    /**
      * Insert-then-select warm for one dict table, chunked. $rowValues maps a
      * miss row to its bind params (insert order); $intoCache maps a fetched
-     * row to [cacheKey, id].
+     * row to [cacheKey, id]. Chunking is a bind-param limit, not a memory one —
+     * the map grows past its cap here and is trimmed only between batches.
      */
     private function warmTable(
         PDO $pdo,
@@ -265,7 +301,6 @@ final class DictionaryCache
         string $selectSql,
         callable $intoCache,
         array &$map,
-        int $cap,
         string $hashPlaceholder = '',
     ): void {
         foreach (array_chunk($rows, self::INSERT_CHUNK) as $chunk) {
@@ -298,7 +333,6 @@ final class DictionaryCache
                 [$key, $id] = $intoCache($fetched);
                 $map[$key] = $id;
             }
-            $this->evict($map, $cap);
         }
     }
 }
