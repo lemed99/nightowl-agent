@@ -459,4 +459,41 @@ return [
     */
     'reopen_cooldown_hours' => (int) env('NIGHTOWL_REOPEN_COOLDOWN_HOURS', 0),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Agent SMTP
+    |--------------------------------------------------------------------------
+    |
+    | The agent sends its own email alerts (issue.new, issue.reopened, agent
+    | health) straight from the drain worker over a raw socket — it cannot use
+    | your app's mailer, because it runs in a forked child with no container.
+    | The SMTP credentials themselves are NOT here: they live per-app in the
+    | nightowl_alert_channels table, set from the dashboard. These are the
+    | knobs for how the agent speaks the protocol.
+    |
+    | A TOP-LEVEL key, not nested under an existing array: mergeConfigFrom is a
+    | shallow array_merge, so a published config predating this file would
+    | replace a parent array wholesale and swallow anything added inside it.
+    |
+    | Verify the whole path with `php artisan nightowl:test-alert` — the
+    | dashboard's own "send test" button goes through NightOwl's API, not
+    | through this client, so it cannot tell you whether the agent can send.
+    |
+    */
+    'smtp' => [
+        // Hostname used in the SMTP HELO/EHLO greeting. Leave null and the
+        // agent uses the machine's FQDN, falling back to an address literal
+        // (e.g. "[10.0.1.7]") when the host has no dotted name — common in
+        // containers. Set this only if your relay demands a specific name;
+        // strict relays (Exchange/Office 365, Postfix with
+        // reject_non_fqdn_helo_hostname) refuse anything that isn't one.
+        'helo' => env('NIGHTOWL_SMTP_HELO'),
+
+        // Seconds to wait for the TCP connection, and for each reply after it.
+        // Raise for a slow or distant relay. Both are additionally capped by
+        // the caller's dispatch budget, so a hung relay can't stall the drain.
+        'connect_timeout' => (float) env('NIGHTOWL_SMTP_CONNECT_TIMEOUT', 10),
+        'timeout' => (float) env('NIGHTOWL_SMTP_TIMEOUT', 10),
+    ],
+
 ];

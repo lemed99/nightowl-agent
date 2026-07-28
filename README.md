@@ -77,7 +77,7 @@ it's running:
 
 ```
 [NightOwl Agent] Update available: a newer nightowl/agent is installed on disk
-(v1.5.0#… -> v1.6.0#…) but this process is still running the old one. Restart
+(v2.0.0#… -> v2.1.0#…) but this process is still running the old one. Restart
 the agent to pick it up …
 ```
 
@@ -126,6 +126,25 @@ These features run in the agent process. Postgres is the only thing it talks to.
 
 - **Exception fingerprinting** — `nightowl_exceptions` upserts into `nightowl_issues` keyed on `(group_hash, type, environment)`, so repeats roll up into one grouped issue.
 - **New-issue alerts** — when an issue is seen for the first time the drain worker fans it out to whatever you've configured in `nightowl_alert_channels`: Email (BYO SMTP), Webhook (HMAC-signed), Slack, Discord.
+
+  Verify that path with:
+
+  ```bash
+  php artisan nightowl:test-alert            # every enabled channel
+  php artisan nightowl:test-alert --channel="Ops email"
+  ```
+
+  This matters more than it sounds. New-issue and reopened-issue alerts are sent **by the agent, from your server**, over its own SMTP and HTTP. If you use the hosted dashboard, its "Send test" button and its status-change alerts are sent by NightOwl's API from NightOwl's infrastructure. Two different senders reading the same channel row — so a green test in the dashboard does not prove your server can reach your SMTP relay. `nightowl:test-alert` is the one that does, and it prints the actual failure per channel rather than leaving it in the log.
+
+  It ignores each channel's event filter on purpose, so a transport problem can't hide behind one, and tells you afterwards if a channel that passed has new-issue alerts switched off.
+
+  Two SMTP knobs, if your relay is fussy or far away — the credentials themselves stay in the dashboard:
+
+  ```
+  NIGHTOWL_SMTP_HELO=mail.example.com   # default: your machine's FQDN, else an address literal
+  NIGHTOWL_SMTP_CONNECT_TIMEOUT=10
+  NIGHTOWL_SMTP_TIMEOUT=10
+  ```
 - **Threshold-based performance issues** — set a threshold per record type (slow request, slow query, slow job, and so on), and durations above it get turned into issues.
 - **Agent + host health diagnosis** — ring buffers and EWMA feed a rule engine that produces a health score and surfaces stalls (drain lag, buffer depth, CPU, memory, load average).
 - **Raw rows for every Nightwatch record type** — all 12 sit in your Postgres. `psql`, Metabase, or your own UI on top.

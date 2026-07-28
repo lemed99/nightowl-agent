@@ -25,18 +25,42 @@ final class AlertNotifier
 
     private ?string $channelFingerprint = null;
 
-    /** Maximum total time for notification dispatch per flush (seconds) */
-    private const MAX_NOTIFICATION_SECONDS = 5.0;
+    /**
+     * Maximum total time for notification dispatch per flush (seconds).
+     *
+     * A ceiling on the whole flush, not on one send: it is checked between
+     * dispatches, and SmtpClient clamps its own socket timeouts to whatever is
+     * left of it, so a hung relay costs the drain this budget plus at most one
+     * socket timeout — not one timeout per channel behind it, which is what an
+     * unclamped timeout would have meant. It was 5s while SMTP alone allowed
+     * 3s connect + 3s read —
+     * arithmetic that let one slow relay consume the budget for every other
+     * channel. Sized now so a real TLS handshake plus AUTH plus DATA fits with
+     * room for the other channels behind it; a flush only runs at all when a
+     * batch produced a new or reopened issue, which is rare.
+     */
+    private const MAX_NOTIFICATION_SECONDS = 30.0;
 
     /** @var list<array{appName: string, issueGroups: array, issueType: string, newHashes: string[], reopenedHashes: string[]}> */
     private array $pendingNotifications = [];
+
+    private SmtpClient $smtp;
+
+    private WebhookClient $webhook;
 
     public function __construct(
         private int $cacheTtl = 86400,
         private string $frontendUrl = '',
         private ?string $appId = null,
         private int $reopenCooldownHours = 0,
-    ) {}
+        ?SmtpClient $smtp = null,
+        ?WebhookClient $webhook = null,
+    ) {
+        // Defaulted rather than required so the many `new AlertNotifier` call
+        // sites (RecordWriter's fallback, every test) keep working unchanged.
+        $this->smtp = $smtp ?? new SmtpClient;
+        $this->webhook = $webhook ?? new WebhookClient;
+    }
 
     public static function fromConfig(): self
     {
@@ -50,6 +74,7 @@ final class AlertNotifier
             (string) config('nightowl.agent.dashboard_url', 'https://usenightowl.com'),
             is_string($appId) && $appId !== '' ? $appId : null,
             (int) config('nightowl.reopen_cooldown_hours', 0),
+            SmtpClient::fromConfig(),
         );
     }
 
@@ -65,7 +90,8 @@ final class AlertNotifier
      *   - 'existing':     keys whose row exists with status open/ignored, OR status=resolved
      *                     but within the reopen cooldown — no alert, status stays put.
      *   - 'reopen':       keys whose row exists with status=resolved AND the most recent
-     *                     status_changed→resolved activity is older than the cooldown.
+     *                     status_changed→resolved activity is older than the cooldown —
+     *                     or carries no readable resolve instant at all, which reopens.
      *                     Maps composite key → issue id, used to flip status + log activity
      *                     + dispatch an issue.reopened alert.
      *   - (anything not in either bucket) is treated as new by queueIssueNotifications.
@@ -85,22 +111,27 @@ final class AlertNotifier
             $reopen = [];
 
             // Pull id + status + most recent resolve-activity timestamp in one shot.
-            // The resolve_at subquery looks up nightowl_issue_activity for the most
-            // recent transition into 'resolved'; if none exists (e.g., issue was
-            // created already-resolved by some custom path), we fall back to
-            // updated_at as a best-effort proxy so cooldown still works.
+            // The resolve instant comes from nightowl_issue_activity and NOTHING
+            // else. There is deliberately no COALESCE onto nightowl_issues.updated_at:
+            // the drain's issue upsert rewrites updated_at on EVERY recurrence
+            // (`updated_at = EXCLUDED.updated_at`, unconditional — it fires even on
+            // the batches where the status CASE leaves the row resolved), so a
+            // resolved fingerprint that keeps recurring always carries an updated_at
+            // of "moments ago". As a cooldown proxy that is not merely imprecise, it
+            // is self-defeating: every recurrence pushes the window forward by
+            // exactly the interval being measured, so under any non-zero cooldown the
+            // issue can never reopen and never alerts again. NULL here instead means
+            // "no resolve instant known", which reopens — the same verdict utcEpoch's
+            // null already produces for an unreadable value.
             $stmt = $pdo->prepare("
                 SELECT
                     i.id,
                     i.status,
-                    COALESCE(
-                        (SELECT MAX(a.created_at)
-                           FROM nightowl_issue_activity a
-                          WHERE a.issue_id = i.id
-                            AND a.action = 'status_changed'
-                            AND a.new_value = 'resolved'),
-                        i.updated_at
-                    ) AS resolved_at
+                    (SELECT MAX(a.created_at)
+                       FROM nightowl_issue_activity a
+                      WHERE a.issue_id = i.id
+                        AND a.action = 'status_changed'
+                        AND a.new_value = 'resolved') AS resolved_at
                 FROM nightowl_issues i
                 WHERE i.group_hash = ?
                   AND i.type = ?
@@ -129,8 +160,17 @@ final class AlertNotifier
 
                 // status === 'resolved' — apply cooldown
                 $resolvedAt = $row['resolved_at'] ?? null;
-                $resolvedTs = $resolvedAt !== null ? strtotime((string) $resolvedAt) : false;
-                $elapsed = $resolvedTs !== false ? ($now - $resolvedTs) : PHP_INT_MAX;
+                $resolvedTs = $resolvedAt !== null ? self::utcEpoch((string) $resolvedAt) : null;
+
+                // Clamped at zero because the two instants are stamped by DIFFERENT
+                // machines — the resolve by whichever host ran the dashboard write,
+                // `$now` by the agent's own clock — so ordinary NTP skew can put the
+                // resolve in the agent's future. Unclamped that is a negative elapsed,
+                // which defeats even the shipped cooldown=0 ("always reopen"):
+                // -300 >= 0 is false, and the recurrence stays silent for the whole
+                // skew. A resolve that has not happened yet by our clock has had zero
+                // cooldown time, never negative.
+                $elapsed = $resolvedTs !== null ? max(0, $now - $resolvedTs) : PHP_INT_MAX;
 
                 if ($elapsed >= $cooldownSeconds) {
                     $reopen[$key] = (int) $row['id'];
@@ -143,6 +183,39 @@ final class AlertNotifier
             return ['existing' => $existing, 'reopen' => $reopen];
         } catch (\Throwable) {
             return ['existing' => [], 'reopen' => []];
+        }
+    }
+
+    /**
+     * Epoch of a naive `timestamp` string out of the tenant DB, read as UTC.
+     *
+     * Both sides of the cooldown are written with gmdate() — UTC wall time, no
+     * offset (nightowl_issue_activity.created_at from
+     * RecordWriter::logReopenActivity, and the nightowl_issues.updated_at
+     * fallback). Laravel calls date_default_timezone_set(app.timezone), so a
+     * bare strtotime() reads them in the CUSTOMER's app zone while the $now they
+     * are subtracted from is a true UTC epoch — the elapsed then carries the
+     * app's UTC offset. West of UTC it goes negative, and even the default
+     * reopen_cooldown_hours=0 suppresses the issue.reopened alert for the whole
+     * offset (~8h on America/Los_Angeles); east of UTC it re-alerts that many
+     * hours early. Hence the explicit zone rather than the process default.
+     *
+     * A value that carries its own offset keeps it: DateTimeImmutable applies
+     * the zone argument only to a naive string.
+     *
+     * null on an unreadable value — the caller treats that as "no resolve
+     * instant known" and reopens, exactly as it did on strtotime's false.
+     */
+    private static function utcEpoch(string $value): ?int
+    {
+        if (trim($value) === '') {
+            return null; // DateTimeImmutable('') is "now", not a parse failure
+        }
+
+        try {
+            return (new \DateTimeImmutable($value, new \DateTimeZone('UTC')))->getTimestamp();
+        } catch (\Throwable) {
+            return null;
         }
     }
 
@@ -248,7 +321,7 @@ final class AlertNotifier
 
                             return;
                         }
-                        $this->dispatchToChannel($channel, $batch['appName'], 'New Issue', $group, $batch['issueType']);
+                        $this->dispatchToChannel($channel, $batch['appName'], 'New Issue', $group, $batch['issueType'], $deadline);
                     }
                 }
 
@@ -259,11 +332,96 @@ final class AlertNotifier
 
                             return;
                         }
-                        $this->dispatchToChannel($channel, $batch['appName'], 'Reopened Issue', $group, $batch['issueType']);
+                        $this->dispatchToChannel($channel, $batch['appName'], 'Reopened Issue', $group, $batch['issueType'], $deadline);
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Send a test notification through every configured channel, on the real
+     * dispatch path, and report per channel what happened.
+     *
+     * This exists because nothing else in the product exercises the AGENT's
+     * dispatchers. The dashboard's "send test" button runs nightowl-api's
+     * Symfony-Mailer path, and so do all the triage alerts (issue.resolved,
+     * issue.ignored) — so a customer can test green, receive triage mail, and
+     * still never get an issue.new or issue.reopened, because those come from
+     * here and only from here. A green test there proves nothing about this.
+     *
+     * Everything below the synthetic issue group is production code:
+     * loadChannels() reads the same rows with the same cache, and
+     * dispatchOrThrow() runs the same formatters and the same transports. The
+     * only thing faked is the issue.
+     *
+     * `notify_events` is deliberately NOT enforced — a transport test that
+     * silently sends nothing is the failure mode we are here to kill. It is
+     * reported instead, since a channel excluding issue.new/issue.reopened is
+     * itself a reason a customer sees no alerts.
+     *
+     * @param  string|null  $only  Restrict to one channel by name
+     * @param  string  $environment  Passed in rather than read from config() here —
+     *                               this class is also constructed inside the forked
+     *                               drain child, where there is no container
+     * @return list<array{name: string, type: string, ok: bool, error: string|null, muted_events: list<string>}>
+     */
+    public function sendTestNotifications(PDO $pdo, string $appName, ?string $only = null, string $environment = 'production'): array
+    {
+        $group = [
+            'fingerprint' => 'nightowl-test-notification',
+            'class' => 'NightOwl\\TestNotification',
+            'message' => 'Test alert from nightowl:test-alert — if you are reading this, the agent can reach your channel.',
+            'location' => 'src/Agent/SmtpClient.php:1',
+            'environment' => $environment,
+            'count' => 1,
+            'users' => 0,
+            'users_count' => 0,
+            'issue_id' => null,
+            'first_seen_at' => gmdate('Y-m-d H:i:s'),
+            'last_seen_at' => gmdate('Y-m-d H:i:s'),
+            'subtype' => null,
+            'handled' => false,
+            'server' => gethostname() ?: 'unknown',
+            'php_version' => PHP_VERSION,
+            'status' => 'open',
+            'priority' => 'medium',
+        ];
+
+        $results = [];
+
+        foreach ($this->loadChannels($pdo) as $channel) {
+            if ($only !== null && $channel['name'] !== $only) {
+                continue;
+            }
+
+            $notifyEvents = $channel['config']['notify_events'] ?? null;
+            $muted = [];
+            if (is_array($notifyEvents)) {
+                foreach (['issue.new', 'issue.reopened'] as $event) {
+                    if (! in_array($event, $notifyEvents, true)) {
+                        $muted[] = $event;
+                    }
+                }
+            }
+
+            $error = null;
+            try {
+                $this->dispatchOrThrow($channel, $appName, 'New Issue', $group, 'exception', null);
+            } catch (\Throwable $e) {
+                $error = $e->getMessage();
+            }
+
+            $results[] = [
+                'name' => $channel['name'],
+                'type' => $channel['type'],
+                'ok' => $error === null,
+                'error' => $error,
+                'muted_events' => $muted,
+            ];
+        }
+
+        return $results;
     }
 
     /**
@@ -438,19 +596,33 @@ final class AlertNotifier
 
     // ─── Dispatch ────────────────────────────────────────────────────
 
-    private function dispatchToChannel(array $channel, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
+    private function dispatchToChannel(array $channel, string $appName, string $prefix, array $group, string $issueType = 'exception', ?float $deadline = null): void
     {
         try {
-            match ($channel['type']) {
-                'slack' => $this->sendSlack($channel['config'], $appName, $prefix, $group, $issueType),
-                'discord' => $this->sendDiscord($channel['config'], $appName, $prefix, $group, $issueType),
-                'webhook' => $this->sendWebhook($channel['config'], $appName, $prefix, $group, $issueType),
-                'email' => $this->sendEmail($channel['config'], $appName, $prefix, $group, $issueType),
-                default => null,
-            };
+            $this->dispatchOrThrow($channel, $appName, $prefix, $group, $issueType, $deadline);
         } catch (\Throwable $e) {
             error_log("[NightOwl Agent] Failed to notify via {$channel['type']} ({$channel['name']}): {$e->getMessage()}");
         }
+    }
+
+    /**
+     * The dispatch itself, errors intact.
+     *
+     * Split out so `nightowl:test-alert` can report why a channel failed
+     * instead of watching it disappear into error_log — which is exactly how
+     * a broken email channel stayed invisible to customers.
+     *
+     * @throws \Throwable
+     */
+    private function dispatchOrThrow(array $channel, string $appName, string $prefix, array $group, string $issueType, ?float $deadline): void
+    {
+        match ($channel['type']) {
+            'slack' => $this->sendSlack($channel['config'], $appName, $prefix, $group, $issueType),
+            'discord' => $this->sendDiscord($channel['config'], $appName, $prefix, $group, $issueType),
+            'webhook' => $this->sendWebhook($channel['config'], $appName, $prefix, $group, $issueType),
+            'email' => $this->sendEmail($channel['config'], $appName, $prefix, $group, $issueType, $deadline),
+            default => throw new \RuntimeException("unknown channel type '{$channel['type']}'"),
+        };
     }
 
     /**
@@ -525,19 +697,11 @@ final class AlertNotifier
         return "{$base}/dashboard/{$this->appId}/issues/{$issueId}";
     }
 
-    /**
-     * Strip CR/LF from a string to prevent email header injection.
-     */
-    private function sanitizeHeader(string $value): string
-    {
-        return str_replace(["\r", "\n"], '', $value);
-    }
-
     private function sendSlack(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
     {
         $url = $config['webhook_url'] ?? '';
         if ($url === '') {
-            return;
+            throw new \RuntimeException('slack channel has no webhook_url configured');
         }
 
         $name = $this->issueName($group);
@@ -660,14 +824,14 @@ final class AlertNotifier
             ],
         ];
 
-        $this->httpPost($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
+        $this->webhook->post($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
     private function sendDiscord(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
     {
         $url = $config['webhook_url'] ?? '';
         if ($url === '') {
-            return;
+            throw new \RuntimeException('discord channel has no webhook_url configured');
         }
 
         $name = $this->issueName($group);
@@ -762,14 +926,14 @@ final class AlertNotifier
             'embeds' => [$embed],
         ];
 
-        $this->httpPost($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
+        $this->webhook->post($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
     private function sendWebhook(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
     {
         $url = $config['url'] ?? '';
         if ($url === '') {
-            return;
+            throw new \RuntimeException('webhook channel has no url configured');
         }
 
         $title = $this->issueName($group);
@@ -818,185 +982,19 @@ final class AlertNotifier
             $headers['X-NightOwl-Signature'] = hash_hmac('sha256', $payload, $config['secret']);
         }
 
-        $this->httpPost($url, $payload, $headers);
+        $this->webhook->post($url, $payload, $headers);
     }
 
-    private function sendEmail(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception'): void
+    private function sendEmail(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception', ?float $deadline = null): void
     {
-        $host = $config['host'] ?? '';
-        $port = (int) ($config['port'] ?? 587);
-        $username = $config['username'] ?? '';
-        $password = $config['password'] ?? '';
-        $encryption = $config['encryption'] ?? 'tls';
-        $fromAddress = $config['from_address'] ?? '';
-        $fromName = $config['from_name'] ?? 'NightOwl';
-        $toAddresses = $config['to_addresses'] ?? [];
-
-        if ($host === '' || $fromAddress === '' || empty($toAddresses)) {
-            return;
-        }
-
         $name = $this->issueName($group);
         $group['view_url'] = $this->buildViewUrl($group['issue_id'] ?? null);
 
         $subjectPrefix = $this->headerStyle($prefix, $issueType)['label'];
-        $subject = $this->sanitizeHeader("[{$appName}] {$subjectPrefix}: {$name}");
-        $fromName = $this->sanitizeHeader($fromName);
-
         $body = EmailTemplate::renderIssue($appName, $group, $issueType, $this->frontendUrl);
 
-        $this->smtpSend($host, $port, $username, $password, $encryption, $fromAddress, $fromName, $toAddresses, $subject, $body, true);
-    }
-
-    // ─── Raw HTTP ────────────────────────────────────────────────────
-
-    /**
-     * Reject non-http(s) URLs before they reach file_get_contents. PHP's URL
-     * wrappers include file://, phar://, compress.zlib:// etc. — a malicious
-     * channel config could otherwise make the agent read local files.
-     */
-    private static function isSafeWebhookUrl(string $url): bool
-    {
-        $scheme = strtolower((string) parse_url($url, PHP_URL_SCHEME));
-
-        return $scheme === 'http' || $scheme === 'https';
-    }
-
-    private function httpPost(string $url, string $body, array $extraHeaders = []): void
-    {
-        if (! self::isSafeWebhookUrl($url)) {
-            error_log("[NightOwl Agent] Rejected webhook URL (scheme must be http/https): {$url}");
-
-            return;
-        }
-
-        $headers = "Content-Type: application/json\r\nContent-Length: ".strlen($body)."\r\n";
-        foreach ($extraHeaders as $key => $value) {
-            $headers .= "{$key}: {$value}\r\n";
-        }
-
-        $context = stream_context_create([
-            'http' => [
-                'method' => 'POST',
-                'header' => $headers,
-                'content' => $body,
-                'timeout' => 3,
-                'ignore_errors' => true,
-            ],
-        ]);
-
-        @file_get_contents($url, false, $context);
-    }
-
-    // ─── Raw SMTP ────────────────────────────────────────────────────
-
-    private function smtpSend(
-        string $host,
-        int $port,
-        string $username,
-        string $password,
-        string $encryption,
-        string $fromAddress,
-        string $fromName,
-        array $toAddresses,
-        string $subject,
-        string $body,
-        bool $isHtml = false,
-    ): void {
-        $transport = $encryption === 'ssl' ? "ssl://{$host}" : $host;
-
-        $socket = @stream_socket_client("{$transport}:{$port}", $errno, $errstr, 3);
-        if (! $socket) {
-            error_log("[NightOwl Agent] SMTP connect failed: {$errstr}");
-
-            return;
-        }
-
-        stream_set_timeout($socket, 3);
-
-        try {
-            $this->smtpExpect($socket, 2); // greeting
-            $this->smtpCommand($socket, 'EHLO nightowl', 2);
-
-            if ($encryption === 'tls') {
-                $this->smtpCommand($socket, 'STARTTLS', 2);
-                if (! stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT)) {
-                    error_log('[NightOwl Agent] SMTP STARTTLS failed');
-
-                    return;
-                }
-                $this->smtpCommand($socket, 'EHLO nightowl', 2);
-            }
-
-            if ($username !== '') {
-                $this->smtpCommand($socket, 'AUTH LOGIN', 3);
-                $this->smtpCommand($socket, base64_encode($username), 3);
-                $this->smtpCommand($socket, base64_encode($password), 2);
-            }
-
-            $this->smtpCommand($socket, "MAIL FROM:<{$fromAddress}>", 2);
-            foreach ($toAddresses as $to) {
-                $this->smtpCommand($socket, "RCPT TO:<{$to}>", 2);
-            }
-
-            $this->smtpCommand($socket, 'DATA', 3);
-
-            $toHeader = implode(', ', $toAddresses);
-            // Normalize body to CRLF line endings for SMTP
-            $smtpBody = str_replace(["\r\n", "\r", "\n"], ["\n", "\n", "\r\n"], $body);
-            // Dot-stuff lines starting with a period (SMTP transparency)
-            $smtpBody = str_replace("\r\n.", "\r\n..", $smtpBody);
-
-            $msg = "From: {$fromName} <{$fromAddress}>\r\n";
-            $msg .= "To: {$toHeader}\r\n";
-            $msg .= "Subject: {$subject}\r\n";
-            $msg .= "MIME-Version: 1.0\r\n";
-            $contentType = $isHtml ? 'text/html' : 'text/plain';
-            $msg .= "Content-Type: {$contentType}; charset=UTF-8\r\n";
-            $msg .= "\r\n";
-            $msg .= $smtpBody;
-            $msg .= "\r\n.\r\n";
-
-            fwrite($socket, $msg);
-            $this->smtpExpect($socket, 2);
-
-            fwrite($socket, "QUIT\r\n");
-        } finally {
-            fclose($socket);
-        }
-    }
-
-    /**
-     * Send an SMTP command and verify the response code starts with the expected digit.
-     *
-     * @throws \RuntimeException on unexpected response
-     */
-    private function smtpCommand($socket, string $command, int $expectFirstDigit): string
-    {
-        fwrite($socket, $command."\r\n");
-
-        return $this->smtpExpect($socket, $expectFirstDigit);
-    }
-
-    /**
-     * Read SMTP response and verify the first digit of the status code.
-     *
-     * @throws \RuntimeException on unexpected response
-     */
-    private function smtpExpect($socket, int $expectFirstDigit): string
-    {
-        $response = '';
-        while ($line = fgets($socket, 512)) {
-            $response .= $line;
-            if (isset($line[3]) && $line[3] === ' ') {
-                break;
-            }
-        }
-
-        if ($response === '' || (int) $response[0] !== $expectFirstDigit) {
-            throw new \RuntimeException('SMTP error: '.trim($response));
-        }
-
-        return $response;
+        // Config extraction, header sanitising and the incomplete-config check
+        // all live in SmtpClient — the two notifiers had drifted on all three.
+        $this->smtp->send($config, "[{$appName}] {$subjectPrefix}: {$name}", $body, true, $deadline);
     }
 }

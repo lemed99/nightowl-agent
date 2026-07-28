@@ -29,7 +29,18 @@ final class HealthAlertNotifier
 
     private const CHANNEL_CACHE_TTL = 3600;
 
-    private const MAX_DISPATCH_SECONDS = 5.0;
+    /**
+     * Ceiling on a whole dispatch round, checked between sends; SmtpClient
+     * clamps its socket timeouts to what remains, so this bounds the health
+     * timer regardless of how generous the SMTP timeouts are. Raised from 5s
+     * with those timeouts — a real TLS handshake plus AUTH plus DATA did not
+     * fit in the old budget, let alone several channels of it.
+     */
+    private const MAX_DISPATCH_SECONDS = 30.0;
+
+    private SmtpClient $smtp;
+
+    private WebhookClient $webhook;
 
     public function __construct(
         private string $dsn,
@@ -37,7 +48,12 @@ final class HealthAlertNotifier
         private string $password,
         private string $appName = 'NightOwl',
         private string $instanceId = '',
-    ) {}
+        ?SmtpClient $smtp = null,
+        ?WebhookClient $webhook = null,
+    ) {
+        $this->smtp = $smtp ?? new SmtpClient;
+        $this->webhook = $webhook ?? new WebhookClient;
+    }
 
     public static function fromConfig(string $instanceId = ''): self
     {
@@ -51,6 +67,7 @@ final class HealthAlertNotifier
             config('nightowl.database.password', 'nightowl'),
             config('app.name', 'NightOwl'),
             $instanceId,
+            SmtpClient::fromConfig(),
         );
     }
 
@@ -110,7 +127,7 @@ final class HealthAlertNotifier
                         'slack' => $this->sendSlack($channel['config'], $diagnosis, $variant),
                         'discord' => $this->sendDiscord($channel['config'], $diagnosis, $variant),
                         'webhook' => $this->sendWebhook($channel['config'], $diagnosis, $event, $variant),
-                        'email' => $this->sendEmail($channel['config'], $diagnosis, $variant),
+                        'email' => $this->sendEmail($channel['config'], $diagnosis, $variant, $deadline),
                         default => null,
                     };
                 } catch (\Throwable $e) {
@@ -209,7 +226,7 @@ final class HealthAlertNotifier
     {
         $url = $config['webhook_url'] ?? '';
         if ($url === '') {
-            return;
+            throw new \RuntimeException('slack channel has no webhook_url configured');
         }
 
         if ($variant === 'recovered') {
@@ -224,14 +241,14 @@ final class HealthAlertNotifier
             }
         }
 
-        $this->httpPost($url, json_encode(['text' => $text], JSON_INVALID_UTF8_SUBSTITUTE));
+        $this->webhook->post($url, json_encode(['text' => $text], JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
     private function sendDiscord(array $config, array $d, string $variant): void
     {
         $url = $config['webhook_url'] ?? '';
         if ($url === '') {
-            return;
+            throw new \RuntimeException('discord channel has no webhook_url configured');
         }
 
         if ($variant === 'recovered') {
@@ -246,14 +263,14 @@ final class HealthAlertNotifier
             }
         }
 
-        $this->httpPost($url, json_encode(['content' => $text], JSON_INVALID_UTF8_SUBSTITUTE));
+        $this->webhook->post($url, json_encode(['content' => $text], JSON_INVALID_UTF8_SUBSTITUTE));
     }
 
     private function sendWebhook(array $config, array $d, string $event, string $variant): void
     {
         $url = $config['url'] ?? '';
         if ($url === '') {
-            return;
+            throw new \RuntimeException('webhook channel has no url configured');
         }
 
         $payload = json_encode([
@@ -275,33 +292,17 @@ final class HealthAlertNotifier
             $headers['X-NightOwl-Signature'] = hash_hmac('sha256', $payload, $config['secret']);
         }
 
-        $this->httpPost($url, $payload, $headers);
+        $this->webhook->post($url, $payload, $headers);
     }
 
-    private function sendEmail(array $config, array $d, string $variant): void
+    private function sendEmail(array $config, array $d, string $variant, ?float $deadline = null): void
     {
-        $host = $config['host'] ?? '';
-        $port = (int) ($config['port'] ?? 587);
-        $username = $config['username'] ?? '';
-        $password = $config['password'] ?? '';
-        $encryption = $config['encryption'] ?? 'tls';
-        $fromAddress = self::sanitizeHeader((string) ($config['from_address'] ?? ''));
-        $fromName = self::sanitizeHeader((string) ($config['from_name'] ?? 'NightOwl'));
-        $toAddresses = array_map(
-            fn ($a) => self::sanitizeHeader((string) $a),
-            (array) ($config['to_addresses'] ?? []),
-        );
-
-        if ($host === '' || $fromAddress === '' || empty($toAddresses)) {
-            return;
-        }
-
         if ($variant === 'recovered') {
-            $subject = self::sanitizeHeader("[{$this->appName}] Recovered: {$d['code']}");
+            $subject = "[{$this->appName}] Recovered: {$d['code']}";
             $body = "Agent Health Recovered — {$this->appName}{$this->instanceLabel()}\n\n";
             $body .= "{$d['code']} — {$d['message']} (resolved)\n";
         } else {
-            $subject = self::sanitizeHeader("[{$this->appName}] Agent Health: {$d['code']}");
+            $subject = "[{$this->appName}] Agent Health: {$d['code']}";
             $body = "Agent Health Alert — {$this->appName}{$this->instanceLabel()}\n\n";
             $body .= strtoupper($d['level']).": {$d['code']}\n";
             $body .= "{$d['message']}\n";
@@ -310,125 +311,10 @@ final class HealthAlertNotifier
             }
         }
 
-        $transport = $encryption === 'ssl' ? "ssl://{$host}" : $host;
-        $socket = @stream_socket_client("{$transport}:{$port}", $errno, $errstr, 3);
-        if (! $socket) {
-            return;
-        }
-
-        stream_set_timeout($socket, 3);
-
-        try {
-            $this->smtpExpect($socket, 2);
-            $this->smtpCommand($socket, 'EHLO nightowl', 2);
-
-            if ($encryption === 'tls') {
-                $this->smtpCommand($socket, 'STARTTLS', 2);
-                if (! stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT)) {
-                    return;
-                }
-                $this->smtpCommand($socket, 'EHLO nightowl', 2);
-            }
-
-            if ($username !== '') {
-                $this->smtpCommand($socket, 'AUTH LOGIN', 3);
-                $this->smtpCommand($socket, base64_encode($username), 3);
-                $this->smtpCommand($socket, base64_encode($password), 2);
-            }
-
-            $this->smtpCommand($socket, "MAIL FROM:<{$fromAddress}>", 2);
-            foreach ($toAddresses as $to) {
-                $this->smtpCommand($socket, "RCPT TO:<{$to}>", 2);
-            }
-
-            $this->smtpCommand($socket, 'DATA', 3);
-
-            $toHeader = implode(', ', $toAddresses);
-            $smtpBody = str_replace(["\r\n", "\r", "\n"], ["\n", "\n", "\r\n"], $body);
-            $smtpBody = str_replace("\r\n.", "\r\n..", $smtpBody);
-
-            $msg = "From: {$fromName} <{$fromAddress}>\r\n";
-            $msg .= "To: {$toHeader}\r\n";
-            $msg .= "Subject: {$subject}\r\n";
-            $msg .= "MIME-Version: 1.0\r\n";
-            $msg .= "Content-Type: text/plain; charset=UTF-8\r\n";
-            $msg .= "\r\n{$smtpBody}\r\n.\r\n";
-
-            fwrite($socket, $msg);
-            $this->smtpExpect($socket, 2);
-            fwrite($socket, "QUIT\r\n");
-        } finally {
-            fclose($socket);
-        }
-    }
-
-    // ─── Raw HTTP / SMTP ─────────────────────────────────────────────
-
-    /**
-     * Strip CR/LF from a string to prevent email header / SMTP command injection.
-     */
-    private static function sanitizeHeader(string $value): string
-    {
-        return str_replace(["\r", "\n"], '', $value);
-    }
-
-    /**
-     * Reject non-http(s) URLs before they reach file_get_contents. PHP's URL
-     * wrappers include file://, phar://, compress.zlib:// etc. — a malicious
-     * channel config could otherwise make the agent read local files.
-     */
-    private static function isSafeWebhookUrl(string $url): bool
-    {
-        $scheme = strtolower((string) parse_url($url, PHP_URL_SCHEME));
-
-        return $scheme === 'http' || $scheme === 'https';
-    }
-
-    private function httpPost(string $url, string $body, array $extraHeaders = []): void
-    {
-        if (! self::isSafeWebhookUrl($url)) {
-            error_log("[NightOwl Agent] Rejected webhook URL (scheme must be http/https): {$url}");
-
-            return;
-        }
-
-        $headers = "Content-Type: application/json\r\nContent-Length: ".strlen($body)."\r\n";
-        foreach ($extraHeaders as $key => $value) {
-            $headers .= "{$key}: {$value}\r\n";
-        }
-
-        @file_get_contents($url, false, stream_context_create([
-            'http' => [
-                'method' => 'POST',
-                'header' => $headers,
-                'content' => $body,
-                'timeout' => 3,
-                'ignore_errors' => true,
-            ],
-        ]));
-    }
-
-    private function smtpCommand($socket, string $command, int $expectFirstDigit): string
-    {
-        fwrite($socket, $command."\r\n");
-
-        return $this->smtpExpect($socket, $expectFirstDigit);
-    }
-
-    private function smtpExpect($socket, int $expectFirstDigit): string
-    {
-        $response = '';
-        while ($line = fgets($socket, 512)) {
-            $response .= $line;
-            if (isset($line[3]) && $line[3] === ' ') {
-                break;
-            }
-        }
-
-        if ($response === '' || (int) $response[0] !== $expectFirstDigit) {
-            throw new \RuntimeException('SMTP error: '.trim($response));
-        }
-
-        return $response;
+        // Config extraction, header sanitising and the incomplete-config check
+        // all live in SmtpClient, shared with the drain's AlertNotifier — the two
+        // had drifted (this one sanitized addresses, that one did not) and only
+        // one of them was ever reached by a customer testing their setup.
+        $this->smtp->send($config, $subject, $body, false, $deadline);
     }
 }

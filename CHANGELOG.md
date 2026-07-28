@@ -79,10 +79,6 @@ in the git tags.
   existing `nightowl:prune` schedule; `--dry-run`, `--quarantine-days`,
   `--chunk`; a no-op on any tenant without the v2 twin or the 000068 column.
 
-## [1.5.0] - 2026-07-20
-
-### Added
-
 - **Boot-migrate: the daemon applies pending migrations at startup.** In the
   default (DB-history) model the schema is applied by `php artisan
   nightowl:migrate`, which is not wired into the host app's `php artisan
@@ -107,7 +103,7 @@ in the git tags.
     it. Without that, a rollup table created empty would serve zeroed charts
     indefinitely — the API read path prefers any rollup table that exists over
     raw.
-  - Failure never blocks startup: warn-and-continue, matching the pre-1.5.0
+  - Failure never blocks startup: warn-and-continue, matching the pre-2.0.0
     behaviour. Opt out with `NIGHTOWL_AUTO_MIGRATE=false` (e.g. a DB role
     without DDL rights); skipped under the legacy `NIGHTOWL_RUN_MIGRATIONS=true`
     ride-along, where the host app's `php artisan migrate` owns the schema.
@@ -126,7 +122,104 @@ in the git tags.
   than one running slightly stale code. Restarting stays your call. Opt out with
   `NIGHTOWL_UPDATE_CHECK=false`.
 
+- **`nightowl:test-alert` — send a real alert through the agent's own
+  dispatchers.** The dashboard's "Send test" button, and every triage alert
+  (`issue.resolved`, `issue.ignored`), are dispatched by nightowl-api through
+  Symfony Mailer. `issue.new` and `issue.reopened` are dispatched by the agent
+  on the customer's own machine, through its raw SMTP and HTTP. Two independent
+  transports reading one config row — so a customer could test green in the
+  dashboard, receive triage mail all day, and never once be told about a new
+  exception, with a single `error_log` line as the only evidence. Nothing in the
+  product exercised the second transport. This command does, and reports
+  PASS/FAIL per channel with the failure reason attached. `--channel=` restricts
+  it to one. It deliberately ignores `notify_events` so a transport failure
+  cannot hide behind a filter, and warns when a channel that passed has
+  `issue.new`/`issue.reopened` switched off — a pass that would still be silent
+  in production is a misleading pass.
+
+### Changed
+
+- **The two SMTP implementations became one (`SmtpClient`), and it now speaks
+  SMTP correctly.** `AlertNotifier` (drain child) and `HealthAlertNotifier`
+  (parent process) each carried a private copy, and the copies had drifted on
+  three separate points — only one of which was reachable by a customer testing
+  their setup. Merged, with four conformance fixes that each cost real mail:
+  - **`EHLO` no longer announces a bare hostname.** RFC 5321 §4.1.1.1 requires
+    an FQDN or an address literal; `nightowl` is neither. Exchange, Office 365
+    and any Postfix with `reject_non_fqdn_helo_hostname` refuse the session
+    outright. Now: configured name, else `gethostname()` when it is an FQDN,
+    else an address literal from the local socket. `NIGHTOWL_SMTP_HELO`
+    overrides.
+  - **`EHLO` is re-issued after `STARTTLS`** (RFC 3207 §4.2). The server
+    discards pre-upgrade capabilities, and relays commonly withhold `AUTH`
+    until the channel is encrypted — so authentication was being attempted
+    against a capability list that no longer applied.
+  - **`AUTH` follows what the server advertises.** `PLAIN` when offered, else
+    `LOGIN`; the old code always tried `LOGIN`, which fails on relays that
+    offer only `PLAIN`. Credentials never reach an exception message.
+  - **Messages carry `Date` and `Message-ID`** (RFC 5322 §3.6). Without them a
+    relay accepts the message with a 250 and then drops or spam-files it, which
+    is indistinguishable from delivery at the agent. Lines beginning with a
+    period are now dot-stuffed (RFC 5321 §4.5.2) — previously the relay
+    truncated the message at the first such line.
+
+  Timeouts are configurable (`NIGHTOWL_SMTP_CONNECT_TIMEOUT`,
+  `NIGHTOWL_SMTP_TIMEOUT`) and clamped to the dispatch budget, which rose from
+  5s to 30s: 5s was less than one real TLS handshake plus `AUTH` plus `DATA`,
+  so a healthy-but-unhurried relay consumed the budget for every channel
+  behind it.
+
+- **Webhook dispatch reads the response, and both notifiers share one
+  implementation (`WebhookClient`).** Slack, Discord and plain webhooks were
+  posted with `@file_get_contents` and the result discarded — a revoked Slack
+  webhook, a mistyped URL 404ing, or a receiver returning 500 was
+  indistinguishable from a delivered alert. A non-2xx now raises, carrying the
+  status and the receiver's own first 200 bytes. URLs are redacted to
+  `host/…` in every error: a Slack or Discord webhook path IS the credential,
+  and these strings reach logs and console output. A channel configured with an
+  empty URL raises too, instead of returning as though it had sent. The
+  per-request timeout moved 3s → 10s. Both notifiers already isolate a
+  channel's dispatch in try/catch, so drain and health-tick behaviour is
+  unchanged — what changes is that failures now have a reason.
+
+  Two details worth naming, because the obvious implementation gets both wrong.
+  The transport reason is captured through a scoped `set_error_handler` rather
+  than `@` plus `error_get_last()`: `error_get_last()` is only written by PHP's
+  *internal* handler, and any userland handler returning non-false bypasses it
+  — Laravel installs one, so inside a real host app the reason degraded to a
+  placeholder ("connection failed" whether the relay refused, timed out or
+  resolved nowhere) in exactly the environment this runs in. And PHP's own
+  warning text embeds the URL verbatim, so surfacing it raw leaked the whole
+  webhook secret back out through the failure path — past the redaction the
+  success path applies. Both were found by running `nightowl:test-alert`
+  against a dead port in a real Laravel app, not by reading the code.
+
 ### Fixed
+
+- **A resolved issue with no resolve-activity row could never reopen, and never
+  alerted again.** The reopen cooldown reads the most recent
+  `status_changed → resolved` row out of `nightowl_issue_activity`; when there
+  was none — a resolve done outside the dashboard, or an issue row predating
+  that table — it fell back to `nightowl_issues.updated_at`. But the drain's
+  issue upsert rewrites `updated_at` on EVERY recurrence
+  (`updated_at = EXCLUDED.updated_at` fires unconditionally, including on the
+  batches where the status CASE leaves the row resolved), so the fallback
+  advanced by exactly the interval it was being compared against: each new
+  occurrence pushed the cooldown window forward past itself. Under any non-zero
+  `NIGHTOWL_REOPEN_COOLDOWN_HOURS` the issue then stayed `resolved` forever and
+  fired no `issue.reopened` alert, silently and permanently — the more often it
+  recurred, the more firmly it was suppressed. There is now no fallback: an
+  absent resolve instant reopens, the same verdict an unreadable one already
+  produced. (Cooldown `0`, the shipped default, was never affected.)
+
+- **Clock skew between the dashboard host and the agent host no longer swallows
+  a reopen.** The resolve instant is stamped by whichever machine ran the
+  dashboard write; `now` is the agent's own clock. A few minutes of NTP drift
+  puts the resolve in the agent's future, and the unclamped negative elapsed
+  failed even `>= 0` — so the documented "0 = always reopen, Sentry-style"
+  went quiet for the length of the skew. Elapsed is clamped at zero: a resolve
+  that has not happened yet by our clock has had zero cooldown time, not
+  negative.
 
 - **An unreachable agent socket can no longer surface inside a host request.**
   Single-agent mode (the default) assigned Nightwatch's `Ingest` straight onto

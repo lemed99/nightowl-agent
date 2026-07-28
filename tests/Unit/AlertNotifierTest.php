@@ -217,23 +217,11 @@ class AlertNotifierTest extends TestCase
         $this->assertSame('Short error', $result);
     }
 
-    // ─── Header Sanitization ─────────────────────────────────────────
-
-    public function testSanitizeHeaderStripsCRLF(): void
-    {
-        $notifier = new AlertNotifier;
-
-        $result = $this->callPrivate($notifier, 'sanitizeHeader', ["Subject\r\nBcc: evil@hacker.com"]);
-        $this->assertSame('SubjectBcc: evil@hacker.com', $result);
-    }
-
-    public function testSanitizeHeaderPreservesNormalText(): void
-    {
-        $notifier = new AlertNotifier;
-
-        $result = $this->callPrivate($notifier, 'sanitizeHeader', ['[App] New Issue: RuntimeException']);
-        $this->assertSame('[App] New Issue: RuntimeException', $result);
-    }
+    // Header sanitization moved to SmtpClient when the two duplicated SMTP
+    // implementations were merged — see SmtpClientTest, plus the end-to-end
+    // injection case in tests/System/SmtpClientConversationTest.php. This
+    // notifier used to sanitize only the subject and from-name while
+    // HealthAlertNotifier also did the addresses; one implementation settles it.
 
     // ─── Notify Event Filtering ──────────────────────────────────────
 
@@ -315,10 +303,18 @@ class AlertNotifierTest extends TestCase
 
     // ─── Notification Time Budget ─────────────────────────────
 
+    /**
+     * 5s was too tight to be a budget: a single TLS handshake plus AUTH plus
+     * DATA against a real relay routinely spends more than that, so the flush
+     * gave up mid-dispatch and the alert was simply never sent. It is a ceiling
+     * on the WHOLE flush, checked between dispatches — SmtpClient clamps each
+     * socket timeout to whatever is left, so raising it cannot let one hung
+     * relay overrun the drain.
+     */
     public function testMaxNotificationSecondsConstantExists(): void
     {
         $ref = new \ReflectionClassConstant(AlertNotifier::class, 'MAX_NOTIFICATION_SECONDS');
-        $this->assertSame(5.0, $ref->getValue());
+        $this->assertSame(30.0, $ref->getValue());
     }
 
     public function testFlushClearsPendingEvenWithNoChannels(): void

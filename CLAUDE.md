@@ -81,6 +81,8 @@ src/Agent/
   PayloadParser.php      — Wire protocol, gzip, token extraction
   AlertNotifier.php      — Issue alerts: rich Slack blocks, Discord embeds, branded HTML email
   HealthAlertNotifier.php — Agent health alerts (DRAIN_STOPPED, PG_LATENCY_CRITICAL, etc.)
+  SmtpClient.php         — The agent's SMTP, shared by both notifiers (they had a private copy each, drifted on three points). RFC-conformant HELO (FQDN or address literal — a bare `nightowl` is refused by Exchange/O365/Postfix), EHLO re-issued after STARTTLS, AUTH chosen from what's advertised, Date + Message-ID + dot-stuffing. Throws on incomplete config instead of returning
+  WebhookClient.php      — The agent's webhook POST, shared by both notifiers. READS the response: non-2xx raises with the status + the receiver's first 200 bytes (it used to `@file_get_contents` and discard, so a revoked webhook looked exactly like a delivered alert). URLs redacted to `host/…` in errors — a Slack/Discord path IS the credential
   EmailTemplate.php      — Branded email rendering (fallback logo if FRONTEND_URL unset)
   Server.php             — Sync fallback (stream_select)
   ConnectionHandler.php  — Sync payload handler
@@ -96,6 +98,7 @@ src/Commands/
   PruneCommand.php        — nightowl:prune (retention cleanup; raw + separate longer rollup retention)
   BackfillRollupsCommand.php — nightowl:backfill-rollups (replace-per-bucket backfill of nightowl_query_rollups)
   ClearCommand.php        — nightowl:clear (truncate all tables)
+  TestAlertCommand.php    — nightowl:test-alert (dispatch a test issue.new through every enabled channel, as the agent)
 ```
 
 ## Artisan Commands
@@ -108,6 +111,7 @@ src/Commands/
 | `nightowl:prune` | Delete telemetry older than retention (14d default); query rollups pruned separately (90d default) |
 | `nightowl:backfill-rollups` | Backfill every `nightowl_*_rollups` table from raw telemetry (chunked, throttled, idempotent; skips the trailing 10min so it never races live drain; `--type=` restricts to one table) |
 | `nightowl:clear` | Truncate all NightOwl tables |
+| `nightowl:test-alert [--channel=]` | Send a test alert through the **agent's own** dispatchers. The dashboard's "Send test" and every triage alert go out from nightowl-api via Symfony Mailer; `issue.new`/`issue.reopened` go out from here via raw SMTP/HTTP. Two transports, one config row — this is the only thing that exercises the second. Reports PASS/FAIL per channel with the reason; ignores `notify_events` (so a transport failure can't hide behind a filter) but warns when a passing channel has `issue.new`/`issue.reopened` muted |
 | `nightowl:gc-dict-traces` | Reclaim orphaned rows from the storage-v2 trace dictionary (unreferenced by `nightowl_exceptions_v2` AND older than quarantine). Rides `nightowl:prune`; `--dry-run`/`--quarantine-days`/`--chunk`. No-op without the v2 twin or the 000068 `created_at` clock |
 
 ## Database
@@ -191,6 +195,12 @@ NIGHTOWL_MAX_BUFFER_MEMORY=268435456     # 256MB RSS limit
 NIGHTOWL_REOPEN_COOLDOWN_HOURS=0         # Hours to wait before flipping resolved → open on recurrence (0 = always reopen, Sentry-style)
 NIGHTOWL_STORAGE_V2=true                 # Storage-format-v2 kill switch: false reverts the drain to the v1 tables without a schema change (dual-read keeps every row visible). Top-level key (shallow-merge rule)
 NIGHTOWL_DICT_TRACE_GC_QUARANTINE_DAYS=7 # nightowl:gc-dict-traces only reclaims traces unreferenced AND older than this. The warm pass touches created_at on every reference, so an active trace never ages in. Top-level key `dict_trace_gc` (shallow-merge rule)
+
+# Agent SMTP (top-level key `smtp` — shallow-merge rule). Credentials are NOT here:
+# they live per-app in nightowl_alert_channels. These are protocol knobs.
+NIGHTOWL_SMTP_HELO=                      # HELO/EHLO name. Null = machine FQDN, else an address literal ("[10.0.1.7]") — containers rarely have a dotted name, and a bare hostname is refused by Exchange/O365/Postfix reject_non_fqdn_helo_hostname
+NIGHTOWL_SMTP_CONNECT_TIMEOUT=10         # Seconds for the TCP connect
+NIGHTOWL_SMTP_TIMEOUT=10                 # Seconds per reply. Both are additionally clamped to the caller's dispatch budget, so a hung relay can't stall the drain
 
 # Boot-migrate + update check (all TOP-LEVEL config keys — shallow-merge rule)
 NIGHTOWL_AUTO_MIGRATE=true               # Run nightowl:migrate at daemon startup when schema is behind (schema pre-listen in a deadline-killed child, backfill detached w/ completion-marker retry; warn-and-continue on failure; ignored under RUN_MIGRATIONS=true)
