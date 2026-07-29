@@ -5,7 +5,7 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
-## [2.0.0] - unreleased
+## [2.0.0] - 2026-07-29
 
 Upgrading from 1.x: see [UPGRADE.md](UPGRADE.md). No action is required for the
 normal case (`composer update` + `nightowl:migrate`, or just a daemon restart);
@@ -181,6 +181,75 @@ by hand, or need to keep a rollback path open.
   cannot hide behind a filter, and warns when a channel that passed has
   `issue.new`/`issue.reopened` switched off — a pass that would still be silent
   in production is a misleading pass.
+
+- **Request concurrency is now a rollup, so the peak-concurrency chart works
+  over any range** (migration 000063, `nightowl_request_concurrency_rollups`).
+  Concurrency used to be derived from raw requests at read time, which is why
+  the dashboard clamped that chart to 6 hours — the scan got too expensive past
+  it. A per-minute `(delta_sum, max_prefix)` fold is now maintained at drain
+  time and the clamp is gone.
+
+  The fold is written **only** by an exact window-function recompute
+  (`ConcurrencyRollup::recompute`), shared verbatim by the drain's 60s
+  maintenance tick (trailing 20 minutes) and by `nightowl:backfill-rollups`, so
+  a live bucket and a backfilled one cannot disagree. An earlier per-batch
+  incremental version was removed after review measured it **~70% low**: drain
+  batches arrive in completion order, and appending deltas is only exact in
+  event-time order. `nightowl:migrate` backfills the table on upgrade.
+
+- **The cache rollup groups by key SHAPE instead of key instance**
+  (migration 000065, `NIGHTOWL_CACHE_KEY_TEMPLATE`, default on). `user:8213:profile`
+  and `user:9147:profile` were two rollup groups, so an app keying cache by id
+  produced a rollup row per user and a cache page that was one long list of
+  near-identical keys. uuid/ulid/hex/int/email/datetime segments now collapse to
+  placeholders (`user:{int}:profile`) — the pattern is computed once in PHP at
+  ingest and stored on the raw row, and the rollup SQL only reads it back, so
+  the two forms are equivalent by construction rather than by two rules kept in
+  sync.
+
+  Raw cache events always keep the literal key, so nothing is lost. Turning the
+  switch off makes NEW keys group literally but never rewrites history: a key's
+  history spans both groupings across the flip until the patterned rows age out
+  of rollup retention.
+
+- **`(group_hash, created_at)` indexes on the mail and notification tables**
+  (migration 000064) — the detail pages for a mail/notification group scanned
+  without them. Built per-partition-child CONCURRENTLY then ATTACHed, with the
+  already-attached check keyed on the CHILD via `pg_inherits ⋈ pg_index`: a
+  name-based check wedges permanently (`55000` on every retry) once the hourly
+  partition sweep creates a child that auto-inherits the parent shell under the
+  default name.
+
+- **Hourly table statistics reported to the platform**
+  (`NIGHTOWL_TABLE_STATS`, default on; `NIGHTOWL_TABLE_STATS_INTERVAL`, 3600s).
+  This exists so an operational problem in your database — a wedged drain, a
+  rollup coverage hole, a disk filling up, a missing index — is diagnosed from
+  our side instead of by asking you to run SQL against your own database.
+
+  What it sends is **catalog and statistics views only**: per-table sizes, tuple
+  counts, scan/write/vacuum/HOT/TOAST and wraparound counters; per-index usage,
+  size and INVALID shells; cluster I/O (cache hits, temp spills, deadlocks,
+  checkpoints, WAL, `pg_stat_io`, archiver, bgwriter); activity (connection
+  states, lock waits, transaction ages, running vacuums); replication slots and
+  retained WAL; ~25 server settings, version and extension inventory; plus
+  agent-side observations SQL cannot make — signed clock skew, best-of-3 ping
+  RTT, connect timing, transaction-pooler detection, standby detection,
+  SSL-in-use. `pg_stat_statements` and query text are excluded **by principle
+  and enforced by test** — a tenant database can be shared with your own
+  application, and those are content, not counts. No query in the collector can
+  read row contents. Row counts are still information (`nightowl_users`' count
+  is your user count), which is why this ships alongside the privacy-policy
+  update disclosing exactly this list; `NIGHTOWL_TABLE_STATS=false` opts out
+  entirely.
+
+  Coverage is catalog-driven (`relname LIKE 'nightowl%'` at runtime, partition
+  children folded into logical parents), so a table added by any future release
+  is covered the moment it exists — this codebase has been bitten by
+  hand-listed table sets repeatedly, and a test creates an unregistered table
+  and asserts it shows up. It runs on its own short-lived connection with its
+  own `statement_timeout`, never the drain's, takes a per-tenant advisory lock
+  so one worker reports per interval, never throws, and posts to its own
+  endpoint so the health channel is never at risk.
 
 ### Changed
 
