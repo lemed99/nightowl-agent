@@ -26,6 +26,25 @@ final class SqliteBuffer
 
         $this->pdo->exec('PRAGMA busy_timeout=5000');
 
+        // Without this the buffer file is high-water-mark sized: drained rows are
+        // DELETEd but their pages stay on the freelist forever, so one traffic
+        // spike leaves a permanently larger file on the customer's disk. (Measured:
+        // 3.8GB of file holding 126k pending rows.) INCREMENTAL lets the drain
+        // worker hand pages back a bounded chunk at a time via reclaim().
+        //
+        // This MUST run before journal_mode=WAL. auto_vacuum lives in the database
+        // header, and it can only be changed while that header does not exist yet
+        // — setting journal_mode writes the file, after which the pragma is
+        // silently a NO-OP (it does not error, and `PRAGMA auto_vacuum` keeps
+        // answering 0). Ordering it after WAL is what made the first version of
+        // this fix do nothing at all. busy_timeout still has to come first; it is
+        // the only one of the three that must precede WAL for locking reasons.
+        //
+        // On a buffer that already has tables the pragma is a no-op by design.
+        // Those are the already-deployed files: needsCompaction() detects them and
+        // compact()'s full VACUUM is what converts them over.
+        $this->pdo->exec('PRAGMA auto_vacuum=INCREMENTAL');
+
         // journal_mode=WAL can fail with "database is locked" when another
         // process (e.g. forked drain worker) is simultaneously opening the same
         // file. Retry with backoff since busy_timeout doesn't cover all PRAGMA
@@ -382,5 +401,76 @@ final class SqliteBuffer
     public function checkpointTruncate(): void
     {
         $this->pdo->exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    }
+
+    /**
+     * Size of the main database file (excludes the -wal, see walSize()).
+     */
+    public function fileSize(): int
+    {
+        clearstatcache(true, $this->path);
+
+        return file_exists($this->path) ? (int) filesize($this->path) : 0;
+    }
+
+    /**
+     * Bytes currently sitting on the freelist — space the file occupies on disk
+     * but no longer uses. This is what reclaim() hands back to the filesystem.
+     */
+    public function freeBytes(): int
+    {
+        $pages = (int) $this->pdo->query('PRAGMA freelist_count')->fetchColumn();
+
+        return $pages * $this->pageSize();
+    }
+
+    public function pageSize(): int
+    {
+        return (int) $this->pdo->query('PRAGMA page_size')->fetchColumn();
+    }
+
+    /**
+     * True when this buffer predates auto_vacuum=INCREMENTAL and therefore can
+     * never shrink on its own — only a full compact() converts it.
+     */
+    public function needsCompaction(): bool
+    {
+        return (int) $this->pdo->query('PRAGMA auto_vacuum')->fetchColumn() === 0;
+    }
+
+    /**
+     * Return up to $maxPages freed pages to the filesystem. Bounded on purpose:
+     * incremental_vacuum holds the write lock while it runs, so the drain worker
+     * trims a slice per cycle rather than stalling ingest with one long pass.
+     *
+     * Returns the number of bytes actually released.
+     */
+    public function reclaim(int $maxPages = 2048): int
+    {
+        if ($maxPages < 1) {
+            return 0;
+        }
+
+        $before = $this->fileSize();
+        $this->pdo->exec('PRAGMA incremental_vacuum('.$maxPages.')');
+        $this->pdo->exec('PRAGMA wal_checkpoint(PASSIVE)');
+
+        return max(0, $before - $this->fileSize());
+    }
+
+    /**
+     * Full VACUUM — rewrites the file, releasing every free page and applying the
+     * auto_vacuum mode set in the constructor. BLOCKS for the duration and needs
+     * scratch space, so the drain worker only calls this on an idle, legacy buffer.
+     *
+     * Returns the number of bytes released.
+     */
+    public function compact(): int
+    {
+        $before = $this->fileSize();
+        $this->pdo->exec('VACUUM');
+        $this->pdo->exec('PRAGMA wal_checkpoint(TRUNCATE)');
+
+        return max(0, $before - $this->fileSize());
     }
 }

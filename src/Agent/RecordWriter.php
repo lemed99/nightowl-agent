@@ -481,9 +481,98 @@ final class RecordWriter
             }
         }
 
+        $this->discardConnection();
+    }
+
+    /**
+     * Drop the handle WITHOUT touching it, so the next pdo() opens a fresh one.
+     *
+     * reconnect() tries to roll back first, which is right when the handle is
+     * merely dirty. It is the wrong move when the handle is already dead:
+     * rollBack() throws, and PDO does not clear its transaction flag on the way
+     * out, so a caller that only guards the rollBack is left holding exactly the
+     * handle it meant to be rid of. This is the half that does the disposal.
+     */
+    private function discardConnection(): void
+    {
         $this->pdo = null;
         $this->rollupSqlCache = [];
         $this->rollupUpsertSqlCache = [];
+    }
+
+    /**
+     * Drop a handle that is stranded inside a transaction, so the next pdo()
+     * opens a fresh one.
+     *
+     * Call this at the top of any entry point that owns no transaction yet — a
+     * drain batch, each cleanup-tick maintenance pass. Never inside a batch: there
+     * an open transaction is ours and this would discard it.
+     *
+     * It is the backstop, not the fix — releaseAbandonedTransaction() at each
+     * swallowing catch is the fix. It exists because the swallowing paths also
+     * fail WITHOUT throwing (the leftover sweep reports per-table failures through
+     * an out-param, so its catch never runs) and because a path that returns early
+     * on a probe the dead handle just failed never reaches its catch either. Every
+     * one of those leaves the handle stranded with no one to clean up after it,
+     * and if the buffer happens to be empty there is no drain batch coming to
+     * notice. Costs one local flag read and no I/O.
+     */
+    private function releaseStrandedConnection(): void
+    {
+        if ($this->pdo === null || ! $this->pdo->inTransaction()) {
+            return;
+        }
+
+        error_log('[NightOwl Drain] stale open transaction on the drain connection — reconnecting');
+        $this->discardConnection();
+    }
+
+    /**
+     * Release a transaction whose owner is about to walk away from the failure,
+     * and make sure the connection is not left unusable when that release fails.
+     *
+     * Every swallow-and-continue maintenance path used a bare guarded rollBack()
+     * here. That is only half the job. When the backend has died under the
+     * statement, rollBack() throws and PDO keeps answering inTransaction() ===
+     * true on a handle that can never work again. Because these callers
+     * deliberately do not rethrow, write()'s reconnect+retry never sees the
+     * failure, so the handle is reused forever after: every beginTransaction()
+     * on it raises "There is already an active transaction", and the next drain
+     * batch trips DictionaryCache::warm's outside-the-batch assertion — a
+     * RuntimeException, which is not a connection error, so still no reconnect.
+     *
+     * Measured on a 90s PostgreSQL outage against a real agent: the drain was
+     * still throwing that assertion ~15 times a second, burning ~30% of a core
+     * and draining nothing, 60s AFTER PostgreSQL came back. Only restarting the
+     * process cleared it. Telemetry loss from a transient outage was permanent.
+     */
+    private function releaseAbandonedTransaction(?PDO $pdo): void
+    {
+        if ($pdo === null) {
+            return;
+        }
+
+        try {
+            if (! $pdo->inTransaction()) {
+                return;
+            }
+
+            $pdo->rollBack();
+
+            // A rollBack that returns without clearing the flag leaves the same
+            // wedge as one that throws, so both land on the discard below.
+            if (! $pdo->inTransaction()) {
+                return;
+            }
+        } catch (\Throwable) {
+            // Dead, not merely dirty. Fall through.
+        }
+
+        // Only ever discard the handle this writer is actually holding — a
+        // caller passing some other connection must not cost us a healthy one.
+        if ($pdo === $this->pdo) {
+            $this->discardConnection();
+        }
     }
 
     private function doWrite(array $records): void
@@ -513,6 +602,16 @@ final class RecordWriter
                 $this->last5xxCount++;
             }
         }
+
+        // doWrite owns the batch transaction end to end, so the handle must not
+        // arrive here already inside one. Letting the dict warm's assertion fire
+        // instead is what made this terminal in the field: a RuntimeException is
+        // not a connection error, so write() never reconnected and every later
+        // batch threw the same assertion until the process restarted. Nothing is
+        // lost by dropping the handle — the batch is still in the SQLite buffer,
+        // and if PostgreSQL is still down the reconnect raises a connection error,
+        // which is the classification the retry/backoff path wants anyway.
+        $this->releaseStrandedConnection();
 
         $pdo = $this->pdo();
 
@@ -1981,6 +2080,8 @@ final class RecordWriter
      */
     public function maintainRawPartitions(): bool
     {
+        $this->releaseStrandedConnection();
+
         $pdo = null;
 
         try {
@@ -2014,14 +2115,10 @@ final class RecordWriter
 
             return $got;
         } catch (\Throwable $e) {
-            try {
-                if ($pdo?->inTransaction()) {
-                    $pdo->rollBack();
-                }
-            } catch (\Throwable) {
-                // Handle already dead — never let this mask the real error.
-                // Mirrors doWrite()'s guarded rollback.
-            }
+            // Not a bare guarded rollBack: this catch does not rethrow, so if the
+            // release fails the handle has to be discarded here or nothing else
+            // will ever discard it. See releaseAbandonedTransaction.
+            $this->releaseAbandonedTransaction($pdo);
 
             error_log('[NightOwl Drain] partition maintenance failed (will retry next tick): '.$e->getMessage());
 
@@ -2103,9 +2200,13 @@ final class RecordWriter
      */
     public function maintainConcurrencyRollup(int $nowTs): void
     {
+        $this->releaseStrandedConnection();
+
         if (! $this->rollupEnabled(ConcurrencyRollup::TABLE)) {
             return;
         }
+
+        $pdo = null;
 
         try {
             $pdo = $this->pdo();
@@ -2138,11 +2239,14 @@ final class RecordWriter
 
             $pdo->commit();
         } catch (\Throwable $e) {
-            try {
-                $this->pdo()->rollBack();
-            } catch (\Throwable) {
-                // connection died mid-rollback — reconnect happens lazily
-            }
+            // Was `$this->pdo()->rollBack()`: unconditional, so on the common
+            // no-transaction failure it threw "There is no active transaction"
+            // (swallowed, and masking nothing useful), and worse, calling pdo()
+            // in the catch re-CONNECTS when the failure was the connect itself.
+            // The local handle plus the shared release fixes both, and discards
+            // the connection when the rollback can't land — this catch does not
+            // rethrow, so no one downstream would.
+            $this->releaseAbandonedTransaction($pdo);
             error_log('[NightOwl Drain] concurrency rollup maintenance failed (retried next tick): '.$e->getMessage());
         }
     }
@@ -2152,6 +2256,8 @@ final class RecordWriter
 
     public function healRawPartitionLeftovers(): void
     {
+        $this->releaseStrandedConnection();
+
         try {
             $failures = [];
             $healed = RawPartitions::healConversionLeftovers(
@@ -2164,6 +2270,12 @@ final class RecordWriter
             // table only once its OWN transaction has committed the DROP.
             $this->logHealedPartitionChecks($healed);
         } catch (\Throwable $e) {
+            // The sweep opens its own per-table transactions and guards their
+            // rollbacks, but a guard is not a release: a rollback that died with
+            // the backend leaves the flag set, and this catch is the end of the
+            // line for the failure. Hand the handle back clean or not at all.
+            $this->releaseAbandonedTransaction($this->pdo);
+
             error_log('[NightOwl Drain] partition leftover sweep failed (will retry next tick): '.$e->getMessage());
         }
     }
@@ -2195,21 +2307,31 @@ final class RecordWriter
      */
     private function rollupEnabled(string $table): bool
     {
-        if (! array_key_exists($table, $this->rollupTableChecked)) {
-            try {
-                $this->rollupTableChecked[$table] = (bool) $this->pdo()->query(
-                    "SELECT to_regclass('public.".$table."') IS NOT NULL"
-                )->fetchColumn();
-            } catch (\Throwable) {
-                $this->rollupTableChecked[$table] = false;
-            }
-
-            if ($this->rollupTableChecked[$table] === false) {
-                error_log('[NightOwl Agent] '.$table.' missing — rollups for it disabled until nightowl:migrate runs (restart the agent afterward)');
-            }
+        if (array_key_exists($table, $this->rollupTableChecked)) {
+            return $this->rollupTableChecked[$table];
         }
 
-        return $this->rollupTableChecked[$table];
+        try {
+            $answer = (bool) $this->pdo()->query(
+                "SELECT to_regclass('public.".$table."') IS NOT NULL"
+            )->fetchColumn();
+        } catch (\Throwable) {
+            // The probe did not ANSWER — it could not run. The table's existence
+            // is fixed for the agent's lifetime; the outcome of a probe against a
+            // dead connection is not, so caching it would turn one blip into a
+            // permanently disabled rollup, under a log line telling the operator
+            // to run a migration that was never the problem. Skip the rollup for
+            // this batch (the raw write still lands) and re-probe next time.
+            return false;
+        }
+
+        $this->rollupTableChecked[$table] = $answer;
+
+        if (! $answer) {
+            error_log('[NightOwl Agent] '.$table.' missing — rollups for it disabled until nightowl:migrate runs (restart the agent afterward)');
+        }
+
+        return $answer;
     }
 
     /**
@@ -2254,8 +2376,12 @@ final class RecordWriter
             $present = $stmt->fetchAll(\PDO::FETCH_COLUMN);
         } catch (\Throwable) {
             // Probe itself failed — the table-existence gate already passed, so
-            // stay permissive rather than silently dropping every rollup.
-            return $this->rollupColumnsChecked[$table] = true;
+            // stay permissive rather than silently dropping every rollup. NOT
+            // cached: a probe that couldn't run answered nothing, and caching the
+            // permissive guess is how a genuinely missing column would go on
+            // raising 42703 inside the drain transaction for the process's whole
+            // life — the exact head-of-line block this method exists to prevent.
+            return true;
         }
 
         $missing = array_diff($expected, $present);
@@ -3918,6 +4044,8 @@ final class RecordWriter
      */
     public function checkWorkerSaturation(): void
     {
+        $this->releaseStrandedConnection();
+
         $config = $this->getWorkerSaturationConfig();
         if (! $config['enabled']) {
             return;
@@ -4010,8 +4138,15 @@ final class RecordWriter
             $pdo->commit();
             $this->notifier->flushNotifications($this->pdo());
         } catch (\Throwable $e) {
-            if ($startedTransaction && $pdo->inTransaction()) {
-                $pdo->rollBack();
+            // The rollBack here used to be UNGUARDED, so on a handle killed
+            // mid-check it threw straight out of a catch that exists precisely so
+            // this never disturbs the cleanup tick — taking the real error's
+            // message with it and skipping clearPending() below. Releasing
+            // through the shared helper both guards it and discards a handle the
+            // rollback couldn't clean, which nothing downstream would do: this
+            // catch is the end of the line.
+            if ($startedTransaction) {
+                $this->releaseAbandonedTransaction($pdo);
             }
             $this->notifier->clearPending();
             error_log('[NightOwl Drain] Worker saturation check failed (will retry next tick): '.$e->getMessage());

@@ -4,30 +4,53 @@ namespace NightOwl\Tests\System;
 
 use NightOwl\Simulator\NightwatchSimulator;
 use NightOwl\Tests\System\Concerns\ReadsRawFamily;
+use NightOwl\Tests\System\Concerns\SystemEnvironment;
 use PDO;
+use PHPUnit\Framework\AssertionFailedError;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Chaos test: agent under a real PostgreSQL outage and recovery.
+ * Chaos tests: agent under real PostgreSQL failure and recovery.
  *
- * Drives the failure modes flagged on r/laravel:
- *   - back-pressure activates and WAL plateaus when pg is gone
- *   - drain catches up cleanly on recovery
- *   - TRUNCATE checkpoint actually fires (instead of getting starved
- *     by drain-worker contention) and reclaims WAL disk space
- *   - SQLite integrity_check passes through the whole sequence
+ * Two failure shapes, deliberately kept in one class so they share one booted
+ * agent — and deliberately gated differently, because they need different things
+ * and only one of them is disruptive.
+ *
+ * 1. OUTAGE (`test_agent_survives_pg_outage_and_drains_on_recovery`) — stops and
+ *    starts the container. Needs Docker, so it stays opt-in behind
+ *    NIGHTOWL_RUN_CHAOS=1. Covers:
+ *      - back-pressure activates and WAL plateaus when pg is gone
+ *      - drain catches up cleanly on recovery
+ *      - TRUNCATE checkpoint actually fires (instead of getting starved
+ *        by drain-worker contention) and reclaims WAL disk space
+ *      - SQLite integrity_check passes through the whole sequence
+ *
+ * 2. BACKEND KILL (`test_drain_recovers_when_its_backend_dies_mid_transaction`) —
+ *    terminates the drain's own backends WHILE THEY HOLD AN OPEN TRANSACTION.
+ *    Pure SQL, no Docker, so it runs wherever PostgreSQL is available, including
+ *    CI. Ungated on purpose: this is the case that shipped a permanent wedge.
+ *
+ * Why the outage test was NOT enough. It was written for exactly the failure the
+ * wedge caused, and it passed against the wedged build — verified by reverting
+ * RecordWriter and re-running. `docker stop` shuts Postgres down cleanly, so the
+ * drain mostly sees connection-refused on its NEXT connect, which the ordinary
+ * reconnect path has always handled. The wedge needs the backend to die while a
+ * transaction is open on it (disk-full, OOM kill, pg_terminate_backend): PDO then
+ * leaves inTransaction() answering true forever, and the resulting failure is a
+ * RuntimeException from DictionaryCache::warm — not a connection error — so the
+ * drain never reconnects. Test 2 reproduces that directly, and asserts it caught
+ * a live transaction rather than trusting timing.
  *
  * Requirements:
- *   - Docker, with a running container named `nightowl-test-pg`
- *     (the test stops/starts it to simulate the outage)
- *   - NIGHTOWL_RUN_CHAOS=1 (the test is slow and intentionally
- *     disruptive to local pg state — opt-in only)
+ *   - PostgreSQL (NIGHTOWL_TEST_DB_*); both tests skip without it
  *   - pcntl + posix extensions
  *   - Ports 2413 / 2414 available
+ *   - Test 1 additionally: Docker, a running `nightowl-test-pg`, NIGHTOWL_RUN_CHAOS=1
  *
  * Run:
+ *   NIGHTOWL_TEST_DB_PORT=5433 vendor/bin/phpunit --filter=AgentPgOutageSystemTest
  *   NIGHTOWL_RUN_CHAOS=1 NIGHTOWL_TEST_DB_PORT=5433 \
- *     vendor/bin/phpunit --filter=AgentPgOutageSystemTest
+ *     vendor/bin/phpunit --filter=AgentPgOutageSystemTest   # adds the outage leg
  */
 class AgentPgOutageSystemTest extends TestCase
 {
@@ -58,6 +81,10 @@ class AgentPgOutageSystemTest extends TestCase
 
     private const CHECKPOINT_TRUNCATE_BYTES = 256 * 1024;
 
+    // Long enough to land kills across several drain batches; the loop asserts it
+    // actually caught transactions rather than trusting this number.
+    private const KILL_WINDOW_SECONDS = 8;
+
     private static string $containerName;
 
     private static string $dbHost;
@@ -78,29 +105,20 @@ class AgentPgOutageSystemTest extends TestCase
     /** @var resource[] */
     private static array $agentPipes = [];
 
+    /** Everything the agent has written to stdout, accumulated by pumpAgentOutput(). */
+    private static string $agentOutput = '';
+
     private static string $sqlitePath = '';
 
     private NightwatchSimulator $sim;
 
     public static function setUpBeforeClass(): void
     {
-        if (getenv('NIGHTOWL_RUN_CHAOS') !== '1') {
-            static::markTestSkipped('NIGHTOWL_RUN_CHAOS=1 to enable.');
-        }
-
         if (! function_exists('pcntl_fork') || ! function_exists('posix_kill')) {
             static::markTestSkipped('pcntl + posix required.');
         }
 
         self::$containerName = getenv('NIGHTOWL_CHAOS_DOCKER_CONTAINER') ?: 'nightowl-test-pg';
-
-        if (! self::dockerAvailable()) {
-            static::markTestSkipped('docker CLI not available.');
-        }
-
-        if (! self::containerRunning(self::$containerName)) {
-            static::markTestSkipped(sprintf('container "%s" not running.', self::$containerName));
-        }
 
         self::$dbHost = getenv('NIGHTOWL_TEST_DB_HOST') ?: '127.0.0.1';
         self::$dbPort = (int) (getenv('NIGHTOWL_TEST_DB_PORT') ?: 5432);
@@ -108,7 +126,13 @@ class AgentPgOutageSystemTest extends TestCase
         self::$dbUsername = getenv('NIGHTOWL_TEST_DB_USERNAME') ?: 'nightowl_test';
         self::$dbPassword = getenv('NIGHTOWL_TEST_DB_PASSWORD') ?: 'test123';
 
-        self::$pdo = self::connectPg();
+        // PostgreSQL is the floor for BOTH tests now that the backend-kill leg no
+        // longer needs Docker, so an absent database skips rather than fataling.
+        try {
+            self::$pdo = self::connectPg();
+        } catch (\Throwable $e) {
+            SystemEnvironment::postgresUnavailable($e);
+        }
 
         // Leftover tables from a prior run break MigrationRunner — it uses
         // Schema::create not createIfNotExists. Drop the agent's tables so
@@ -118,10 +142,30 @@ class AgentPgOutageSystemTest extends TestCase
         self::startAgent();
     }
 
+    /**
+     * Gate for the container stop/start leg only. It is slow, needs Docker, and
+     * leaves local pg state disrupted if it dies midway — so it stays opt-in even
+     * though the rest of the class no longer is.
+     */
+    private function requireDockerOutageSupport(): void
+    {
+        if (getenv('NIGHTOWL_RUN_CHAOS') !== '1') {
+            $this->markTestSkipped('NIGHTOWL_RUN_CHAOS=1 to enable the container outage leg.');
+        }
+
+        if (! self::dockerAvailable()) {
+            $this->markTestSkipped('docker CLI not available.');
+        }
+
+        if (! self::containerRunning(self::$containerName)) {
+            $this->markTestSkipped(sprintf('container "%s" not running.', self::$containerName));
+        }
+    }
+
     protected function setUp(): void
     {
         if (self::$pdo === null || self::$agentProcess === null) {
-            $this->markTestSkipped('agent or pg unavailable.');
+            SystemEnvironment::agentUnavailable('agent or pg unavailable.');
         }
         $this->sim = new NightwatchSimulator(self::TOKEN, self::AGENT_HOST, self::AGENT_PORT, timeout: 3.0);
         self::truncateAllTables();
@@ -129,8 +173,12 @@ class AgentPgOutageSystemTest extends TestCase
 
     public static function tearDownAfterClass(): void
     {
-        // Make sure pg is back up no matter what the test left behind.
-        if (isset(self::$containerName) && self::containerRunning(self::$containerName) === false) {
+        // Make sure pg is back up no matter what the test left behind. Only the
+        // outage leg ever stops it, and that leg only runs when Docker is present —
+        // so probe Docker first rather than shelling out on a box without it.
+        if (isset(self::$containerName)
+            && self::dockerAvailable()
+            && self::containerRunning(self::$containerName) === false) {
             self::dockerExec('start', self::$containerName);
             self::waitForPg(self::PG_RECOVERY_TIMEOUT);
         }
@@ -143,6 +191,8 @@ class AgentPgOutageSystemTest extends TestCase
 
     public function test_agent_survives_pg_outage_and_drains_on_recovery(): void
     {
+        $this->requireDockerOutageSupport();
+
         // 1. Baseline: pg up, a few rows make it through normally.
         $traceA = self::uuid();
         $response = $this->sim->send([
@@ -284,7 +334,156 @@ class AgentPgOutageSystemTest extends TestCase
         $this->assertSame('ok', $integrity, "PRAGMA integrity_check returned: {$integrity}");
     }
 
+    /**
+     * The wedge. Kill the drain's backends WHILE they hold an open transaction and
+     * the drain must still recover by itself.
+     *
+     * PDO's behaviour here is the whole problem, and it was measured rather than
+     * assumed: once the backend is gone, rollBack() throws AND inTransaction()
+     * keeps answering true, so every later beginTransaction() on that handle raises
+     * "There is already an active transaction". That surfaced as a RuntimeException
+     * out of DictionaryCache::warm — not a connection error — so the drain's
+     * reconnect-on-connection-error path never fired and the wedge was permanent:
+     * measured 30 CPU-seconds and 1369 log lines over 90s, with rows still stuck in
+     * the buffer long after Postgres was healthy.
+     *
+     * Unlike the outage leg this needs no Docker — pg_terminate_backend is plain
+     * SQL — which is exactly why it can be the one that runs in CI.
+     */
+    public function test_drain_recovers_when_its_backend_dies_mid_transaction(): void
+    {
+        // 1. Warm the drain first. This is load-bearing, not tidiness: RecordWriter
+        // probes for the v2 tables once and caches only a SUCCESSFUL probe, so a
+        // writer whose very first connection is already dead fails open to v1 and
+        // never reaches the dictionary warm where the wedge assertion lives. Kill a
+        // cold drain and the test passes against the broken build.
+        $warm = self::uuid();
+        $this->assertSame('2:OK', $this->sim->send([
+            $this->sim->makeRequest(['trace_id' => $warm, 'method' => 'GET', 'status_code' => 200]),
+        ]));
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $warm), 1);
+
+        // 2. Sustained load while repeatedly terminating any backend that is inside
+        // a transaction. Timing-dependent by nature, so the kill count is asserted
+        // below — a run that never caught one proves nothing and must not pass.
+        $accepted = 0;
+        $kills = 0;
+        $deadline = microtime(true) + self::KILL_WINDOW_SECONDS;
+
+        while (microtime(true) < $deadline) {
+            for ($i = 0; $i < 25; $i++) {
+                $resp = $this->sim->send([
+                    $this->sim->makeRequest([
+                        'trace_id' => self::uuid(),
+                        'method' => 'POST',
+                        'status_code' => 200,
+                    ]),
+                ]);
+                if ($resp === '2:OK') {
+                    $accepted++;
+                }
+            }
+
+            $kills += $this->terminateBackendsInTransaction();
+            $this->pumpAgentOutput();
+            usleep(50_000);
+        }
+
+        $this->assertGreaterThan(
+            0,
+            $kills,
+            'INCONCLUSIVE: never caught a drain backend inside a transaction, so the wedge was never provoked'
+        );
+        $this->assertGreaterThan(0, $accepted, 'expected the agent to keep accepting ingest through the kills');
+
+        // 3. Stop killing. Postgres has been healthy the whole time — nothing but
+        // the agent's own recovery can move these rows now.
+        //
+        // A wedged drain fails here first, as a bare "did not catch up", which reads
+        // like a slow machine. Translate it: the buffer standing still while Postgres
+        // is healthy IS the wedge, and the log says so.
+        try {
+            $this->waitForDrainCatchup(self::DRAIN_CATCHUP_TIMEOUT);
+        } catch (AssertionFailedError $e) {
+            if (str_contains($this->pumpAgentOutput(), 'must run outside the batch transaction')) {
+                $this->fail(
+                    "drain wedged on a stranded transaction after {$kills} mid-transaction kills "
+                    ."and never recovered, with Postgres healthy throughout — {$e->getMessage()}"
+                );
+            }
+
+            throw $e;
+        }
+
+        // 4. The wedge's signature must be absent. Checked after catch-up so a
+        // recovery that only LOOKED clean (e.g. one worker wedged while another
+        // carried the backlog) still fails here.
+        $output = $this->pumpAgentOutput();
+        $this->assertStringNotContainsString(
+            'must run outside the batch transaction',
+            $output,
+            "drain hit the stranded-transaction wedge after {$kills} mid-transaction kills"
+        );
+
+        // 5. And the pipeline is genuinely alive again, not merely idle.
+        $after = self::uuid();
+        $this->assertSame('2:OK', $this->sim->send([
+            $this->sim->makeRequest(['trace_id' => $after, 'method' => 'GET', 'status_code' => 200]),
+        ]));
+        $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $after), 1);
+
+        // Rows accepted before the kills started are already in; the assertion that
+        // matters is that the backlog moved rather than sitting in SQLite forever.
+        $this->assertGreaterThan(
+            1,
+            self::rowCount(self::rawTable('nightowl_requests')),
+            'the buffered backlog never reached Postgres'
+        );
+    }
+
     // ─── Helpers ───────────────────────────────────────────────
+
+    /**
+     * Terminate every backend on this database that currently holds an open
+     * transaction, and report how many were actually hit.
+     *
+     * `xact_start IS NOT NULL` is the whole point: a backend killed between
+     * transactions just yields a clean reconnect, which was never broken. Our own
+     * connection is excluded, and the filter is scoped to this database, so the
+     * only backends left to match are the agent's drain workers.
+     */
+    private function terminateBackendsInTransaction(): int
+    {
+        $stmt = self::$pdo->prepare(
+            'SELECT pg_terminate_backend(pid) AS killed
+               FROM pg_stat_activity
+              WHERE datname = :db
+                AND pid <> pg_backend_pid()
+                AND xact_start IS NOT NULL'
+        );
+        $stmt->execute(['db' => self::$dbDatabase]);
+
+        return count(array_filter($stmt->fetchAll(PDO::FETCH_COLUMN)));
+    }
+
+    /**
+     * Read whatever the agent has written to stdout so far, accumulating it.
+     *
+     * Must be called periodically during a noisy phase, not just at the end: the
+     * pipe holds ~64KB and the agent BLOCKS once it fills, which would look like a
+     * drain stall caused by the test harness itself.
+     */
+    private function pumpAgentOutput(): string
+    {
+        if (isset(self::$agentPipes[1]) && is_resource(self::$agentPipes[1])) {
+            $chunk = stream_get_contents(self::$agentPipes[1]);
+            if (is_string($chunk) && $chunk !== '') {
+                self::$agentOutput .= $chunk;
+            }
+        }
+
+        return self::$agentOutput;
+    }
 
     private static function dockerAvailable(): bool
     {
@@ -339,6 +538,7 @@ class AgentPgOutageSystemTest extends TestCase
 
     private static function startAgent(): void
     {
+        self::$agentOutput = '';
         self::$sqlitePath = sys_get_temp_dir().'/nightowl-chaos-'.getmypid().'.sqlite';
 
         // Wipe any leftover from a prior failed run before launching.
@@ -350,7 +550,7 @@ class AgentPgOutageSystemTest extends TestCase
 
         $harness = realpath(__DIR__.'/../Simulator/agent-harness-async.php');
         if (! $harness) {
-            static::markTestSkipped('agent-harness-async.php not found.');
+            SystemEnvironment::agentUnavailable('agent-harness-async.php not found.');
         }
 
         $cmd = sprintf(
@@ -374,7 +574,7 @@ class AgentPgOutageSystemTest extends TestCase
         self::$agentProcess = proc_open($cmd, $descriptors, self::$agentPipes);
 
         if (! is_resource(self::$agentProcess)) {
-            static::markTestSkipped('failed to start agent.');
+            SystemEnvironment::agentUnavailable('failed to start agent.');
         }
 
         stream_set_blocking(self::$agentPipes[1], false);
@@ -393,7 +593,7 @@ class AgentPgOutageSystemTest extends TestCase
         if (! $ready) {
             $output = stream_get_contents(self::$agentPipes[1]);
             self::stopAgent();
-            static::markTestSkipped('agent did not start: '.$output);
+            SystemEnvironment::agentUnavailable('agent did not start: '.$output);
         }
     }
 

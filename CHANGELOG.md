@@ -7,6 +7,51 @@ in the git tags.
 
 ## [2.0.0] - unreleased
 
+Upgrading from 1.x: see [UPGRADE.md](UPGRADE.md). No action is required for the
+normal case (`composer update` + `nightowl:migrate`, or just a daemon restart);
+the notes below matter if you query the telemetry tables yourself, manage schema
+by hand, or need to keep a rollback path open.
+
+### Breaking
+
+- **The drain writes the `_v2` raw tables. Anything reading the v1 tables
+  directly stops seeing new rows.** This is the whole point of the release and
+  it is invisible from the dashboard, which reads both families — but the
+  database is yours, and a report, BI extract or `psql` query pointed at
+  `nightowl_requests` returns only rows written before the upgrade, with no
+  error and no empty-result signal. Every v1 value is byte-recoverable from a v2
+  row plus the dictionaries; UPGRADE.md carries the join for each renamed or
+  dictionary-encoded column. `NIGHTOWL_STORAGE_V2=false` reverts the drain to v1
+  with no schema change, which is the escape hatch if you need reading time.
+
+- **`nightowl:prune` retires empty v1 tables.** Once the storage-v2 fence is
+  older than your raw retention window (`NIGHTOWL_RETENTION_DAYS`, 14 days by
+  default), the v2 twin exists, and the v1 parent is EMPTY, prune issues
+  `DROP TABLE` on the v1 parent. No rows are destroyed — emptiness is a
+  precondition, not a consequence, and it doubles as the mixed-fleet guard: an
+  older agent still draining into v1 keeps rows younger than retention, so the
+  drop cannot fire underneath it. What breaks is anything holding a hard
+  reference to the table NAME — a view, a foreign key, a materialised report, a
+  monitoring query. `--keep-v1` disables the retirement permanently.
+
+- **Downgrading to 1.x is only safe until the v1 tables are dropped.** A 1.x
+  agent writes v1 exclusively and knows nothing about the v2 twins, so a
+  rollback before EOL works — it resumes writing v1, and the dashboard keeps
+  reading both. After a prune has retired the v1 parents, a 1.x agent's drain
+  fails with `42P01` on every batch (rows stay buffered in SQLite; nothing is
+  lost, but nothing lands until you roll forward again). If you want the
+  rollback path held open past retention, pass `--keep-v1`.
+
+- **The daemon applies pending migrations at startup by default.**
+  `nightowl:agent` now runs the schema sync before it binds the ingest port when
+  the nightowl migration history is behind (`NIGHTOWL_AUTO_MIGRATE`, default
+  `true`). This is DDL executed by a long-running process rather than by your
+  deploy step, which some environments deliberately do not permit — the
+  database role you give the agent is the boundary. Set
+  `NIGHTOWL_AUTO_MIGRATE=false` to keep schema changes in the deploy step; the
+  daemon then warns instead of acting. Ignored entirely under the legacy
+  `NIGHTOWL_RUN_MIGRATIONS=true` ride-along.
+
 ### Added
 
 - **Storage format v2 — the definitive raw-telemetry format** (migrations
@@ -195,6 +240,79 @@ in the git tags.
   against a dead port in a real Laravel app, not by reading the code.
 
 ### Fixed
+
+- **A PostgreSQL outage could wedge the drain permanently — it did not recover
+  when PostgreSQL came back.** When a backend dies underneath an open
+  transaction, `PDO::rollBack()` throws AND leaves `inTransaction()` answering
+  true; a guarded rollback stops the throw but does not release the flag. Four
+  cleanup-tick maintenance paths caught, logged and returned at exactly that
+  point, so the stranded handle was kept and reused. Every later
+  `beginTransaction()` on it raised "There is already an active transaction",
+  and the next batch tripped `DictionaryCache::warm`'s outside-the-batch
+  assertion — a `RuntimeException`, not a connection error, so `write()`'s
+  reconnect-and-retry path never fired and nothing ever replaced the handle.
+  Measured against a real agent and a 90s outage: 60 seconds after PostgreSQL
+  was healthy again the drain was still throwing that assertion ~15 times a
+  second, burning ~30% of a core and draining nothing. Rows stayed safe in the
+  SQLite buffer, so nothing was lost — but nothing arrived either, and the only
+  cure was restarting the process. What a customer saw was a dashboard frozen at
+  the moment of a blip they had already fixed. Each swallowing catch now
+  disposes of the handle it is walking away from, and every entry point that
+  owns no transaction yet drops a stranded one first as a backstop — needed
+  because two of those paths fail WITHOUT throwing (the leftover sweep reports
+  per-table failures through an out-param, so its catch never runs; a probe-based
+  early return bypasses its catch), and because an empty buffer means no drain
+  batch is coming to notice. Covered by a System test that kills backends
+  *inside a transaction* while PostgreSQL stays up: the pre-existing chaos test
+  stopped the whole container, which cannot strand a transaction because every
+  handle dies before one is open, and it passed against the wedged build.
+
+- **One failed probe could disable a tenant's rollups for the life of the
+  process.** `rollupEnabled()` and `rollupColumnsPresent()` cached their answer
+  permanently, which is right — a table's existence does not change under a
+  running agent — but they cached it even when the probe had not ANSWERED. A
+  probe that could not run because the connection was dead returned "missing",
+  and that verdict stuck: rollups for the table were skipped for every later
+  batch, under a log line telling the operator to run `nightowl:migrate` and
+  restart, when the migration had never been the problem. Wide-range dashboard
+  views read the rollup tier when the table exists, so the damage outlived the
+  blip as a growing hole in exactly the views that cannot fall back to raw. Only
+  a probe that returned an answer is cached now; one that threw skips the rollup
+  for that batch (the raw write still lands) and is re-probed on the next.
+
+- **The drain retried an unreachable PostgreSQL at full idle cadence,
+  indefinitely.** With the buffer holding rows and the database unreachable, the
+  loop reconnected every `NIGHTOWL_DRAIN_INTERVAL_MS` (100ms default) and logged
+  the failure each time. Measured over one 90s outage: 1,369 near-identical
+  `SQLSTATE[08006]` lines and ~27 CPU-seconds spent achieving nothing, since the
+  rows were already durable in SQLite. On a small host the retry storm competed
+  with the application it was meant to be observing, and the log noise buried
+  the one line that explained it. Consecutive connection failures now back off
+  exponentially from one idle interval to a 10s ceiling — capped so recovery
+  stays prompt, since an uncapped ladder would be hours deep by the time the
+  database returned — and the log collapses to roughly one line per doubling.
+  The first batch to complete a round trip clears the backoff immediately.
+  A reachable-but-refusing PostgreSQL (a missing table, a permission error) is
+  deliberately excluded: that is not a reachability problem, and an operator
+  fixing a migration should not also be waiting out a 10s sleep.
+
+- **The SQLite buffer never returned disk space after draining.** SQLite reuses
+  the pages a deleted row occupied but does not hand them back, so the buffer
+  file was high-water-mark sized: a load test measured it at 3.8 GB holding
+  126,728 pending rows, and it stayed 3.8 GB after those rows drained.
+  Checkpointing does not help — it only resets the `-wal`. On a host where the
+  buffer shares a volume with the database, one traffic spike is enough to fill
+  the disk permanently, which is how that test ended: Postgres out of space, and
+  a drain that could not recover. New buffers are created with
+  `auto_vacuum=INCREMENTAL` and the drain trims the freelist on its cleanup tick
+  in bounded slices, so the write lock is never held long enough to stall
+  ingest, and only above a threshold — below it the freelist is cheap reuse for
+  the next spike. Already-deployed buffers cannot be converted incrementally, so
+  they get one full `VACUUM`, taken only when the buffer is idle. The pragma
+  ordering is load-bearing and pinned by a test: `auto_vacuum` lives in the
+  database header and can only be set before that header exists, so running it
+  after `journal_mode=WAL` is silently a no-op — no error, and `PRAGMA
+  auto_vacuum` keeps answering 0.
 
 - **Wide list views could skip or repeat a row while a tenant held both storage
   families.** The API pages raw lists on `(created_at, id)`, and a COPY batch

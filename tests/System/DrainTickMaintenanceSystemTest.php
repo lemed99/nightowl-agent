@@ -4,6 +4,7 @@ namespace NightOwl\Tests\System;
 
 use NightOwl\Support\RawPartitions;
 use NightOwl\Tests\Integration\MigrationRunner;
+use NightOwl\Tests\System\Concerns\SystemEnvironment;
 use PDO;
 use PHPUnit\Framework\TestCase;
 
@@ -32,6 +33,8 @@ class DrainTickMaintenanceSystemTest extends TestCase
     private const TICK_TIMEOUT = 20.0;
 
     private static ?PDO $pdo = null;
+
+    private static ?\Throwable $pdoError = null;
 
     private static string $host;
 
@@ -63,8 +66,9 @@ class DrainTickMaintenanceSystemTest extends TestCase
             $dsn = sprintf('pgsql:host=%s;port=%d;dbname=%s', self::$host, self::$port, self::$database);
             self::$pdo = new PDO($dsn, self::$username, self::$password);
             self::$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        } catch (\Exception) {
+        } catch (\Exception $e) {
             self::$pdo = null;
+            self::$pdoError = $e;
         }
 
         if (self::$pdo) {
@@ -75,7 +79,7 @@ class DrainTickMaintenanceSystemTest extends TestCase
     protected function setUp(): void
     {
         if (self::$pdo === null) {
-            $this->markTestSkipped('PostgreSQL not available. Set NIGHTOWL_TEST_DB_* env vars.');
+            SystemEnvironment::postgresUnavailable(self::$pdoError ?? new \RuntimeException('no connection attempt recorded'));
         }
 
         if (! function_exists('proc_open') || ! function_exists('posix_kill')) {

@@ -4,6 +4,7 @@ namespace NightOwl\Tests\System;
 
 use NightOwl\Tests\Integration\MigrationRunner;
 use NightOwl\Tests\System\Concerns\ReadsRawFamily;
+use NightOwl\Tests\System\Concerns\SystemEnvironment;
 use NightOwl\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
@@ -92,7 +93,7 @@ class AgentSystemTest extends TestCase
             self::$pdo = new PDO($dsn, self::$dbUsername, self::$dbPassword);
             self::$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         } catch (\Exception $e) {
-            static::markTestSkipped('PostgreSQL not available: '.$e->getMessage());
+            SystemEnvironment::postgresUnavailable($e);
         }
 
         // Apply the agent's migrations — single source of truth.
@@ -111,7 +112,7 @@ class AgentSystemTest extends TestCase
     protected function setUp(): void
     {
         if (self::$pdo === null || self::$agentProcess === null) {
-            $this->markTestSkipped('Agent or PostgreSQL not available.');
+            SystemEnvironment::agentUnavailable('Agent or PostgreSQL not available.');
         }
 
         $this->sim = new NightwatchSimulator(
@@ -138,7 +139,7 @@ class AgentSystemTest extends TestCase
 
         $harness = realpath(__DIR__.'/../Simulator/agent-harness-async.php');
         if (! $harness) {
-            static::markTestSkipped('agent-harness-async.php not found.');
+            SystemEnvironment::agentUnavailable('agent-harness-async.php not found.');
         }
 
         $cmd = sprintf(
@@ -163,7 +164,7 @@ class AgentSystemTest extends TestCase
         self::$agentProcess = proc_open($cmd, $descriptors, self::$agentPipes);
 
         if (! is_resource(self::$agentProcess)) {
-            static::markTestSkipped('Failed to start agent process.');
+            SystemEnvironment::agentUnavailable('Failed to start agent process.');
         }
 
         // Non-blocking reads on stdout
@@ -190,7 +191,7 @@ class AgentSystemTest extends TestCase
             // Read any output for diagnostics
             $output = stream_get_contents(self::$agentPipes[1]);
             self::stopAgent();
-            static::markTestSkipped('Agent did not start within '.self::STARTUP_TIMEOUT."s. Output: {$output}");
+            SystemEnvironment::agentUnavailable('Agent did not start within '.self::STARTUP_TIMEOUT."s. Output: {$output}");
         }
     }
 

@@ -74,6 +74,13 @@ final class DrainWorker
     // DRAIN_UNREACHABLE diagnosis and clears the write-rejection latch when newer.
     private float $lastConnFailAt = 0.0;
 
+    // Consecutive PG connection failures, driving the reconnect backoff. Each retry
+    // costs a full connect attempt, so hammering an unreachable Postgres at the idle
+    // interval burns CPU and floods the log to no purpose (measured: 856 identical
+    // SQLSTATE[08006] lines and ~60% of a core over 3.5 minutes of downtime).
+    // Reset the moment PG answers again — whether it accepts the write or rejects it.
+    private int $connFailStreak = 0;
+
     // Poison-payload quarantine (Phase 2). Cumulative since worker start — a
     // dropped telemetry row is data loss, so the DRAIN_QUARANTINE diagnosis stays
     // visible. SQLSTATE + table only, never raw row values.
@@ -121,6 +128,24 @@ final class DrainWorker
 
     private const EWMA_ALPHA = 0.3;
 
+    private const RECONNECT_BACKOFF_MAX_MS = 10_000;
+
+    /**
+     * Soft wall-clock budget for buffer reclamation per cleanup tick, spent as
+     * many small slices rather than one long hold — see reclaimBufferSpace().
+     *
+     * Soft because the deadline is only tested between slices, so one slow slice
+     * overruns it: measured on a 1GB buffer, most ticks landed at ~260ms but two
+     * of eight took 640-720ms when SQLite did the physical file truncation. The
+     * overrun is bounded by a single slice's cost, which is why the slice stays
+     * small.
+     *
+     * Measured throughput at this budget: ~123MB per tick average, taking a fully
+     * drained 981MB buffer to zero in 8 ticks. At the 60s cleanup cadence that
+     * puts even the 3.8GB buffer this fix exists for back inside half an hour.
+     */
+    private const RECLAIM_BUDGET_MS = 250;
+
     public function __construct(
         private string $sqlitePath,
         private string $pgHost,
@@ -140,6 +165,14 @@ final class DrainWorker
         // Knobs the chaos test tunes; defaults match prior hardcoded behavior.
         private int $checkpointIntervalSeconds = 60,
         private int $checkpointTruncateBytes = 100 * 1024 * 1024,
+        // Reclaim freed buffer pages once this much dead space has accumulated.
+        // Below the threshold the freelist is left alone — it is cheap reuse for
+        // the next spike; above it, the file is just holding the customer's disk.
+        private int $reclaimThresholdBytes = 64 * 1024 * 1024,
+        // One slice, not the whole tick's work: ~8MB at the default 4KB page,
+        // measured at ~11ms holding the write lock. RECLAIM_BUDGET_MS decides how
+        // many slices a tick runs.
+        private int $reclaimPagesPerCycle = 2048,
         // Phase 2: when enabled, a batch that fails with a row-level data error is
         // bisected to isolate and quarantine the poison payload so the rest drain,
         // instead of head-of-line-blocking. Off by default — opt-in via
@@ -336,11 +369,19 @@ final class DrainWorker
             // When approaching the max wait deadline, reduce sleep to ensure
             // data doesn't sit in SQLite longer than drain_max_wait_ms.
             if (! $drained) {
-                $sinceLastFlush = (microtime(true) - $lastFlushTime) * 1000;
-                $remaining = $this->maxWaitMs - $sinceLastFlush;
-                $sleepMs = ($remaining > 0 && $remaining < $this->intervalMs)
-                    ? max(10, (int) $remaining)
-                    : $this->intervalMs;
+                // While PG is unreachable, retrying at the idle interval accomplishes
+                // nothing except burning a core on failed connects — back off instead.
+                // Rows stay safe in SQLite meanwhile, and the first successful round
+                // trip resets the streak so recovery is still prompt.
+                if ($this->connFailStreak > 0) {
+                    $sleepMs = $this->reconnectBackoffMs();
+                } else {
+                    $sinceLastFlush = (microtime(true) - $lastFlushTime) * 1000;
+                    $remaining = $this->maxWaitMs - $sinceLastFlush;
+                    $sleepMs = ($remaining > 0 && $remaining < $this->intervalMs)
+                        ? max(10, (int) $remaining)
+                        : $this->intervalMs;
+                }
                 usleep($sleepMs * 1000);
             }
         }
@@ -428,6 +469,31 @@ final class DrainWorker
     }
 
     /**
+     * Exponential backoff between reconnect attempts while PG is unreachable:
+     * one idle interval, doubling to a 10s ceiling. Capped low on purpose — SIGTERM
+     * interrupts the sleep (signals are async, see run()), and a short ceiling keeps
+     * recovery prompt once Postgres comes back while still cutting the retry rate
+     * from ~10/s to 0.1/s.
+     */
+    private function reconnectBackoffMs(): int
+    {
+        $exponent = min($this->connFailStreak - 1, 20);
+
+        return (int) min($this->intervalMs * (2 ** $exponent), self::RECONNECT_BACKOFF_MAX_MS);
+    }
+
+    /**
+     * Log a repeat connection failure only as the backoff doubles (attempts 1, 2, 4,
+     * 8, ...), so an outage leaves a readable trail instead of one line per retry.
+     */
+    private function isBackoffEscalation(): bool
+    {
+        $n = $this->connFailStreak;
+
+        return $n > 0 && ($n & ($n - 1)) === 0;
+    }
+
+    /**
      * Checkpoint escalation: PASSIVE by default, TRUNCATE when the WAL is large.
      *
      * At high write throughput (10k+ writes/s), PASSIVE checkpoints can't fully
@@ -467,6 +533,68 @@ final class DrainWorker
                 $this->truncateFailures++;
                 error_log("[NightOwl Drain] TRUNCATE checkpoint failed (will retry): {$e->getMessage()}");
             }
+        }
+
+        $this->reclaimBufferSpace($buffer);
+    }
+
+    /**
+     * Hand drained pages back to the filesystem.
+     *
+     * Checkpointing only resets the -wal; the main buffer file keeps every page a
+     * drained row ever occupied, so without this a single spike leaves the file at
+     * its high-water mark for good. Bounded per cycle so trimming never stalls
+     * ingest, and skipped entirely below the threshold since a modest freelist is
+     * just free space for the next burst.
+     */
+    private function reclaimBufferSpace(SqliteBuffer $buffer): void
+    {
+        try {
+            $free = $buffer->freeBytes();
+
+            if ($free < $this->reclaimThresholdBytes) {
+                return;
+            }
+
+            // Buffers created before auto_vacuum=INCREMENTAL can only be shrunk by a
+            // full VACUUM, which blocks and needs scratch space — so wait until the
+            // backlog is fully drained and do it once. Afterwards the file is in
+            // INCREMENTAL mode and the cheap path below handles it from then on.
+            if ($buffer->needsCompaction()) {
+                if ($buffer->pendingCount() > 0) {
+                    return;
+                }
+
+                $freedMb = round($buffer->compact() / 1024 / 1024, 1);
+                error_log("[NightOwl Drain] Buffer compacted, {$freedMb}MB returned to disk.");
+
+                return;
+            }
+
+            // Trim in small slices under a wall-clock budget rather than one big
+            // pass. incremental_vacuum holds the write lock for the length of a
+            // slice, and the ingest process shares this file — so a slice small
+            // enough to be invisible (measured ~11ms per 8MB) run repeatedly gives
+            // the lock back between slices, while the budget still returns real
+            // ground per tick. One fixed slice per 60s tick could not: at 8MB a
+            // minute, the 3.8GB buffer this fix exists for would have taken ~8
+            // hours to give its disk back.
+            $deadline = microtime(true) + self::RECLAIM_BUDGET_MS / 1000;
+            $freed = 0;
+
+            do {
+                $slice = $buffer->reclaim($this->reclaimPagesPerCycle);
+                $freed += $slice;
+            } while ($slice > 0 && microtime(true) < $deadline);
+
+            if ($freed > 0) {
+                $freedMb = round($freed / 1024 / 1024, 1);
+                $sizeMb = round($buffer->fileSize() / 1024 / 1024, 1);
+                error_log("[NightOwl Drain] Reclaimed {$freedMb}MB of buffer space (file now {$sizeMb}MB).");
+            }
+        } catch (\Throwable $e) {
+            // Reclamation is housekeeping — never let it take the drain down.
+            error_log("[NightOwl Drain] Buffer reclaim failed (will retry): {$e->getMessage()}");
         }
     }
 
@@ -563,12 +691,23 @@ final class DrainWorker
                 ? $pgElapsed
                 : (self::EWMA_ALPHA * $pgElapsed) + ((1 - self::EWMA_ALPHA) * $this->pgLatencyEwma);
 
+            // PG completed a round trip, so it is reachable again regardless of how
+            // many rows moved — clear the reconnect backoff.
+            $this->connFailStreak = 0;
+
             // Treat a batch that only deferred (transient failures, nothing committed
             // or quarantined) as idle so the loop backs off instead of busy-looping.
             return ($result['drained'] + $result['quarantined']) > 0;
         } catch (\Throwable $e) {
             $this->batchesFailed++;
-            error_log("[NightOwl Drain] Error: {$e->getMessage()}");
+
+            // While PG is unreachable the message is identical every retry, so log
+            // the first one and then only on backoff escalation — the streak counter
+            // below carries the "still down" signal without the flood.
+            $isConnFailure = ! empty($writer->lastWriteError['connection']);
+            if (! $isConnFailure || $this->connFailStreak === 0 || $this->isBackoffEscalation()) {
+                error_log("[NightOwl Drain] Error: {$e->getMessage()}");
+            }
 
             // Classify the failure for the health report:
             //  - non-connection write rejection (PG reachable, refusing): capture
@@ -583,8 +722,12 @@ final class DrainWorker
                 $this->lastWriteSqlstate = is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : null;
                 $this->lastWriteTable = is_string($err['table'] ?? null) ? $err['table'] : null;
                 $this->lastWriteAt = microtime(true);
+                // PG answered — it just refused the write. Not a reachability problem,
+                // so the reconnect backoff must not apply.
+                $this->connFailStreak = 0;
             } elseif (is_array($err) && ! empty($err['connection'])) {
                 $this->lastConnFailAt = microtime(true);
+                $this->connFailStreak++;
             }
 
             return false;
