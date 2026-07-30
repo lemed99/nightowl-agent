@@ -150,7 +150,7 @@ class AgentCommand extends Command
             // table that EXISTS over raw, so those serve zeroed charts. With
             // zero pending migrations nothing else would ever retry, so the
             // marker is what keeps re-spawning the backfill until one finishes.
-            $this->line('A previous rollup backfill did not complete — retrying in the background.');
+            $this->line('A previous rollup backfill did not complete.');
             $this->spawnBackgroundBackfill();
         }
 
@@ -320,7 +320,23 @@ class AgentCommand extends Command
     /** Survives until a detached backfill COMPLETES; see spawnBackgroundBackfill. */
     private function backfillMarkerPath(): string
     {
-        return storage_path('nightowl/backfill-pending');
+        return MigrateCommand::backfillMarkerPath();
+    }
+
+    /**
+     * Record that rollup reconciliation is owed, before anything tries it.
+     *
+     * Written even when auto_backfill is OFF: the marker is what makes the
+     * reminder recur. Without it, the boot after a successful schema run sees
+     * zero pending migrations and says nothing, leaving whatever rollup tables
+     * that run created existing-but-empty — and the API read path prefers an
+     * existing rollup table over raw, so those serve zeros indefinitely.
+     */
+    private function markBackfillPending(): void
+    {
+        $marker = $this->backfillMarkerPath();
+        @mkdir(dirname($marker), 0755, true);
+        @file_put_contents($marker, (string) time());
     }
 
     /**
@@ -330,8 +346,18 @@ class AgentCommand extends Command
      * Backfill can run for tens of minutes on a big tenant, and running it
      * pre-listen would leave the ingest port unbound — Nightwatch clients drop
      * telemetry after their 0.5s timeout. The exists-but-empty-rollup zeros
-     * window is the smaller harm and self-heals the moment backfill lands;
-     * backfill is advisory-locked and commutes with live drain by design.
+     * window is the smaller harm and self-heals the moment backfill lands.
+     *
+     * "Advisory-locked, so it commutes with live drain" is what this docblock
+     * used to claim, and it was wrong in the way that matters: the lock IS
+     * correct, but each chunk held it for a whole calendar span, and on a large
+     * tenant that outlasted the drain's lock_timeout — every drain batch then
+     * aborted 55P03 until the pass ended, and once the SQLite buffer passed
+     * max_pending_rows the agent began REJECTING live telemetry. What makes it
+     * commute is the chunk PACING added alongside this note
+     * (BackfillRollupsCommand::TARGET_CHUNK_SECONDS): ~1s per lock hold
+     * regardless of tenant size. NIGHTOWL_AUTO_BACKFILL=false is the escape
+     * hatch for an operator who would rather still own that pass.
      *
      * Shell-backgrounded subshell → the child reparents to init: no pipes held,
      * no interaction with AsyncServer's SIGCHLD reaper (which tolerates unknown
@@ -347,16 +373,27 @@ class AgentCommand extends Command
                 return; // non-standard bootstrap (harness) — backfill stays manual
             }
 
-            // Completion marker, written BEFORE the spawn and removed by the
-            // subshell only after nightowl:migrate exits 0. If the backfill
+            // Completion marker, written BEFORE the spawn and removed by
+            // whoever performs the reconciliation — the subshell on a clean
+            // exit, or nightowl:migrate itself on a manual run. If the backfill
             // dies mid-run (OOM, statement_timeout, tenant PG restart), the
             // marker survives and syncOrWarnSchema() re-spawns on the next
             // boot — without it, a boot with zero pending migrations would
             // never retry and the rollup tables would stay existing-but-empty
             // forever.
+            $this->markBackfillPending();
             $marker = $this->backfillMarkerPath();
-            @mkdir(dirname($marker), 0755, true);
-            @file_put_contents($marker, (string) time());
+
+            if (! config('nightowl.auto_backfill', true)) {
+                $message = 'Rollup backfill reconciliation is owed but NIGHTOWL_AUTO_BACKFILL=false — run '
+                    .'`php artisan nightowl:migrate` when it suits you. Until then, any rollup table this '
+                    .'upgrade created is empty, and charts read ZERO off an empty rollup rather than falling '
+                    .'back to raw. This warning repeats every boot until that command completes.';
+                error_log('[NightOwl Agent] '.$message);
+                $this->warn($message);
+
+                return;
+            }
 
             $log = storage_path('logs/nightowl-boot-migrate.log');
 

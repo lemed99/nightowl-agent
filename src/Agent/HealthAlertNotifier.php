@@ -91,8 +91,31 @@ final class HealthAlertNotifier
         $this->sendAll($diagnoses, 'health.recovered', 'recovered');
     }
 
+    /**
+     * The diagnoses worth waking somebody for.
+     *
+     * `info` diagnoses report an expected, self-clearing state (a rollup backfill
+     * still reconciling after an upgrade). They belong in the health payload and
+     * on /status, not in a Slack message titled "degraded" — and suppressing the
+     * alert has to suppress its RECOVERY too, or an all-clear arrives for
+     * something that never raised. Both dispatch paths go through sendAll(), so
+     * one filter there covers both.
+     *
+     * @param  array<int, array{code?: string, level?: string}>  $diagnoses
+     * @return array<int, array<string, mixed>>
+     */
+    public static function alertable(array $diagnoses): array
+    {
+        return array_values(array_filter(
+            $diagnoses,
+            static fn (array $d): bool => ($d['level'] ?? '') !== 'info',
+        ));
+    }
+
     private function sendAll(array $diagnoses, string $event, string $variant): void
     {
+        $diagnoses = self::alertable($diagnoses);
+
         if (empty($diagnoses)) {
             return;
         }

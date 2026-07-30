@@ -5,6 +5,63 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.0.1] - 2026-07-30
+
+### Fixed
+
+- **The boot rollup backfill no longer starves the drain into rejecting
+  payloads.** A backfill chunk was sized by a calendar span (15 minutes of
+  history, adapted on wall-clock feedback), which says nothing about how much
+  work a chunk actually is: on a dense tenant one chunk aggregated enough rows to
+  hold the rollup table's exclusive advisory lock for tens of seconds. Every
+  drain batch touching that table then hit `NIGHTOWL_DB_LOCK_TIMEOUT_MS` and
+  raised 55P03, which the drain correctly classifies as transient and defers — so
+  nothing errored, nothing was lost, and the SQLite buffer grew until it crossed
+  `NIGHTOWL_MAX_PENDING_ROWS`, after which the agent answered `5:ERROR` to the
+  SDK and telemetry stopped being accepted at all. Chunks are now bounded by
+  **measured lock-hold time** rather than a span, re-paced against live drain
+  contention toward a ~1s hold. Measured on an 800-group workload: failed drain
+  batches 4 of 8 → **0 of 56**, longest window with no drain progress 23.6s →
+  **0.0s**, longest lock hold 24.18s → **1.17s**, rows drained 40 of 80 → **560
+  of 560**, at the cost of 11% more wall clock on the backfill pass itself. The
+  floor is one bucket (an hourly tier chunk can never go below an hour, raw never
+  below 60s), so a tenant where aggregating a single bucket exceeds the lock
+  timeout is still beyond the pacer's help.
+- **A drain that cannot take the shared rollup lock keeps the raw telemetry.**
+  The 55P03 from a contended rollup table used to abort the whole batch, raw rows
+  included, and the batch was retried later as a unit. The shared-lock
+  acquisition is now savepointed: on 55P03 the raw rows commit anyway and the
+  drain records what it owes in `nightowl_settings.rollup_repair_from` (per
+  table, keeping the earliest bucket). `nightowl:migrate` repairs the marked
+  range and clears the marker, so a deploy fixes it with no operator action. Only
+  55P03 is absorbed — any other error still fails the batch.
+
+### Added
+
+- **`NIGHTOWL_AUTO_BACKFILL`** (default `true`) — set `false` to skip the boot
+  rollup backfill entirely on a host where you would rather run
+  `nightowl:backfill-rollups` yourself at a chosen time. Opt-out rather than
+  opt-in on purpose: a rollup table that exists but is EMPTY makes the
+  dashboard's wide-range charts read zeros instead of falling back to raw, so
+  defaulting this off would trade a bounded slowdown for silently wrong charts.
+- **Two rollup diagnoses in the health payload.** Both states were previously
+  visible only in the local agent log. `ROLLUP_REPAIR_PENDING` (warning) names
+  the tables owing a repair, the earliest bucket owed, and the `--since` that
+  fixes them; it clears itself once a `nightowl:migrate` fills the hole, because
+  the drain re-reads the marker rather than remembering it.
+  `ROLLUP_BACKFILL_PENDING` reports a boot reconciliation that has not finished —
+  `info` while it is plausibly still running, escalating to `warning` after six
+  hours, when the likelier explanation is that nobody is going to run it.
+
+### Changed
+
+- **`info`-level diagnoses no longer fire health alerts.** They still appear in
+  the health payload and on `/status`, but an expected, self-clearing state does
+  not belong in a Slack message titled "degraded" — and a suppressed alert has to
+  suppress its recovery too, or an all-clear arrives for something that never
+  raised. A no-op against 2.0.0 (which had no `info` diagnosis); it exists so
+  that a routine upgrade cannot page anyone.
+
 ## [2.0.0] - 2026-07-29
 
 Upgrading from 1.x: see [UPGRADE.md](UPGRADE.md). No action is required for the

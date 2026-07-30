@@ -100,6 +100,13 @@ final class MetricsCollector
     // failed batch, so this window only governs the post-last-failure decay.
     private const DRAIN_CONN_FAIL_FRESH_SECONDS = 45;
 
+    // A boot backfill that is still owed this long after it was recorded is no
+    // longer "in progress" — it is either much bigger than the tenant expected
+    // or nobody is going to run it (NIGHTOWL_AUTO_BACKFILL=false). Six hours,
+    // because the pass is paced against live drain contention by design and a
+    // multi-year tenant legitimately takes hours.
+    private const BACKFILL_PENDING_STALE_SECONDS = 6 * 3600;
+
     // Defensive emit ceilings — keep these two gauges within the API's decimal
     // columns (pg_latency_ms decimal(12,2), buffer_utilization_pct decimal(8,2))
     // so a stalled PG or a misconfigured max_pending_rows can never overflow the
@@ -196,6 +203,21 @@ final class MetricsCollector
     // instance query the same tenant DB, so this is a MAX across workers, not
     // a sum — see readDrainMetrics().
     private int $appOpenIssues = 0;
+
+    /**
+     * Rollup tables whose minute summaries have a hole a drain could not fill
+     * (table => earliest bucket owed), merged across workers. Drives
+     * ROLLUP_REPAIR_PENDING. A gauge — it empties when a deploy's
+     * nightowl:migrate clears the tenant's marker.
+     *
+     * @var array<string,string>
+     */
+    private array $rollupRepairDebt = [];
+
+    // mtime of the boot-backfill pending marker, 0.0 when nothing is owed.
+    // Drives ROLLUP_BACKFILL_PENDING — and its AGE is what separates "running
+    // right now" from "nobody ever ran it".
+    private float $backfillPendingSince = 0.0;
 
     // Previous drain totals for rate calculation
     private int $prevDrainTotal = 0;
@@ -444,6 +466,7 @@ final class MetricsCollector
         $mostRecentQuarAt = 0.0;
         $mostRecentQuarSqlstate = null;
         $mostRecentQuarTable = null;
+        $repairDebt = [];
 
         for ($w = 0; $w < $workerCount; $w++) {
             $metricsPath = $workerCount > 1
@@ -506,6 +529,21 @@ final class MetricsCollector
                 $mostRecentQuarTable = is_string($data['last_quarantine_table'] ?? null) ? $data['last_quarantine_table'] : null;
             }
 
+            // Rollup repair debt: a gauge every worker reads from the SAME tenant
+            // marker, so this is a merge, not a sum — and per table the EARLIEST
+            // floor wins, matching the SQL-side minimum recordRollupRepairDebt()
+            // converges on. A worker that hasn't hit its cleanup tick yet reports
+            // nothing and simply contributes no key.
+            foreach ((is_array($data['rollup_repair_debt'] ?? null) ? $data['rollup_repair_debt'] : []) as $table => $floor) {
+                if (! is_string($table) || ! is_string($floor)) {
+                    continue;
+                }
+                // 'Y-m-d H:i:s' UTC — lexicographic order IS chronological order.
+                if (! isset($repairDebt[$table]) || $floor < $repairDebt[$table]) {
+                    $repairDebt[$table] = $floor;
+                }
+            }
+
             $lat = (float) ($data['pg_latency_ms'] ?? 0.0);
             if ($lat > 0) {
                 $latencySum += $lat;
@@ -553,6 +591,21 @@ final class MetricsCollector
         $this->app5xxTotal = $app5xx;
         $this->appExceptionsTotal = $appExceptions;
         $this->appOpenIssues = $appOpenIssues;
+        ksort($repairDebt);
+        $this->rollupRepairDebt = $repairDebt;
+    }
+
+    /**
+     * Tell the collector whether a boot rollup backfill is still owed, and since
+     * when. Pushed in by the parent's diagnosis tick (a single `stat` of the
+     * marker AgentCommand writes) rather than pulled here, so this class keeps
+     * needing nothing from the filesystem layout.
+     *
+     * @param  float  $since  mtime of the pending marker; 0.0 when nothing is owed.
+     */
+    public function setBackfillPendingSince(float $since): void
+    {
+        $this->backfillPendingSince = $since;
     }
 
     /**
@@ -688,6 +741,57 @@ final class MetricsCollector
                 'message' => sprintf('%d telemetry payload(s) were rejected by your database and quarantined (dropped).', $this->drainQuarantinedTotal),
                 'recommendation' => sprintf('A payload failed a column rule (SQLSTATE %s%s) and was set aside so the rest of the stream could drain. Check the agent log for the offending payloads; if many were dropped, a column/schema mismatch is likely.', $sqlstate !== '' ? $sqlstate : 'data error', $on),
                 'value' => $this->drainQuarantinedTotal,
+            ];
+        }
+
+        // ROLLUP_REPAIR_PENDING — a drain landed raw telemetry it could not
+        // summarise (the rollup table was locked by a backfill pass) and wrote
+        // itself an IOU. The raw rows are safe; the summaries a wide-range chart
+        // reads are short for that window, which is silent by nature — nothing
+        // errors, the numbers are just low. Warning, not critical: no data was
+        // lost and one command fixes it. Self-clearing — the drain re-reads the
+        // marker, so this goes away on its own once a deploy repairs it.
+        if ($this->rollupRepairDebt !== []) {
+            $tables = array_keys($this->rollupRepairDebt);
+            $earliest = min($this->rollupRepairDebt);
+            $diagnoses[] = [
+                'code' => 'ROLLUP_REPAIR_PENDING',
+                'level' => 'warning',
+                'message' => sprintf(
+                    '%d rollup table(s) are missing summaries for telemetry that has already been stored: %s.',
+                    count($tables),
+                    $this->describeRepairDebt(),
+                ),
+                'recommendation' => sprintf(
+                    'The raw rows are all there — only the per-minute summaries behind wide-range charts are short, so those charts under-report from %s UTC onward. Run `php artisan nightowl:migrate` (or `php artisan nightowl:backfill-rollups --since=%s`) to rebuild them from raw; the next deploy does it automatically.',
+                    $earliest,
+                    $earliest,
+                ),
+                'value' => count($tables),
+            ];
+        }
+
+        // ROLLUP_BACKFILL_PENDING — the rollup reconciliation an upgrade owes has
+        // not finished. This matters because a rollup table that EXISTS but is
+        // EMPTY is worse than an absent one: the read path prefers any rollup
+        // that exists over raw, so empty means charts read zeros rather than
+        // falling back. Info while it is plausibly still running; warning once it
+        // is old enough that nobody is running it.
+        if ($this->backfillPendingSince > 0.0) {
+            // round(), not a truncating cast: the stamp is a float mtime, so
+            // truncation turns an exact N hours into N-1 in the message.
+            $ageSeconds = max(0, (int) round(microtime(true) - $this->backfillPendingSince));
+            $stale = $ageSeconds > self::BACKFILL_PENDING_STALE_SECONDS;
+            $diagnoses[] = [
+                'code' => 'ROLLUP_BACKFILL_PENDING',
+                'level' => $stale ? 'warning' : 'info',
+                'message' => $stale
+                    ? sprintf('The rollup backfill this upgrade owes has been outstanding for %d hours.', intdiv($ageSeconds, 3600))
+                    : 'Rollup backfill is still reconciling after an upgrade.',
+                'recommendation' => $stale
+                    ? 'Any rollup table the upgrade created is still empty, and an empty rollup makes wide-range charts read ZERO instead of falling back to raw. Run `php artisan nightowl:migrate` to finish it — check the agent log first in case an earlier attempt failed.'
+                    : 'Nothing to do. Wide-range charts may read low until it completes; raw telemetry is unaffected.',
+                'value' => $ageSeconds,
             ];
         }
 
@@ -1061,6 +1165,30 @@ final class MetricsCollector
             'resolved_diagnoses' => $this->getResolvedDiagnoses(),
             'reported_at' => gmdate('Y-m-d\TH:i:s\Z'),
         ];
+    }
+
+    /**
+     * The owing rollup tables with the window each one lost, for the
+     * ROLLUP_REPAIR_PENDING message.
+     *
+     * Capped, because `diagnoses.*.message` is validated max:1024 by the platform
+     * and one over-long field 422s the ENTIRE health report. All 14 rollups owing
+     * at once already renders to ~908 characters, which leaves a future 15th spec
+     * enough rope to take down every diagnosis in the payload. The recommendation
+     * carries the single --since that repairs everything regardless, so the list is
+     * orientation, not instructions.
+     */
+    private function describeRepairDebt(int $limit = 6): string
+    {
+        $parts = [];
+        foreach ($this->rollupRepairDebt as $table => $floor) {
+            if (count($parts) === $limit) {
+                return implode(', ', $parts).sprintf(', and %d more', count($this->rollupRepairDebt) - $limit);
+            }
+            $parts[] = $table.' (from '.$floor.' UTC)';
+        }
+
+        return implode(', ', $parts);
     }
 
     /**

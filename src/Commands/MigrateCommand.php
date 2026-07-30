@@ -5,6 +5,7 @@ namespace NightOwl\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use NightOwl\Support\RollupSpec;
 use NightOwl\Support\RollupSpecs;
 use NightOwl\Support\RollupTiers;
 use NightOwl\Support\V2SequenceFence;
@@ -53,6 +54,12 @@ class MigrateCommand extends Command
 
         if ($exit === self::SUCCESS && ! $this->option('no-backfill')) {
             $this->backfillEmptyRollups();
+
+            // This run WAS the reconciliation the daemon's marker asks for, so
+            // clear it — otherwise an operator who runs this by hand (the whole
+            // point of NIGHTOWL_AUTO_BACKFILL=false) keeps getting the
+            // "did not complete" warning on every boot, forever.
+            @unlink(self::backfillMarkerPath());
         }
 
         if ($exit === self::SUCCESS) {
@@ -61,6 +68,20 @@ class MigrateCommand extends Command
         }
 
         return $exit;
+    }
+
+    /**
+     * "Rollup reconciliation is owed."
+     *
+     * Written by the daemon when it defers the backfill half of a boot upgrade
+     * (AgentCommand::spawnBackgroundBackfill), removed by whoever actually
+     * performs it — the detached subshell, or this command on any full run.
+     * Lives here because both commands need it and this one is already
+     * AgentCommand's static dependency.
+     */
+    public static function backfillMarkerPath(): string
+    {
+        return storage_path('nightowl/backfill-pending');
     }
 
     /**
@@ -279,7 +300,12 @@ class MigrateCommand extends Command
             }
         }
 
-        if ($plan['full'] === [] && $plan['tiers_only'] === []) {
+        // Holes the live drain reported but could not fill itself. Independent of
+        // the completeness checks above: a drain that skipped one batch's rollup
+        // leaves a hole too narrow for a MIN or a SUM comparison to notice.
+        $repaired = $this->repairMarkedRollups($conn, $plan['full']);
+
+        if ($plan['full'] === [] && $plan['tiers_only'] === [] && $repaired === []) {
             return;
         }
 
@@ -289,6 +315,112 @@ class MigrateCommand extends Command
             .'restart it (nightowl:agent) so it starts writing rollups for new telemetry — it caches '
             .'which rollup tables exist at boot.'
         );
+    }
+
+    /**
+     * Fill the rollup holes the drain recorded in `rollup_repair_from`.
+     *
+     * The drain writes that key when it cannot take a rollup table's shared
+     * advisory lock: it commits the raw rows and skips the rollup, per table with
+     * the earliest bucket it skipped (RecordWriter::recordRollupRepairDebt). One
+     * skipped batch is a minutes-wide hole in the middle of an otherwise complete
+     * table — MIN(bucket_start) still predates raw and the tier sums still match,
+     * so neither baseIsIncomplete() nor tierIsIncomplete() can see it. This is the
+     * only thing that closes it.
+     *
+     * `--since` the recorded floor rather than the whole history: the floor is the
+     * earliest bucket that could be affected, and replace-per-bucket makes
+     * re-deriving everything after it correct regardless of how many holes there
+     * are. Skips tables the completeness pass just rebuilt in full — that pass
+     * already covered them, and it ran first.
+     *
+     * The key is cleared only after every table it names succeeds. A partial run
+     * keeps the debt, so the next deploy retries the rest instead of dropping it.
+     *
+     * @param  array<int, string>  $alreadyFull
+     * @return array<int, string>  tables repaired here
+     */
+    private function repairMarkedRollups($conn, array $alreadyFull): array
+    {
+        try {
+            $raw = $conn->table('nightowl_settings')->where('key', 'rollup_repair_from')->value('value');
+        } catch (\Throwable $e) {
+            $this->warn('Could not read the rollup repair marker: '.$e->getMessage());
+
+            return [];
+        }
+
+        if ($raw === null || $raw === '') {
+            return [];
+        }
+
+        $debt = json_decode((string) $raw, true, 8);
+        if (! is_array($debt) || $debt === []) {
+            // Not our shape — say so rather than silently discarding a record of
+            // missing data, and leave the row for a human to look at.
+            $this->warn('The rollup repair marker is unreadable; leaving it in place. Value: '.substr((string) $raw, 0, 200));
+
+            return [];
+        }
+
+        $known = array_map(fn (RollupSpec $spec): string => $spec->table, RollupSpecs::all());
+
+        $repaired = [];
+        $failed = [];
+        foreach ($debt as $table => $floor) {
+            if (! is_string($table) || ! in_array($table, $known, true) || ! is_string($floor)) {
+                $failed[$table] = $floor; // unrecognised — keep it, don't act on it
+                continue;
+            }
+            if (in_array($table, $alreadyFull, true)) {
+                continue; // the full pass above already re-derived this table
+            }
+
+            // A floor inside the backfill's own safety margin cannot be repaired
+            // yet: backfill-rollups caps --until at now minus the margin, so it
+            // would report "nothing to backfill", succeed, and let the key be
+            // cleared with the hole still open. Keep the debt for the next run
+            // instead. Normal timing never lands here — the repair runs a deploy
+            // or a reboot after the skip — so this is the belt for a migrate that
+            // follows a contended drain within ten minutes.
+            if (strtotime($floor.' UTC') > time() - BackfillRollupsCommand::SAFETY_MARGIN_SECONDS) {
+                $this->line(sprintf(
+                    '  %s: rollup repair from %s UTC is too recent to backfill; keeping the marker for the next run.',
+                    $table,
+                    $floor,
+                ));
+                $failed[$table] = $floor;
+
+                continue;
+            }
+
+            $this->newLine();
+            $this->info(sprintf(
+                'Repairing %s from %s UTC — the live drain skipped its rollup while the table was locked.',
+                $table,
+                $floor,
+            ));
+
+            if ($this->call('nightowl:backfill-rollups', ['--type' => $table, '--since' => $floor]) === self::SUCCESS) {
+                $repaired[] = $table;
+            } else {
+                $failed[$table] = $floor;
+            }
+        }
+
+        try {
+            if ($failed === []) {
+                $conn->table('nightowl_settings')->where('key', 'rollup_repair_from')->delete();
+            } else {
+                $conn->table('nightowl_settings')
+                    ->where('key', 'rollup_repair_from')
+                    ->update(['value' => json_encode($failed), 'updated_at' => now()]);
+            }
+        } catch (\Throwable $e) {
+            $this->warn('Could not update the rollup repair marker: '.$e->getMessage());
+        }
+
+        return $repaired;
     }
 
     /**

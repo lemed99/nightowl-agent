@@ -70,6 +70,34 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Auto-Backfill of Rollups at Daemon Startup
+    |--------------------------------------------------------------------------
+    |
+    | The second half of the boot upgrade: after the schema run lands, spawn a
+    | detached `nightowl:migrate` to populate whatever rollup tables it left
+    | existing-but-empty and to repair incomplete tiers. On by default, because
+    | the alternative is worse than slow charts — the API read path prefers ANY
+    | rollup table that exists over raw, so a table that exists and is empty
+    | serves ZEROS, and nothing but this pass ever fills it.
+    |
+    | Set false when you would rather own that pass yourself — a very large
+    | tenant, a maintenance window, or a tenant PG you don't want carrying the
+    | aggregation while the daemon is also draining. The daemon then warns once
+    | per boot with the tables that are still empty, and you run
+    | `php artisan nightowl:migrate` (or `nightowl:backfill-rollups`) by hand.
+    | Charts over those tables read zero until you do.
+    |
+    | Backfill chunks are paced to hold each rollup table's advisory lock for
+    | ~1s regardless of tenant size (BackfillRollupsCommand::TARGET_CHUNK_SECONDS),
+    | so leaving this on does not wedge the live drain. It did before that
+    | pacing existed — see the constant's docblock.
+    |
+    */
+    // TOP-LEVEL on purpose (shallow-merge rule — see 'drain_connection').
+    'auto_backfill' => (bool) env('NIGHTOWL_AUTO_BACKFILL', true),
+
+    /*
+    |--------------------------------------------------------------------------
     | Cache Key Templating
     |--------------------------------------------------------------------------
     |

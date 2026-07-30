@@ -40,6 +40,18 @@ final class DrainWorker
     // per-app "issues" count. Refreshed at most once per minute — see run().
     private int $openIssues = 0;
 
+    /**
+     * Rollup tables carrying a repair debt (table => earliest bucket owed), as
+     * last read off the tenant's `rollup_repair_from` marker on the cleanup
+     * tick. A gauge, not a counter: it empties by itself once a deploy's
+     * nightowl:migrate fills the hole. Ships to the parent so the health payload
+     * can say so — a tenant that never deploys would otherwise carry a chart-
+     * distorting gap in silence.
+     *
+     * @var array<string,string>
+     */
+    private array $rollupRepairDebt = [];
+
     private const ISSUE_COUNT_INTERVAL = 60; // seconds
 
     private const PARTITION_CHECK_INTERVAL = 3600; // seconds
@@ -332,6 +344,18 @@ final class DrainWorker
                     // enabled it in settings. Advisory-locked internally so one
                     // worker evaluates per tenant per minute.
                     $writer->checkWorkerSaturation();
+
+                    // Re-read the rollup repair marker. Cheap (single-row PK
+                    // lookup on nightowl_settings) and deliberately re-read
+                    // rather than remembered: the marker is CLEARED by
+                    // nightowl:migrate in another process, so only a fresh read
+                    // lets the health signal go away once the hole is filled.
+                    // null = couldn't read; keep the last good value.
+                    $debt = $writer->readRollupRepairDebt();
+                    if ($debt !== null) {
+                        $this->rollupRepairDebt = $debt;
+                    }
+
                     $this->checkpointWithEscalation($buffer);
                 } catch (\Throwable $e) {
                     error_log("[NightOwl Drain] Cleanup error: {$e->getMessage()}");
@@ -1031,6 +1055,9 @@ final class DrainWorker
             'last_quarantine_sqlstate' => $this->lastQuarantineSqlstate,
             'last_quarantine_table' => $this->lastQuarantineTable,
             'last_quarantine_at' => $this->lastQuarantineAt,
+            // Gauge (table => earliest bucket owed), NOT summed across workers —
+            // every worker reads the same tenant marker. See readDrainMetrics().
+            'rollup_repair_debt' => $this->rollupRepairDebt,
             'updated_at' => microtime(true),
         ], JSON_INVALID_UTF8_SUBSTITUTE);
 

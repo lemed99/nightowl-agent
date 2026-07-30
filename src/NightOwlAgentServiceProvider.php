@@ -188,6 +188,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 drainSpawner: $this->makeDrainSpawner($app),
                 drainWedgeSeconds: (float) config('nightowl.drain_connection.wedge_warn_seconds', 180),
                 driftWatcher: $this->makeDriftWatcher(),
+                backfillMarkerPath: MigrateCommand::backfillMarkerPath(),
             );
         });
     }

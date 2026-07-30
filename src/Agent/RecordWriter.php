@@ -455,6 +455,62 @@ final class RecordWriter
     }
 
     /**
+     * The rollup repair debt this tenant is currently carrying — the
+     * `rollup_repair_from` marker recordRollupRepairDebt() writes when a
+     * contended rollup table forced a drain to land raw rows without their
+     * summaries.
+     *
+     * Read from the DB rather than accumulated in memory ON PURPOSE. The marker
+     * is cleared by MigrateCommand::repairMarkedRollups() (a deploy, or the
+     * daemon's boot migrate) in a DIFFERENT process, so an in-memory counter
+     * would keep asserting a hole that has already been filled — for as long as
+     * the daemon runs. Re-reading makes the health signal self-clearing.
+     *
+     * @return array<string,string>|null table => earliest bucket owed, 'Y-m-d H:i:s'
+     *                                   UTC; null (never a throw) when the marker
+     *                                   can't be read — no table (pre-000018), a
+     *                                   PG blip, or a value that isn't the map
+     *                                   shape. The caller keeps its last good
+     *                                   value, exactly as with countOpenIssues().
+     */
+    public function readRollupRepairDebt(): ?array
+    {
+        try {
+            $value = $this->pdo()
+                ->query("SELECT value FROM nightowl_settings WHERE key = 'rollup_repair_from'")
+                ->fetchColumn();
+
+            if ($value === false || $value === null) {
+                return []; // read fine, nothing owed
+            }
+
+            $decoded = json_decode((string) $value, true, 8, JSON_THROW_ON_ERROR);
+            if (! is_array($decoded)) {
+                return null;
+            }
+
+            // Only tables we can actually name a backfill for. A hand-edited or
+            // older-shape entry stays in the setting (MigrateCommand preserves
+            // what it doesn't recognise) but must not reach the health payload,
+            // where the code path downstream is "tell the operator which command
+            // fixes this".
+            $known = array_map(static fn (RollupSpec $spec): string => $spec->table, RollupSpecs::all());
+
+            $debt = [];
+            foreach ($decoded as $table => $floor) {
+                if (is_string($table) && is_string($floor) && in_array($table, $known, true)) {
+                    $debt[$table] = $floor;
+                }
+            }
+            ksort($debt);
+
+            return $debt;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
      * Drop the current connection and force a fresh one on next use.
      * Ensures any stale transaction state is cleaned up before the
      * socket is discarded — critical for PgBouncer/Supavisor which
@@ -739,14 +795,24 @@ final class RecordWriter
      *
      * lock_timeout is deliberately NOT exempted around the rollup advisory lock. With
      * a backfill chunk holding the paired EXCLUSIVE lock, the drain's shared lock
-     * aborts with 55P03 — and 55P03 hits DrainWorker::isTransientFailure(), checked
-     * before the bisect, which DEFERS the batch and leaves the rows in SQLite. That is
-     * already correct: a drain blocked on the lock and a drain deferring on 55P03 both
-     * land zero rows for the chunk's duration, but only the deferring one keeps its
-     * loop responsive. Exempting it (SET LOCAL lock_timeout = 0) would reintroduce an
+     * aborts with 55P03. Exempting it (SET LOCAL lock_timeout = 0) would reintroduce an
      * unbounded wait AND, via a finally-restore, throw 25P02 over the real exception —
      * which is neither whole-target nor transient, so with quarantine on it would
      * bisect and quarantine good rows.
+     *
+     * What that 55P03 MEANS changed, though, and the reasoning it replaced is worth
+     * keeping visible because it was wrong. It used to fall through to
+     * DrainWorker::isTransientFailure() and defer the whole batch, which this
+     * docblock called "already correct" on the grounds that a blocked drain and a
+     * deferring drain both land zero rows for the chunk's duration. True, and beside
+     * the point: deferring is only free if the contention ENDS before the SQLite
+     * buffer fills. On a 2.0.0 upgrade it did not — the boot backfill held each
+     * chunk far past this timeout, every batch deferred, the buffer crossed
+     * max_pending_rows, and the agent spent two hours answering `5:ERROR` to live
+     * payloads. Deferred rows are safe; rejected ones do not exist. So the rollup
+     * lock is now taken under a savepoint (lockRollupForWriteShared) and a 55P03
+     * there skips the ROLLUP and commits the raw rows, with the hole recorded for
+     * repair. A 55P03 from anywhere else still defers the batch as before.
      *
      * idle_in_transaction_session_timeout is the ORPHAN reaper. When this process
      * abandons a batch mid-transaction (reconnect after a false-dead verdict, a
@@ -802,11 +868,117 @@ final class RecordWriter
      *
      * hashtext()'s int4 result implicitly widens to the bigint advisory-lock key
      * (works on every supported Postgres). The key string must match the backfill's.
+     *
+     * Answers FALSE when the lock could not be taken inside lock_timeout, leaving
+     * the transaction usable so the caller can commit the RAW rows and skip only
+     * the rollup — the same trade rollupEnabled() already makes for a missing
+     * table. Losing the customer's telemetry is the one outcome this agent may
+     * never choose, and deferring the whole batch chooses it indirectly: the rows
+     * stay in the SQLite buffer, and a contended rollup table that outlasts the
+     * buffer makes the agent answer `5:ERROR` to live payloads (the 2.0.0 field
+     * incident — see BackfillRollupsCommand::TARGET_CHUNK_SECONDS). A rollup hole
+     * is repairable from raw; a rejected payload is gone.
+     *
+     * The savepoint is what buys that. A 55P03 aborts the transaction, so without
+     * one the COPYs already in this batch die with it. It rides in the SAME query
+     * string as the lock — one round trip on the happy path, and a savepoint
+     * established earlier in a multi-statement query survives that query's own
+     * error, so ROLLBACK TO can still reach it (verified against PG 16). The
+     * subtransaction never writes, so it is never assigned an xid and cannot push
+     * the batch past the 64-cached-subxid threshold that would flag it overflowed
+     * for other backends' snapshots.
+     *
+     * Only 55P03 is absorbed. Anything else is a real failure and stays the
+     * batch's — the caller's poison/bisect handling is built for those.
      */
-    private function lockRollupForWriteShared(string $table): void
+    private function lockRollupForWriteShared(string $table): bool
     {
-        $stmt = $this->pdo()->prepare('SELECT pg_advisory_xact_lock_shared(hashtext(?))');
-        $stmt->execute(['nightowl_rollup:'.$table]);
+        // Interpolated, not bound: multi-statement strings can't be prepared, and
+        // $table is always a RollupSpecs/RollupTiers constant (same rule as
+        // rollupEnabled's to_regclass probe). Never a caller-supplied value.
+        $sql = 'SAVEPOINT nightowl_rollup_lock; '
+            ."SELECT pg_advisory_xact_lock_shared(hashtext('nightowl_rollup:".$table."')); "
+            .'RELEASE SAVEPOINT nightowl_rollup_lock';
+
+        try {
+            $this->pdo()->exec($sql);
+
+            return true;
+        } catch (\PDOException $e) {
+            if (($e->errorInfo[0] ?? null) !== '55P03') {
+                throw $e;
+            }
+
+            $this->pdo()->exec('ROLLBACK TO SAVEPOINT nightowl_rollup_lock');
+
+            return false;
+        }
+    }
+
+    /**
+     * Record that a rollup table has a hole this drain could not fill, so the
+     * repair is not left to luck.
+     *
+     * Written in the SAME transaction as the raw rows it accounts for, so the
+     * debt and the un-rolled-up telemetry commit together or not at all. The
+     * value is a per-table MINIMUM bucket — the floor a later
+     * `nightowl:backfill-rollups --type=X --since=<floor>` has to start from to
+     * re-derive the whole chain from raw. Merged in SQL under the row lock, so
+     * concurrent drain workers converge on the earliest floor instead of
+     * clobbering each other.
+     *
+     * Timestamps are 'Y-m-d H:i:s' UTC, where lexicographic order IS chronological
+     * order — that's what makes the SQL-side minimum a plain string compare.
+     *
+     * Consumed and cleared by MigrateCommand::repairMarkedRollups() (deploy, or
+     * the daemon's boot migrate) and surfaced in the health payload meanwhile,
+     * because a tenant that never deploys would otherwise carry the hole silently.
+     */
+    private function recordRollupRepairDebt(string $table, string $floorBucket): void
+    {
+        // Savepointed for the same reason the lock is, and this time it also
+        // covers the states this statement can legitimately fail in: no
+        // nightowl_settings at all (42P01, pre-000018 tenant), or a value that
+        // isn't valid json (22P02 — hand-edited, or an older shape). Both would
+        // otherwise abort the transaction and take down the very raw rows this
+        // path exists to save. Only the debt is lost, and a lost debt degrades
+        // the repair to "found by the next completeness check" rather than
+        // "never" — nightowl:migrate's tier/base incompleteness detection is
+        // independent of this marker.
+        try {
+            $this->pdo()->exec('SAVEPOINT nightowl_rollup_debt');
+        } catch (\PDOException) {
+            return; // can't even savepoint: leave the transaction strictly alone
+        }
+
+        try {
+            $stmt = $this->pdo()->prepare(
+                "INSERT INTO nightowl_settings (key, value, created_at, updated_at)
+                 VALUES ('rollup_repair_from', jsonb_build_object(?::text, ?::text)::text, now(), now())
+                 ON CONFLICT (key) DO UPDATE SET
+                     value = (CASE
+                         WHEN (nightowl_settings.value::jsonb ->> ?::text) IS NULL
+                           OR (nightowl_settings.value::jsonb ->> ?::text) > ?::text
+                         THEN nightowl_settings.value::jsonb || jsonb_build_object(?::text, ?::text)
+                         ELSE nightowl_settings.value::jsonb
+                     END)::text,
+                     updated_at = now()"
+            );
+            $stmt->execute([$table, $floorBucket, $table, $table, $floorBucket, $table, $floorBucket]);
+            $this->pdo()->exec('RELEASE SAVEPOINT nightowl_rollup_debt');
+        } catch (\PDOException $e) {
+            error_log(
+                '[NightOwl Agent] Could not record the rollup repair debt for '.$table.' ('.$e->getMessage()
+                .') — run `php artisan nightowl:backfill-rollups --type='.$table.' --since='.$floorBucket.'` when convenient.'
+            );
+
+            try {
+                $this->pdo()->exec('ROLLBACK TO SAVEPOINT nightowl_rollup_debt');
+            } catch (\PDOException) {
+                // Nothing left to protect the batch with; its own failure
+                // handling owns what happens next.
+            }
+        }
     }
 
     private function isConnectionError(\Throwable $e, ?string $sqlstate = null): bool
@@ -2457,7 +2629,6 @@ final class RecordWriter
         }
 
         $this->markWriteTarget($spec->table);
-        $this->lockRollupForWriteShared($spec->table);
         $counterCols = $spec->counterColumns();
         $repCols = $spec->representativeColumns();
 
@@ -2545,6 +2716,22 @@ final class RecordWriter
             return;
         }
 
+        // Taken here rather than before the grouping: the lock is held for less
+        // of the transaction, and by now the batch's earliest bucket is known —
+        // which is the floor a repair has to re-derive from if we skip.
+        if (! $this->lockRollupForWriteShared($spec->table)) {
+            $this->recordRollupRepairDebt(
+                $spec->table,
+                min(array_column($groups, 'bucket_start')),
+            );
+
+            // Tiers are skipped with the base on purpose. Writing them while the
+            // minute table has a hole makes a wide-range chart disagree with the
+            // narrow one over the same span, which reads as a product bug; and
+            // the repair re-derives the whole chain from raw anyway.
+            return;
+        }
+
         $this->upsertRollupGroups($spec, $histColumns, $groups, $spec->table);
 
         // Hour/day tiers: re-collapse the (already minute-collapsed) groups in
@@ -2560,7 +2747,14 @@ final class RecordWriter
             }
 
             $this->markWriteTarget($tierTable);
-            $this->lockRollupForWriteShared($tierTable);
+
+            // A skipped TIER needs no marker: its call_count sum then falls short
+            // of the minute table's, which is exactly what
+            // MigrateCommand::tierIsIncomplete() already looks for, and the
+            // --tiers-only pass it schedules heals mid-history holes.
+            if (! $this->lockRollupForWriteShared($tierTable)) {
+                continue;
+            }
 
             $this->upsertRollupGroups(
                 $spec,
@@ -2919,7 +3113,6 @@ final class RecordWriter
         }
 
         $this->markWriteTarget('nightowl_query_rollups');
-        $this->lockRollupForWriteShared('nightowl_query_rollups');
 
         // Clamp the conflict-key columns (group_hash, connection) at the grouping layer
         // so two values that clamp equal merge into ONE additive group. Keyed by the
@@ -2976,6 +3169,17 @@ final class RecordWriter
             return;
         }
 
+        // Same skip-the-rollup-keep-the-raw trade as writeRollup — see
+        // lockRollupForWriteShared.
+        if (! $this->lockRollupForWriteShared('nightowl_query_rollups')) {
+            $this->recordRollupRepairDebt(
+                'nightowl_query_rollups',
+                min(array_column($groups, 'bucket_start')),
+            );
+
+            return;
+        }
+
         $this->upsertQueryRollupGroups($histColumns, $groups, 'nightowl_query_rollups');
 
         // Hour/day tiers — same re-collapse as the generic writeRollup path,
@@ -2990,7 +3194,12 @@ final class RecordWriter
             }
 
             $this->markWriteTarget($tierTable);
-            $this->lockRollupForWriteShared($tierTable);
+
+            // No marker for a skipped tier: tierIsIncomplete() detects the
+            // shortfall against the minute table (see writeRollup).
+            if (! $this->lockRollupForWriteShared($tierTable)) {
+                continue;
+            }
 
             $this->upsertQueryRollupGroups(
                 $histColumns,

@@ -29,7 +29,51 @@ class BackfillRollupsCommand extends Command
      * behind `now` guarantees the two write modes never collide, so backfill can
      * safely DELETE-then-INSERT (replace-per-bucket) without a watermark.
      */
-    private const SAFETY_MARGIN_SECONDS = 600;
+    public const SAFETY_MARGIN_SECONDS = 600;
+
+    /**
+     * Chunk pacing. Every chunk holds the rollup table's EXCLUSIVE advisory lock
+     * for its whole transaction (backfillChunk / backfillTierChunk), and the live
+     * drain's paired SHARED lock is taken under `SET LOCAL lock_timeout` —
+     * NIGHTOWL_DB_LOCK_TIMEOUT_MS, 10s by default. A chunk that outlives that
+     * budget makes EVERY concurrent drain batch abort 55P03 for as long as the
+     * pass runs, and a drain landing zero rows long enough fills the SQLite
+     * buffer past NIGHTOWL_MAX_PENDING_ROWS — at which point the agent stops
+     * deferring and starts REJECTING live telemetry. Observed in the field on a
+     * 2.0.0 upgrade: a --tiers-only pass held the lock 24s per chunk and the
+     * drain rejected 100% of payloads for two hours.
+     *
+     * So chunk size is paced by MEASURED hold time rather than a calendar span.
+     * A fixed span cannot work: the same 7 days is milliseconds on a small
+     * tenant and half a minute on a large one, and the cost per row also depends
+     * on hardware we don't control (local NVMe vs managed Postgres over a
+     * network). The controller below converges on TARGET regardless.
+     */
+    private const TARGET_CHUNK_SECONDS = 1.0;
+
+    /**
+     * First window, before any measurement exists. Deliberately small: on the
+     * largest documented profile (8M requests/day) 15 minutes of raw is ~83k
+     * rows, well inside TARGET, so even the un-paced first chunk is short.
+     */
+    private const INITIAL_CHUNK_SECONDS = 900;
+
+    /**
+     * Proportional controller for the next chunk window.
+     *
+     * Clamped to [0.25x, 2x] per step so one anomalous chunk (an autovacuum
+     * landing mid-transaction, a pooler stall) can neither collapse the window
+     * to nothing nor let it run away. Capped at 2x in particular bounds the
+     * OVERSHOOT: the worst hold after a converged chunk is ~2x TARGET, which
+     * still sits an order of magnitude under a default lock_timeout.
+     */
+    private static function nextWindow(float $current, float $elapsed, float $min, float $max): float
+    {
+        $scale = $elapsed > 0.01 ? self::TARGET_CHUNK_SECONDS / $elapsed : 2.0;
+        $scale = max(0.25, min(2.0, $scale));
+
+        return max($min, min($max, $current * $scale));
+    }
 
     /**
      * Every column this command compares against is UTC wall time: raw
@@ -253,28 +297,51 @@ class BackfillRollupsCommand extends Command
             $groupBy = implode(', ', range(1, $parts['groupByCount']));
 
             // Rollup rows are ~60× / ~1440× sparser than raw, so tier chunks can
-            // span much wider windows per transaction.
+            // span much wider windows per transaction — but only as wide as the
+            // pacer allows, because a tier chunk's GROUP BY over a high-
+            // cardinality minute table is exactly what held the lock for 24s in
+            // the field. This stays the CEILING; nextWindow() picks the window.
             $tierChunkDays = $chunkDays * ($tier === 'hourly' ? 7 : 30);
 
+            // A window narrower than one destination bucket would keep
+            // re-deleting and recomputing the same bucket without advancing
+            // (backfillTierChunk truncates its DELETE floor to the granularity),
+            // so the granularity is the floor.
+            $maxWindow = (float) ($tierChunkDays * 86400);
+            $minWindow = (float) max($granularitySeconds, 60);
+            $window = min($maxWindow, max($minWindow, (float) self::INITIAL_CHUNK_SECONDS));
+
             $cursor = $since->copy();
-            $total = 0;
+            $chunks = 0;
+            $longestHold = 0.0;
             while ($cursor->lessThan($until)) {
-                $chunkEnd = $cursor->copy()->addDays($tierChunkDays);
+                $chunkEnd = $cursor->copy()->addSeconds(max(1, (int) round($window)));
                 if ($chunkEnd->greaterThan($until)) {
                     $chunkEnd = $until->copy();
                 }
 
-                $total += $this->backfillTierChunk(
+                $startedAt = microtime(true);
+                $this->backfillTierChunk(
                     $conn, $spec, $sourceTable, $tierTable, $unit, $granularitySeconds,
                     $columns, $selects, $groupBy,
                     $cursor->toDateTimeString(), $chunkEnd->toDateTimeString(),
                 );
+                $held = microtime(true) - $startedAt;
+                $longestHold = max($longestHold, $held);
+                $chunks++;
+
                 $cursor = $chunkEnd;
+                $window = self::nextWindow($window, $held, $minWindow, $maxWindow);
 
                 usleep(50_000);
             }
 
-            $this->line("  {$tierTable}: {$total} rollup rows.");
+            $this->reportPass(
+                $tierTable,
+                $this->countRange($conn, $tierTable, RollupTiers::truncateBucket($since->toDateTimeString(), $granularitySeconds), $until->toDateTimeString()),
+                $chunks,
+                $longestHold,
+            );
 
             // The next tier aggregates from this one (day from hour) — but only
             // when this pass actually ran; a missing hourly table leaves daily
@@ -368,23 +435,72 @@ class BackfillRollupsCommand extends Command
         $groupBy = implode(', ', range(1, $parts['groupByCount']));
 
         $cursor = $since->copy();
-        $total = 0;
+        $chunks = 0;
+
+        // --chunk-days is now a CEILING on the paced window rather than the
+        // window itself: an operator who lowered it to spare a small tenant
+        // still gets that bound, and one who left it at the default never gets
+        // a chunk longer than the pacer allows.
+        $maxWindow = (float) ($chunkDays * 86400);
+        $window = min($maxWindow, (float) self::INITIAL_CHUNK_SECONDS);
+        $longestHold = 0.0;
 
         while ($cursor->lessThan($until)) {
-            $chunkEnd = $cursor->copy()->addDays($chunkDays);
+            $chunkEnd = $cursor->copy()->addSeconds(max(1, (int) round($window)));
             if ($chunkEnd->greaterThan($until)) {
                 $chunkEnd = $until->copy();
             }
 
-            $total += $this->backfillChunk($conn, $spec, $columns, $selects, $groupBy, $cursor->toDateTimeString(), $chunkEnd->toDateTimeString());
-            $cursor = $chunkEnd;
+            $startedAt = microtime(true);
+            $this->backfillChunk($conn, $spec, $columns, $selects, $groupBy, $cursor->toDateTimeString(), $chunkEnd->toDateTimeString());
+            $held = microtime(true) - $startedAt;
+            $longestHold = max($longestHold, $held);
+            $chunks++;
 
-            // Throttle so backfill doesn't compete with live drain on the
-            // customer's DB.
+            $cursor = $chunkEnd;
+            $window = self::nextWindow($window, $held, 60.0, $maxWindow);
+
+            // Yields the advisory lock between chunks. Postgres grants queued
+            // waiters when the exclusive holder commits, so this is the gap a
+            // blocked drain batch is let through in.
             usleep(50_000);
         }
 
-        $this->line("  {$spec->table}: {$total} rollup rows.");
+        $this->reportPass(
+            $spec->table,
+            $this->countRange($conn, $spec->table, RollupTiers::truncateBucket($since->toDateTimeString(), 60), $until->toDateTimeString()),
+            $chunks,
+            $longestHold,
+        );
+    }
+
+    /**
+     * One line per pass. The chunk count and the longest hold are the two numbers
+     * that tell an operator whether pacing is working: many short chunks is the
+     * healthy shape, and a hold approaching NIGHTOWL_DB_LOCK_TIMEOUT_MS is the
+     * shape that wedged a customer's drain for two hours.
+     */
+    private function reportPass(string $table, int $rows, int $chunks, float $longestHold): void
+    {
+        $this->line(sprintf(
+            '  %s: %d rollup rows in %d chunk(s) (longest lock hold %.2fs).',
+            $table, $rows, $chunks, $longestHold,
+        ));
+    }
+
+    /**
+     * Rows the pass leaves covering its range. Counted once at the end rather
+     * than summed per chunk: a bucket straddling two chunk windows is counted by
+     * BOTH (the second chunk truncates its floor back to the bucket and
+     * recomputes it), so a summed total over-reports — invisibly at one chunk per
+     * calendar span, badly at a hundred paced chunks.
+     */
+    private function countRange($conn, string $table, string $from, string $to): int
+    {
+        return (int) $conn->table($table)
+            ->where('bucket_start', '>=', $from)
+            ->where('bucket_start', '<', $to)
+            ->count();
     }
 
     /**

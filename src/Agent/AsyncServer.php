@@ -89,6 +89,12 @@ final class AsyncServer
         // feature off — the default keeps every existing harness/test
         // byte-identical in behavior. Appended LAST (see above).
         private ?VersionDriftWatcher $driftWatcher = null,
+        // Path of the boot-backfill pending marker, stat'd each diagnosis tick so
+        // an unfinished rollup reconciliation shows up in the health payload
+        // instead of only in the log. Injected rather than resolved here: this
+        // class touches no Laravel helpers, so the standalone harness works
+        // without an app. null = feature off. Appended LAST (see above).
+        private ?string $backfillMarkerPath = null,
     ) {
         $this->expectedTokenHash = $token !== null
             ? substr(hash('xxh128', $token), 0, 7)
@@ -96,6 +102,31 @@ final class AsyncServer
         $this->loop = Loop::get();
         $this->metrics = new MetricsCollector($maxPendingRows, $maxBufferMemory);
         $this->metrics->setDrainWedgeSeconds($drainWedgeSeconds);
+    }
+
+    /**
+     * mtime of the boot-backfill pending marker, or 0.0 when nothing is owed
+     * (marker absent, or the feature not wired). The AGE is what the diagnosis
+     * grades on — a pass that is legitimately slow reads as in-progress, one
+     * nobody is running reads as neglected — so the stamp travels, not a bool.
+     */
+    private function backfillPendingSince(): float
+    {
+        if ($this->backfillMarkerPath === null) {
+            return 0.0;
+        }
+
+        clearstatcache(true, $this->backfillMarkerPath);
+        $mtime = @filemtime($this->backfillMarkerPath);
+
+        // false means gone (the usual case) or present-but-unstattable. Only the
+        // first is "nothing owed"; the second still owes a backfill, so fall back
+        // to "now" and report it as in-progress rather than let it vanish.
+        if ($mtime === false) {
+            return @file_exists($this->backfillMarkerPath) ? microtime(true) : 0.0;
+        }
+
+        return (float) $mtime;
     }
 
     public function listen(string $host, int $port): void
@@ -255,6 +286,12 @@ final class AsyncServer
                 $this->drainWorkerCount,
                 array_intersect_key($this->childForkedAtMonoNs, $this->drainChildPids)
             );
+            // One stat per tick: is the rollup reconciliation an upgrade owes still
+            // outstanding, and since when? clearstatcache() because the detached
+            // backfill deletes this file from ANOTHER process — PHP's cached stat
+            // would otherwise keep the diagnosis alive after it completed.
+            $this->metrics->setBackfillPendingSince($this->backfillPendingSince());
+
             $this->metrics->runDiagnosis($this->backPressure, $pending, $walSize, $rss);
 
             // Dispatch alerts for newly active or resolved diagnoses (rare —
