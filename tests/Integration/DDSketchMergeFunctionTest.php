@@ -115,4 +115,116 @@ final class DDSketchMergeFunctionTest extends TestCase
 
         self::$pdo->exec('DROP TABLE ddsketch_agg_probe');
     }
+
+    /**
+     * 000070 replaced the bytea-state fold with a dense bigint[] state, so the
+     * aggregate accumulates in place instead of re-encoding per input row. The
+     * state carries the occupied span in slots 1264/1265 and finalize() walks
+     * only that — which is where an off-by-one drops the first or last bucket
+     * of a sketch without changing anything else about the output.
+     */
+    public function test_aggregate_over_many_sketches_matches_php_fold(): void
+    {
+        self::$pdo->exec('DROP TABLE IF EXISTS ddsketch_agg_probe');
+        self::$pdo->exec('CREATE TABLE ddsketch_agg_probe (s bytea)');
+        $insert = self::$pdo->prepare('INSERT INTO ddsketch_agg_probe VALUES (:s)');
+
+        // Spans the whole closed index domain, so the min/max slots move in
+        // both directions across the fold rather than only growing upward.
+        $maps = [
+            [Sketch::OVERFLOW_INDEX => 3],
+            [630 => 12, 631 => 1],
+            [Sketch::UNDERFLOW_INDEX => 9],
+            [0 => 200000, 1 => 1],
+            [630 => 4],
+            [], // an empty sketch must not widen the span
+        ];
+
+        $expected = [];
+        foreach ($maps as $m) {
+            $insert->bindValue(':s', Sketch::pack($m), PDO::PARAM_LOB);
+            $insert->execute();
+            $expected = Sketch::mergeCounts($expected, $m);
+        }
+        // ...and a NULL row, which the drain leaves on dispatch-only buckets.
+        self::$pdo->exec('INSERT INTO ddsketch_agg_probe VALUES (NULL)');
+
+        $this->assertSame(
+            bin2hex(Sketch::pack($expected)),
+            bin2hex($this->fetchBytea('SELECT nightowl_ddsketch_agg(s) FROM ddsketch_agg_probe')),
+        );
+
+        self::$pdo->exec('DROP TABLE ddsketch_agg_probe');
+    }
+
+    /**
+     * The aggregate is declared PARALLEL SAFE with a COMBINEFUNC, so a parallel
+     * plan folds per-worker states through nightowl_ddsketch_combine — a path
+     * no serial query ever reaches, and therefore one no other test covers.
+     */
+    public function test_combine_merges_two_partial_states(): void
+    {
+        $left = [Sketch::UNDERFLOW_INDEX => 2, 700 => 5];
+        $right = [700 => 1, Sketch::OVERFLOW_INDEX => 4];
+
+        $stmt = self::$pdo->prepare(<<<'SQL'
+SELECT nightowl_ddsketch_finalize(nightowl_ddsketch_combine(
+    nightowl_ddsketch_accum(NULL::bigint[], :a),
+    nightowl_ddsketch_accum(NULL::bigint[], :b)
+))
+SQL);
+        $stmt->bindValue(':a', Sketch::pack($left), PDO::PARAM_LOB);
+        $stmt->bindValue(':b', Sketch::pack($right), PDO::PARAM_LOB);
+        $stmt->execute();
+
+        $expected = Sketch::mergeCounts($left, $right);
+        ksort($expected);
+
+        $this->assertSame($expected, Sketch::unpack($this->decodeBytea($stmt->fetchColumn())));
+
+        // A worker that saw no rows contributes a NULL state.
+        $this->assertSame(
+            '',
+            $this->fetchBytea('SELECT nightowl_ddsketch_finalize(nightowl_ddsketch_combine(NULL, NULL))'),
+        );
+    }
+
+    /**
+     * The aggregate must actually be the 000070 one. A test DB whose migration
+     * chain stopped at 000057 still answers every assertion above correctly —
+     * just at a cost that cannot serve a wide range inside a statement timeout,
+     * which is the whole reason 000070 exists.
+     */
+    public function test_aggregate_is_the_linear_declaration(): void
+    {
+        $row = self::$pdo->query(<<<'SQL'
+SELECT format_type(a.aggtranstype, NULL) AS state_type,
+       a.aggcombinefn <> 0 AS has_combine,
+       p.proparallel AS parallel
+FROM pg_aggregate a
+JOIN pg_proc p ON p.oid = a.aggfnoid
+WHERE p.proname = 'nightowl_ddsketch_agg'
+SQL)->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame('bigint[]', $row['state_type'], 'aggregate still folds a bytea state (migration 000070 did not run)');
+        $this->assertTrue((bool) $row['has_combine'], 'aggregate has no COMBINEFUNC, so it cannot be parallelised');
+        $this->assertSame('s', $row['parallel']);
+    }
+
+    private function fetchBytea(string $sql): string
+    {
+        return $this->decodeBytea(self::$pdo->query($sql)->fetchColumn());
+    }
+
+    private function decodeBytea(mixed $value): string
+    {
+        if (is_resource($value)) {
+            $value = stream_get_contents($value);
+        }
+        if (is_string($value) && str_starts_with($value, '\x')) {
+            return hex2bin(substr($value, 2));
+        }
+
+        return (string) $value;
+    }
 }

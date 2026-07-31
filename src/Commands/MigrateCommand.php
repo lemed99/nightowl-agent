@@ -17,6 +17,24 @@ class MigrateCommand extends Command
 
     protected $description = 'Create or update the NightOwl tables (idempotent — safe to run on every environment and deploy)';
 
+    /**
+     * How far a rollup base may trail the raw ceiling before a deploy treats it
+     * as STOPPED rather than lagging.
+     *
+     * Deliberately loose. The two sides are measured on different clocks —
+     * `bucket_start` is event time, `created_at` is the drain-insert clock —
+     * so a buffer working through a backlog legitimately widens the gap by the
+     * whole length of that backlog while losing nothing. Two hours clears any
+     * plausible backlog; the failure this catches is unbounded and grows every
+     * minute (a frozen table trails by a day within a day), so nothing real is
+     * missed by refusing to be twitchy.
+     *
+     * Fine-grained detection is not this check's job — the agent's ROLLUP_STALE
+     * diagnosis grades against tier peers within 15 minutes and reports. This
+     * one repairs, and repair costs a raw scan, so it waits for certainty.
+     */
+    private const TAIL_FREEZE_TOLERANCE_SECONDS = 7200;
+
     public function handle(): int
     {
         // History is tracked in the *nightowl* database (--database=nightowl),
@@ -423,43 +441,87 @@ class MigrateCommand extends Command
         return $repaired;
     }
 
-    /**
-     * Empty, or missing history the raw table still holds (its earliest bucket
-     * is younger than the earliest raw row's minute). Normal states never
-     * trigger: a fresh install starts both at the same instant, and raw
-     * pruning (14d) moves the raw floor ABOVE the rollup's (90d) floor.
-     */
     /** The concurrency-rollup twin of baseIsIncomplete (bespoke, no spec). */
     private function concurrencyIsIncomplete($conn): bool
     {
-        $rollupMin = $conn->table('nightowl_request_concurrency_rollups')->min('bucket_start');
-        if ($rollupMin === null) {
-            return true;
-        }
-
-        $rawMin = \NightOwl\Support\StorageV2::rawMinCreatedAt($conn->getPdo(), 'nightowl_requests');
-        if ($rawMin === null) {
-            return false;
-        }
-
-        return \Carbon\Carbon::parse($rawMin)->startOfMinute()
-            ->lessThan(\Carbon\Carbon::parse($rollupMin));
+        return $this->baseIsIncompleteFor(
+            $conn,
+            'nightowl_request_concurrency_rollups',
+            'nightowl_requests',
+        );
     }
 
     private function baseIsIncomplete($conn, \NightOwl\Support\RollupSpec $spec): bool
     {
-        $rollupMin = $conn->table($spec->table)->min('bucket_start');
-        if ($rollupMin === null) {
+        return $this->baseIsIncompleteFor($conn, $spec->table, $spec->source);
+    }
+
+    /**
+     * A minute rollup base is incomplete when it is empty, missing history the
+     * raw table still holds (HEAD), or has stopped advancing while raw kept
+     * arriving (TAIL).
+     *
+     * Head and tail are separate failures and neither implies the other. The
+     * head arm has been here since the tiers shipped: a base whose earliest
+     * bucket is younger than the earliest raw row started late, and normal
+     * states never trigger it — a fresh install starts both at the same
+     * instant, and raw pruning (14d) moves the raw floor ABOVE the rollup's
+     * (90d) floor.
+     *
+     * The tail arm is what the 2026-07-31 Yomoney freeze needed and nothing
+     * had: prune's v1-EOL dropped `nightowl_requests` under a running daemon,
+     * the concurrency recompute named a relation that no longer existed, and
+     * 42P01 stopped that one table dead while every other rollup stayed
+     * current. Nothing noticed for thirteen hours. The head arm could not see
+     * it — the floor was untouched, only the ceiling stopped — and the tier
+     * `call_count` comparison could not either, because when a minute base
+     * freezes its hourly child freezes with it and the two sums still agree.
+     * Both sides stuck at the same instant is indistinguishable from both
+     * sides being correct, unless something looks at raw.
+     *
+     * Repair is the same full raw→minute→hour→day chain either arm already
+     * triggers, so a tail hole heals on the next deploy instead of persisting
+     * for as long as raw retention allows it to be fixed at all.
+     *
+     * The tail arm assumes every raw row reaches a bucket — true today because
+     * every RollupSpec groups on COALESCE(...), so rows with no user, server or
+     * fingerprint land in the '' group rather than vanishing. A spec that
+     * genuinely FILTERED rows would break that: its source ceiling would run
+     * ahead of its rollup ceiling with nothing wrong, and every deploy would
+     * rescan raw. Such a spec needs its own predicate, not this one.
+     */
+    private function baseIsIncompleteFor($conn, string $rollupTable, string $rawSource): bool
+    {
+        $bounds = $conn->table($rollupTable)
+            ->selectRaw('MIN(bucket_start) AS lo, MAX(bucket_start) AS hi')
+            ->first();
+
+        if ($bounds === null || $bounds->lo === null) {
             return true; // empty
         }
 
-        $rawMin = \NightOwl\Support\StorageV2::rawMinCreatedAt($conn->getPdo(), $spec->source);
+        $pdo = $conn->getPdo();
+
+        $rawMin = \NightOwl\Support\StorageV2::rawMinCreatedAt($pdo, $rawSource);
         if ($rawMin === null) {
             return false; // no raw history to be missing
         }
 
-        return \Carbon\Carbon::parse($rawMin)->startOfMinute()
-            ->lessThan(\Carbon\Carbon::parse($rollupMin));
+        if (\Carbon\Carbon::parse($rawMin)->startOfMinute()->lessThan(\Carbon\Carbon::parse($bounds->lo))) {
+            return true; // head: raw predates the earliest bucket
+        }
+
+        $rawMax = \NightOwl\Support\StorageV2::rawMaxCreatedAt($pdo, $rawSource);
+        if ($rawMax === null) {
+            return false;
+        }
+
+        // Read the ROLLUP ceiling first (above) and raw's second: a drain batch
+        // committing between the two reads then only advances the raw side,
+        // which can at most trigger a redundant repair. The reverse order could
+        // hide a real freeze behind a stale raw ceiling.
+        return \Carbon\Carbon::parse($bounds->hi)->addSeconds(self::TAIL_FREEZE_TOLERANCE_SECONDS)
+            ->lessThan(\Carbon\Carbon::parse($rawMax));
     }
 
     /**

@@ -214,6 +214,15 @@ final class MetricsCollector
      */
     private array $rollupRepairDebt = [];
 
+    /**
+     * Rollup tables that stopped advancing while their tier peers kept going
+     * (table => seconds behind the leader), merged across workers. Drives
+     * ROLLUP_STALE. A gauge — it empties once the tables catch up.
+     *
+     * @var array<string,int>
+     */
+    private array $staleRollups = [];
+
     // mtime of the boot-backfill pending marker, 0.0 when nothing is owed.
     // Drives ROLLUP_BACKFILL_PENDING — and its AGE is what separates "running
     // right now" from "nobody ever ran it".
@@ -467,6 +476,7 @@ final class MetricsCollector
         $mostRecentQuarSqlstate = null;
         $mostRecentQuarTable = null;
         $repairDebt = [];
+        $staleRollups = [];
 
         for ($w = 0; $w < $workerCount; $w++) {
             $metricsPath = $workerCount > 1
@@ -544,6 +554,19 @@ final class MetricsCollector
                 }
             }
 
+            // Frozen rollups: same no-sum rule (every worker grades the same
+            // tenant tables), and per table the WORST lag wins. Workers sample
+            // on independent hourly clocks, so at any moment one may hold a
+            // fresher verdict than another; taking the max means a freeze one
+            // worker has already seen is never masked by a peer whose sample
+            // predates it.
+            foreach ((is_array($data['rollup_stale'] ?? null) ? $data['rollup_stale'] : []) as $table => $behind) {
+                if (! is_string($table) || ! is_int($behind)) {
+                    continue;
+                }
+                $staleRollups[$table] = max($staleRollups[$table] ?? 0, $behind);
+            }
+
             $lat = (float) ($data['pg_latency_ms'] ?? 0.0);
             if ($lat > 0) {
                 $latencySum += $lat;
@@ -593,6 +616,8 @@ final class MetricsCollector
         $this->appOpenIssues = $appOpenIssues;
         ksort($repairDebt);
         $this->rollupRepairDebt = $repairDebt;
+        arsort($staleRollups);
+        $this->staleRollups = $staleRollups;
     }
 
     /**
@@ -768,6 +793,29 @@ final class MetricsCollector
                     $earliest,
                 ),
                 'value' => count($tables),
+            ];
+        }
+
+        // ROLLUP_STALE — one or more rollup tables stopped advancing while
+        // their tier peers kept going. Critical, and higher than the other two
+        // rollup diagnoses on purpose: those describe a KNOWN hole with a known
+        // repair command, this one says a table is not being written at all and
+        // nobody knows why. It is also the only failure here whose symptom is a
+        // dashboard OUTAGE rather than wrong numbers — the API's coverage gate
+        // sees the stale bound, abandons the rollup, and sweeps raw, which on a
+        // wide range is the 57014 the rollups exist to prevent.
+        if ($this->staleRollups !== []) {
+            $worst = max($this->staleRollups);
+            $diagnoses[] = [
+                'code' => 'ROLLUP_STALE',
+                'level' => 'critical',
+                'message' => sprintf(
+                    '%d rollup table(s) have stopped being written while the rest kept current: %s.',
+                    count($this->staleRollups),
+                    $this->describeStaleRollups(),
+                ),
+                'recommendation' => 'Wide-range charts backed by these tables will fall back to scanning raw telemetry and can time out. Check the agent log for a repeating "[NightOwl Drain]" maintenance error naming one of them — a dropped or renamed source table, or a permission loss on one relation, aborts that table\'s recompute every tick while every other rollup carries on. Once the cause is fixed, `php artisan nightowl:backfill-rollups` rebuilds the gap.',
+                'value' => $worst,
             ];
         }
 
@@ -1178,6 +1226,36 @@ final class MetricsCollector
      * carries the single --since that repairs everything regardless, so the list is
      * orientation, not instructions.
      */
+    /**
+     * The frozen rollup tables and how far behind each one is, for the
+     * ROLLUP_STALE message. Same 1024-char reasoning as describeRepairDebt():
+     * an over-long `message` 422s the whole health report, taking every other
+     * diagnosis in the payload with it, so the list is capped and the
+     * recommendation stands on its own without it.
+     */
+    private function describeStaleRollups(int $limit = 6): string
+    {
+        $parts = [];
+        foreach ($this->staleRollups as $table => $behind) {
+            if (count($parts) === $limit) {
+                return implode(', ', $parts).sprintf(', and %d more', count($this->staleRollups) - $limit);
+            }
+            $parts[] = sprintf('%s (%s behind)', $table, self::humanizeSeconds($behind));
+        }
+
+        return implode(', ', $parts);
+    }
+
+    /** Coarse "3 days" / "5 hours" / "22 minutes" for diagnosis prose. */
+    private static function humanizeSeconds(int $seconds): string
+    {
+        return match (true) {
+            $seconds >= 172800 => intdiv($seconds, 86400).' days',
+            $seconds >= 7200 => intdiv($seconds, 3600).' hours',
+            default => max(1, intdiv($seconds, 60)).' minutes',
+        };
+    }
+
     private function describeRepairDebt(int $limit = 6): string
     {
         $parts = [];

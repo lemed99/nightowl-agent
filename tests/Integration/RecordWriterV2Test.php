@@ -328,4 +328,46 @@ class RecordWriterV2Test extends TestCase
 
         $this->assertSame(2, $count, 'users_count must union v1 and v2 occurrences');
     }
+
+    /**
+     * Prune's v1-EOL DROPS the v1 raw parent under a RUNNING daemon, and the
+     * concurrency recompute named `nightowl_requests` unconditionally — so from
+     * the minute of the drop every cleanup tick raised 42P01, aborted, and was
+     * swallowed into error_log. The table froze while every other rollup stayed
+     * current; the API's coverage gate then read a stale max(bucket_start),
+     * fell back to its raw sweep, and 14d peak-concurrency charts 57014'd.
+     *
+     * Renamed rather than dropped so the shared test DB survives: the probe the
+     * fix added reads `to_regclass`, which answers NULL either way, and the
+     * children of a renamed partitioned parent stay attached to it.
+     */
+    public function test_concurrency_maintenance_outlives_the_v1_raw_parent(): void
+    {
+        self::$pdo->exec('DELETE FROM nightowl_request_concurrency_rollups');
+
+        $minute = (intdiv(time(), 60) - 10) * 60;
+
+        // Two overlapping requests inside one minute → peak 2 in flight.
+        $this->writer->write([
+            $this->sim->makeRequest(['timestamp' => (float) $minute, 'duration' => 10_000_000]),
+            $this->sim->makeRequest(['timestamp' => (float) ($minute + 2), 'duration' => 4_000_000]),
+        ]);
+
+        self::$pdo->exec('ALTER TABLE nightowl_requests RENAME TO nightowl_requests__eol');
+
+        try {
+            $this->writer->maintainConcurrencyRollup(time());
+        } finally {
+            self::$pdo->exec('ALTER TABLE nightowl_requests__eol RENAME TO nightowl_requests');
+        }
+
+        $row = self::$pdo->query(
+            "SELECT delta_sum, max_prefix FROM nightowl_request_concurrency_rollups
+             WHERE bucket_start = to_timestamp({$minute}) AT TIME ZONE 'UTC'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertNotFalse($row, 'the v2-only fold must still be written after v1 EOL');
+        $this->assertSame(0, (int) $row['delta_sum'], 'both requests start AND end in the minute');
+        $this->assertSame(2, (int) $row['max_prefix'], 'the two requests overlapped');
+    }
 }

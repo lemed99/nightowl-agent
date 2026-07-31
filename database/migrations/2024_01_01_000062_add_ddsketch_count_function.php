@@ -15,10 +15,11 @@ return new class extends Migration
      * The v1 hist_NN drop guard (V1HistogramCleanup::verify) needs it to prove
      * that a row's sketch actually covers the histogram mass it is about to
      * replace. A non-NULL sketch is not evidence of that: nightowl_ddsketch_agg
-     * has INITCOND = '' over a non-strict SFUNC, so a tier bucket whose minute
-     * rows all pre-date raw retention aggregates to an EMPTY sketch, and a
-     * bucket straddling the retention edge aggregates to a PARTIAL one. Both
-     * are non-NULL and both would silently lose their percentiles on drop.
+     * yields an EMPTY sketch rather than NULL over rows it took nothing from, so
+     * a tier bucket whose minute rows all pre-date raw retention aggregates to
+     * an empty sketch, and a bucket straddling the retention edge aggregates to
+     * a PARTIAL one. Both are non-NULL and both would silently lose their
+     * percentiles on drop.
      *
      * Returns NULL on a truncated payload — the guard reads that as "cannot
      * prove coverage" and blocks, rather than the merge function's RAISE,

@@ -1542,6 +1542,14 @@ class RecordWriterTest extends TestCase
      * A hand-list would silently re-create the exact stale-schema flake it was
      * written to fix. Replay is safe because these migrations are all
      * hasTable/hasColumn/IF NOT EXISTS guarded — a no-op for every other table.
+     *
+     * nightowl_ddsketch is matched alongside the table name because 000057
+     * carries a database-global artifact as well as columns: it re-runs
+     * `CREATE OR REPLACE AGGREGATE nightowl_ddsketch_agg(bytea)`, and Postgres
+     * lets that SILENTLY change the state type back to bytea — reverting
+     * 000070's linear aggregate, with no error, for the rest of the process.
+     * 000070 never names the rollup table, so matching on it alone replayed the
+     * regression and skipped the fix.
      */
     private function restoreQueryRollupsSchema(): void
     {
@@ -1549,7 +1557,8 @@ class RecordWriterTest extends TestCase
         sort($files);
 
         foreach ($files as $file) {
-            if (! str_contains((string) file_get_contents($file), 'nightowl_query_rollups')) {
+            $body = (string) file_get_contents($file);
+            if (! str_contains($body, 'nightowl_query_rollups') && ! str_contains($body, 'nightowl_ddsketch')) {
                 continue;
             }
 

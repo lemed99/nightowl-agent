@@ -52,6 +52,19 @@ final class DrainWorker
      */
     private array $rollupRepairDebt = [];
 
+    /**
+     * Rollup tables that have stopped advancing while their tier peers kept
+     * going (table => seconds behind the leader), from the hourly table-stats
+     * pass. Also a gauge, and also NOT summed across workers — every worker
+     * grades the same tenant tables. Kept from the last sample that actually
+     * ran: a skipped or failed collection returns no opinion, and treating that
+     * as "all clear" would clear a real freeze the moment the tenant DB got
+     * slow. See RollupStaleness and TableStatsCollector::collectAndReport().
+     *
+     * @var array<string,int>
+     */
+    private array $rollupStale = [];
+
     private const ISSUE_COUNT_INTERVAL = 60; // seconds
 
     private const PARTITION_CHECK_INTERVAL = 3600; // seconds
@@ -487,7 +500,12 @@ final class DrainWorker
             return $lastTableStats;
         }
 
-        TableStatsCollector::fromConfig()->collectAndReport(time());
+        // null = no sample this interval (disabled, lock lost, DB unreachable).
+        // Keep the last verdict rather than clearing it — see $rollupStale.
+        $stale = TableStatsCollector::fromConfig()->collectAndReport(time());
+        if ($stale !== null) {
+            $this->rollupStale = $stale;
+        }
 
         return time();
     }
@@ -1058,6 +1076,8 @@ final class DrainWorker
             // Gauge (table => earliest bucket owed), NOT summed across workers —
             // every worker reads the same tenant marker. See readDrainMetrics().
             'rollup_repair_debt' => $this->rollupRepairDebt,
+            // Gauge (table => seconds behind its tier), same no-sum rule.
+            'rollup_stale' => $this->rollupStale,
             'updated_at' => microtime(true),
         ], JSON_INVALID_UTF8_SUBSTITUTE);
 

@@ -57,11 +57,12 @@ final class MigrationRunner
         // with its own static state. Probe the NEWEST migration's observable
         // effect — probing an early artifact would skip every migration added
         // since the test DB was first provisioned. Update this probe whenever
-        // a migration is added (high-water 000069 v2 id-sequence re-fence, which
-        // is artifact-less and rides REPLAY_ALWAYS instead of a clause; last
-        // probeable artifact 000068 dict_trace.created_at; before that 000066
-        // dictionaries + 000067 raw v2 family; 000063 concurrency rollup, 000064
-        // mail/notification composites, 000065 cache key_pattern).
+        // a migration is added (high-water 000070 linear ddsketch aggregate;
+        // 000069 v2 id-sequence re-fence is artifact-less and rides
+        // REPLAY_ALWAYS instead of a clause; before that 000068
+        // dict_trace.created_at, 000066 dictionaries + 000067 raw v2 family,
+        // 000063 concurrency rollup, 000064 mail/notification composites,
+        // 000065 cache key_pattern).
         if (Schema::connection('nightowl')->hasTable('nightowl_dict_string')
             && Schema::connection('nightowl')->hasColumn('nightowl_dict_trace', 'created_at')
             && Schema::connection('nightowl')->hasTable('nightowl_requests_v2')
@@ -76,6 +77,15 @@ final class MigrationRunner
             )->present
             && Schema::connection('nightowl')->getConnection()->selectOne(
                 "SELECT to_regprocedure('nightowl_ddsketch_count(bytea)') IS NOT NULL AS present"
+            )->present
+            && Schema::connection('nightowl')->getConnection()->selectOne(
+                // The aggregate's state type, not the existence of accum():
+                // 000057's CREATE OR REPLACE AGGREGATE silently reverts the
+                // state to bytea while leaving 000070's functions in place, so
+                // probing for the function would call that DB migrated.
+                "SELECT (SELECT format_type(a.aggtranstype, NULL) FROM pg_aggregate a
+                         JOIN pg_proc p ON p.oid = a.aggfnoid
+                         WHERE p.proname = 'nightowl_ddsketch_agg') = 'bigint[]' AS present"
             )->present) {
             // Warm DB: the glob/replay loop below never runs, so an
             // artifact-less migration would never execute in CI once the test DB

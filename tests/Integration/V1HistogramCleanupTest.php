@@ -88,8 +88,9 @@ final class V1HistogramCleanupTest extends TestCase
 
     /**
      * The tier backfill's own aggregate over minute rows that all pre-date raw
-     * retention: nightowl_ddsketch_agg has INITCOND = '' over a NULL-skipping
-     * SFUNC, so it yields an EMPTY sketch, not NULL. Such a row still carries
+     * retention: nightowl_ddsketch_agg finalizes an untouched state to an EMPTY
+     * sketch, not NULL (000057 got this from INITCOND = '' over a NULL-skipping
+     * SFUNC; 000070 from a FINALFUNC that packs nothing). Such a row carries
      * its bins, and dropping them would strand it with no percentile source.
      */
     public function test_verify_blocks_on_empty_sketch_from_aggregating_sketchless_rows(): void
@@ -158,6 +159,35 @@ final class V1HistogramCleanupTest extends TestCase
             $offenders = V1HistogramCleanup::verify(self::$pdo, ['nightowl_fake_rollups']);
 
             $this->assertSame(V1HistogramCleanup::MISSING_COUNT_FN, $offenders['nightowl_fake_rollups'] ?? null);
+        } finally {
+            self::$pdo->rollBack();
+        }
+    }
+
+    /**
+     * The bins are the fallback that makes a slow sketch survivable. Dropping
+     * them while the aggregate is still 000057's bytea-state fold leaves wide
+     * ranges with no path that returns inside a statement timeout, and no way
+     * back — so the missing linear aggregate blocks ahead of any row check.
+     */
+    public function test_verify_refuses_while_the_aggregate_is_still_the_bytea_fold(): void
+    {
+        self::$pdo->exec("INSERT INTO nightowl_fake_rollups (group_hash, bucket_start, sketch, hist_00, duration_count)
+            VALUES ('covered', now(), '\\x0103', 3, 3)");
+
+        // Premise: this row is otherwise clear.
+        $this->assertSame([], V1HistogramCleanup::verify(self::$pdo, ['nightowl_fake_rollups']));
+
+        // DDL is transactional here: the rollback restores the shared test DB.
+        self::$pdo->beginTransaction();
+
+        try {
+            self::$pdo->exec('DROP AGGREGATE nightowl_ddsketch_agg(bytea)');
+            self::$pdo->exec('DROP FUNCTION nightowl_ddsketch_accum(bigint[], bytea)');
+
+            $offenders = V1HistogramCleanup::verify(self::$pdo, ['nightowl_fake_rollups']);
+
+            $this->assertSame(V1HistogramCleanup::MISSING_LINEAR_AGG, $offenders['nightowl_fake_rollups'] ?? null);
         } finally {
             self::$pdo->rollBack();
         }

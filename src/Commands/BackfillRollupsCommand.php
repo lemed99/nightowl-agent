@@ -694,7 +694,22 @@ class BackfillRollupsCommand extends Command
                     includeV2: (bool) $conn->getPdo()->query(
                         "SELECT to_regclass('nightowl_requests_v2') IS NOT NULL AS e"
                     )->fetchColumn(),
+                    // Probed alongside v2, for the same reason the drain probes
+                    // it: prune's v1-EOL drops this table, and naming it then
+                    // makes the recompute 42P01 — which would break the repair
+                    // path exactly on the tenants that need repairing, since
+                    // this is what nightowl:migrate's reconciliation runs.
+                    includeV1: (bool) $conn->getPdo()->query(
+                        "SELECT to_regclass('nightowl_requests') IS NOT NULL AS e"
+                    )->fetchColumn(),
                 );
+
+                // Neither family — the DELETE stands and there is nothing to
+                // aggregate back into the window.
+                if ($q === null) {
+                    return;
+                }
+
                 $conn->statement($q['sql'], $q['bindings']);
             });
 

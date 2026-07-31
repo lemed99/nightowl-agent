@@ -54,6 +54,18 @@ final class V1HistogramCleanup
     public const MISSING_COUNT_FN = -3;
 
     /**
+     * verify() marker: the aggregate is still 000057's bytea-state fold
+     * (migration 000070 has not run). Post-drop every percentile at every tier
+     * goes through nightowl_ddsketch_agg with nothing cheaper to fall back to,
+     * and that fold re-decodes its whole accumulated state per input row —
+     * ~6.5ms/row once saturated, which exhausts a 20s statement_timeout at
+     * ~3000 rows. Dropping the bins on top of it trades a slow wide-range chart
+     * for one that cannot return at all, and the bins are unrecoverable past
+     * raw retention.
+     */
+    public const MISSING_LINEAR_AGG = -4;
+
+    /**
      * @param  list<string>|null  $bases  test hook; production uses BASE_TABLES
      * @return list<string> all tables (base + hourly + daily), existing ones only
      */
@@ -82,6 +94,11 @@ final class V1HistogramCleanup
      * its bins hold. Anything that cannot be proven — a missing counting
      * function, an unreadable sketch — blocks.
      *
+     * Coverage is not the only prerequisite: a database still on 000057's
+     * bytea-state aggregate is reported with -4, because after the drop the
+     * sketch is the only percentile source and that fold cannot serve a wide
+     * range inside a statement timeout.
+     *
      * @return array<string, int> table => unreplaced row count (or a marker)
      */
     public static function verify(PDO $conn, ?array $bases = null): array
@@ -92,6 +109,9 @@ final class V1HistogramCleanup
         $denominatorTables = self::tables($conn, $bases ?? self::DENOMINATOR_BASES);
 
         $canCountSamples = self::functionExists($conn, 'nightowl_ddsketch_count(bytea)');
+        // The sketch becomes the ONLY percentile source once the bins go, so
+        // the linear aggregate (000070) is a prerequisite, not an optimisation.
+        $aggIsLinear = self::functionExists($conn, 'nightowl_ddsketch_accum(bigint[], bytea)');
 
         foreach (self::tables($conn, $bases) as $table) {
             if (! self::columnExists($conn, $table, 'sketch')) {
@@ -108,6 +128,11 @@ final class V1HistogramCleanup
             }
             if (! self::columnExists($conn, $table, 'hist_00')) {
                 continue; // already dropped
+            }
+            if (! $aggIsLinear) {
+                $offenders[$table] = self::MISSING_LINEAR_AGG;
+
+                continue;
             }
             // Coverage is unprovable without the counter (migration 000062).
             if (! $canCountSamples) {
@@ -131,7 +156,7 @@ final class V1HistogramCleanup
             $histSum = '('.implode(' + ', $histCols).')';
 
             // A non-NULL sketch is not evidence of coverage: nightowl_ddsketch_agg
-            // carries INITCOND = '' over a NULL-skipping SFUNC, so a tier bucket
+            // finalizes an untouched state to an EMPTY sketch, so a tier bucket
             // whose minute rows all pre-date raw retention aggregates to an EMPTY
             // sketch, and one straddling the retention edge to a PARTIAL sketch.
             // An unreadable sketch counts NULL, which loses to the -1 and blocks.

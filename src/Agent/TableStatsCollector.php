@@ -2,6 +2,8 @@
 
 namespace NightOwl\Agent;
 
+use NightOwl\Support\RollupStaleness;
+
 /**
  * Hourly per-table statistics for the NightOwl platform — the measurement
  * layer that exists so nobody ever has to ask a customer to run SQL against
@@ -78,11 +80,25 @@ final class TableStatsCollector
     /**
      * Collect and report one sample. NEVER throws — runs on the drain's
      * cleanup tick, which must not lose its WAL checkpoint to a stats hiccup.
+     *
+     * Returns the frozen-rollup verdict derived from the same sample (see
+     * RollupStaleness), or null when no sample was taken — a skipped interval,
+     * a lost advisory lock, a failed connect. Null means "no opinion, keep the
+     * last one", never "all clear": treating a failed collection as healthy
+     * would make a tenant whose DB is unreachable look like its rollups are
+     * fine, which is the one moment they are least likely to be.
+     *
+     * This rides the stats pass rather than probing on its own because the
+     * bounds it grades are ALREADY in the sample — one catalog-driven pass, one
+     * connection, one advisory lock, hourly. A second scanner would be 40-odd
+     * extra MAX() probes an hour to recompute numbers this one already has.
+     *
+     * @return array<string, int>|null table => seconds behind its tier's leader
      */
-    public function collectAndReport(int $nowTs): void
+    public function collectAndReport(int $nowTs): ?array
     {
         if (! $this->enabled || $this->token === null || $this->token === '') {
-            return;
+            return null;
         }
 
         try {
@@ -90,7 +106,7 @@ final class TableStatsCollector
         } catch (\Throwable $e) {
             error_log('[NightOwl Agent] table-stats: connect failed (retried next interval): '.$e->getMessage());
 
-            return;
+            return null;
         }
 
         try {
@@ -100,20 +116,25 @@ final class TableStatsCollector
                 "SELECT pg_try_advisory_lock(hashtext('".self::ADVISORY_KEY."'))"
             )->fetchColumn();
             if (! $locked) {
-                return;
+                return null;
             }
 
             $payload = $this->gather($pdo, $nowTs);
         } catch (\Throwable $e) {
             error_log('[NightOwl Agent] table-stats: collection failed (retried next interval): '.$e->getMessage());
 
-            return;
+            return null;
         } finally {
             // Close regardless — short-lived by contract.
             unset($pdo);
         }
 
         $this->post($payload);
+
+        // After the post, not before: the platform copy of the sample is the
+        // forensic record, and a staleness verdict is worth much less without
+        // the numbers behind it. post() never throws.
+        return RollupStaleness::detect($payload['tables']);
     }
 
     /**

@@ -207,6 +207,32 @@ final class StorageV2
         return $min === false || $min === null ? null : (string) $min;
     }
 
+    /**
+     * Raw-history ceiling across both families — the twin of rawMinCreatedAt,
+     * and what tells MigrateCommand a rollup base has STOPPED rather than
+     * merely started late. `created_at` is the drain-insert clock, not event
+     * time, so it only ever runs AHEAD of a bucket derived from event time;
+     * the comparison is therefore one-sided by construction and its tolerance
+     * absorbs the gap (see MigrateCommand::TAIL_FREEZE_TOLERANCE_SECONDS).
+     */
+    public static function rawMaxCreatedAt(PDO $pdo, string $v1Table): ?string
+    {
+        $legs = [];
+        foreach ([$v1Table, self::v2Name($v1Table)] as $table) {
+            $exists = $pdo->query("SELECT to_regclass('{$table}') IS NOT NULL AS e")->fetchColumn();
+            if ($exists) {
+                $legs[] = "SELECT MAX(created_at) AS m FROM {$table}";
+            }
+        }
+        if ($legs === []) {
+            return null;
+        }
+
+        $max = $pdo->query('SELECT MAX(m)::text FROM ('.implode(' UNION ALL ', $legs).') maxes')->fetchColumn();
+
+        return $max === false || $max === null ? null : (string) $max;
+    }
+
     private static function logOnce(string $field, string $reason): void
     {
         if (isset(self::$logged[$field])) {

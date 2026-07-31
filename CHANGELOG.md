@@ -5,6 +5,104 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.1.0] - 2026-07-31
+
+### Fixed
+
+- **A rollup table no longer freezes silently when prune drops its v1 source.**
+  The per-minute request-concurrency recompute named `nightowl_requests`
+  unconditionally. Prune's v1-EOL step DROPs that table under a running daemon
+  once the storage-v2 fence is past retention, after which the recompute raised
+  42P01 — which aborts the whole statement, so the rollup wrote nothing on that
+  tick and every tick after. The only outward trace was one `[NightOwl Drain]`
+  line per minute in a log nobody tails: the table simply stopped advancing
+  while every other rollup stayed current, the API's coverage gate saw the stale
+  bound, abandoned the rollup, swept raw telemetry instead, and 14-day charts
+  hit the tenant's `statement_timeout`. Both raw families are now probed **per
+  tick, never cached** (a stale `true` is the failure mode; a stale `false`
+  costs one slightly narrower scan), the query is built from the arms actually
+  emitted rather than from a flag read twice, and neither-family-present skips
+  the statement instead of issuing one. The same probe was added to
+  `nightowl:backfill-rollups`, which is what `nightowl:migrate` runs to repair
+  this — it would otherwise have 42P01'd on exactly the tenants that needed it.
+  (Yomoney, 2026-07-31: v1 dropped at 00:00 UTC, 11 hours of frozen buckets,
+  four 504s.)
+- **A deploy now repairs a rollup that stopped, not just one that started
+  late.** `nightowl:migrate` has always rebuilt an incomplete rollup without
+  being asked, but every check it made looked at floors: a base was incomplete
+  if raw history predated its earliest bucket, and an hourly/daily tier if its
+  `call_count` sum fell short of its source's. A freeze is invisible to both.
+  The floor never moves — only the ceiling stops — and when a minute base
+  freezes its hourly child freezes with it, so the two sums keep agreeing;
+  both sides stuck at the same instant reads exactly like both sides being
+  correct. The concurrency rollup was the most exposed of all: it sits outside
+  `RollupSpecs::all()` and has no tiers, so the sum comparison never ran for it
+  at all. Completeness now also compares **ceilings** — the newest bucket
+  against the newest raw row — and a base trailing raw by more than two hours
+  takes the same full rebuild the floor arm already triggered. The tolerance is
+  deliberately loose: the two sides are measured on different clocks (bucket
+  starts are event time, `created_at` is the drain-insert clock), so a buffer
+  working through a backlog widens the gap legitimately, while the failure this
+  catches grows without bound and trails by a day within a day. Without this a
+  frozen table stayed frozen across every subsequent deploy, and stayed
+  repairable only for as long as raw retention kept the rows to rebuild from.
+- **Health-alert dispatch no longer blocks the event loop.** Every step of a
+  dispatch round is blocking I/O — a Postgres connect to read the channels, then
+  raw SMTP and raw HTTP sends — and it ran inline on the 10s diagnosis timer, on
+  the assumption that a new diagnosis is rare. It is not: the dispatch fires on
+  transitions, and a struggling agent flaps. One unreachable SMTP or webhook
+  host then held the entire loop for the connect timeout, measured at **30.01
+  seconds** against an unroutable address, during which nothing is ingested,
+  drained, reported, or accepted on the TCP port. The round now runs in a
+  short-lived forked child that closes the inherited listeners and `SIGKILL`s
+  itself when done (no `exit()`, so no destructor can close the parent's SQLite
+  handle and corrupt WAL shared memory), with one round in flight at a time.
+  Same symptom, opposite direction, as the v2.0.1 backfill starvation: an agent
+  at 4% CPU reporting sustained ~480ms loop lag where v1.4.0 reported 2ms.
+- **DDSketch percentile aggregation is linear in its input** (migration
+  000070). `nightowl_ddsketch_agg` was declared with `STYPE = bytea`, so
+  Postgres copied the accumulated sketch into the transition function on every
+  input row, where it was re-decoded into a jsonb map and re-packed — per-row
+  cost growing with the state rather than staying flat. Measured at ~6.5ms per
+  row once saturated, which exhausts a 20s `statement_timeout` at ~3000 rows, so
+  a 14-day per-route read (16,800 rollup rows) never returned. The state is now
+  a dense `bigint[]` over the closed index domain, decoding one payload per call
+  and packing once per group. On a 200-route × 336-hour corpus, a 14d 50-group
+  percentile read goes from 103s to 0.48s on narrow sketches and from
+  not-finishing-in-120s to 2.0s on wide ones; `nightowl_ddsketch_merge` keeps its
+  signature for the drain's `ON CONFLICT` upsert and is 4.85× faster. Output is
+  byte-identical to the old fold across 1,022 real groups and the boundary cases.
+  One shape is slower — a group holding a single narrow row pays the array setup
+  it never amortises — and is left alone, because it was never the shape in
+  trouble.
+
+### Added
+
+- **`ROLLUP_STALE` diagnosis.** A rollup table that stops being written while
+  its peers keep current now reaches the health payload and the alert channels,
+  instead of only `error_log`. Staleness is graded **peer-relative within a
+  tier** — a table's newest bucket against the newest bucket any table of the
+  same tier reached — which self-calibrates: it needs no assumption about which
+  telemetry types an app emits, and a daily rollup is never judged against a
+  minute one. An empty table is not stale (that is a backfill that has not run,
+  which `ROLLUP_BACKFILL_PENDING` owns), and a wholesale freeze reports nothing
+  here because everything froze together and `DRAIN_STOPPED`/`DRAIN_WEDGED`
+  already say something more useful. The verdict rides the existing hourly
+  `TableStatsCollector` pass, which already reads each rollup's bucket bounds
+  under an advisory lock, so it costs no additional probes.
+
+### Changed
+
+- **`nightowl:drop-v1-histograms` is runnable again, behind the linear
+  aggregate.** v2.0.2 made it refuse outright, because dropping the bins leaves
+  the sketch as the only percentile source and the quadratic fold could not
+  serve a wide range. With migration 000070 that premise is gone. The command
+  now blocks on a new `MISSING_LINEAR_AGG` verdict from `V1HistogramCleanup`
+  rather than on principle: a database still carrying 000057's bytea-state
+  aggregate is told to run `nightowl:migrate` first. The irreversibility warning
+  stays — the bins can only be rebuilt from raw telemetry, which is gone past
+  retention.
+
 ## [2.0.2] - 2026-07-31
 
 ### Changed

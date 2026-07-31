@@ -27,6 +27,8 @@ final class AsyncServer
     private ?string $expectedTokenHash;
     /** @var int[] Drain worker PIDs indexed by worker ID */
     private array $drainChildPids = [];
+    /** In-flight health-alert dispatch child, at most one — see dispatchHealthAlerts(). */
+    private ?int $alertChildPid = null;
     private bool $shuttingDown = false;
     /** @var float[] Last spawn time per worker ID */
     private array $lastChildSpawns = [];
@@ -294,15 +296,13 @@ final class AsyncServer
 
             $this->metrics->runDiagnosis($this->backPressure, $pending, $walSize, $rss);
 
-            // Dispatch alerts for newly active or resolved diagnoses (rare —
-            // only fires on genuine state transitions, not every tick)
+            // Dispatch alerts for newly active or resolved diagnoses. Off the
+            // event loop — see dispatchHealthAlerts().
             if ($this->healthAlertNotifier !== null) {
-                try {
-                    $this->healthAlertNotifier->dispatch($this->metrics->getNewlyActiveDiagnoses());
-                    $this->healthAlertNotifier->dispatchRecovered($this->metrics->getNewlyResolvedDiagnoses());
-                } catch (\Throwable $e) {
-                    error_log("[NightOwl Agent] Health alert dispatch failed: {$e->getMessage()}");
-                }
+                $this->dispatchHealthAlerts(
+                    $this->metrics->getNewlyActiveDiagnoses(),
+                    $this->metrics->getNewlyResolvedDiagnoses(),
+                );
             }
         });
 
@@ -396,6 +396,115 @@ final class AsyncServer
         }
 
         $this->loop->run();
+    }
+
+    /**
+     * Dispatch health alerts in a short-lived forked child, never on the loop.
+     *
+     * Every step of a dispatch round is BLOCKING network I/O: loadChannels()
+     * issues a Postgres query, and the sends are raw SMTP and HTTP with their
+     * own socket timeouts, the whole round bounded only by
+     * HealthAlertNotifier::MAX_DISPATCH_SECONDS (30s). Run inline off the 10s
+     * diagnosis timer — as this did — that is up to 30 seconds during which the
+     * agent accepts no telemetry.
+     *
+     * It degrades exactly when it must not. The dispatch fires on diagnosis
+     * TRANSITIONS, so a struggling agent flaps and dispatches constantly, and
+     * the Postgres it must query to find its channels is the same slow one that
+     * is causing the diagnoses. Worse, it is self-reinforcing: the blocking
+     * raises event-loop lag, lag raises LOOP_LAG_CRITICAL, and that transition
+     * dispatches again. (Yomoney, 2026-07-29 onward: event-loop lag went from a
+     * 2ms median on v1.4.0 to ~480ms and never came back, on a box sitting at
+     * 4% CPU with 2-5s Postgres latency and diagnoses flapping every 30s.)
+     *
+     * The child is SIGKILLed rather than exited. PHP's exit() runs destructors,
+     * which would call sqlite3_close() on the buffer handle it inherited and
+     * corrupt the WAL shared memory (sqlite.org/howtocorrupt.html §2.7 — the
+     * same hazard forkDrainWorker() avoids by nulling the buffer first). SIGKILL
+     * runs no destructors at all, so the inherited handle is never touched,
+     * which is why this does NOT have to churn the parent's buffer connection on
+     * every alert. The notifier's own Postgres handle is created lazily and the
+     * parent no longer dispatches, so each child opens its own and takes the
+     * abrupt close with it.
+     *
+     * One round at a time: under flapping these would otherwise pile up. A
+     * skipped round is not a lost alert — the diagnosis stays active and the
+     * next transition re-reports it.
+     *
+     * @param  array<int, array<string, mixed>>  $active
+     * @param  array<int, array<string, mixed>>  $resolved
+     */
+    private function dispatchHealthAlerts(array $active, array $resolved): void
+    {
+        if ($active === [] && $resolved === []) {
+            return;
+        }
+
+        // No fork available (sync driver, non-POSIX host): inline is all there
+        // is. Keeps the pre-existing behaviour rather than dropping the alert.
+        if (! function_exists('pcntl_fork') || ! function_exists('posix_kill')) {
+            $this->dispatchHealthAlertsInline($active, $resolved);
+
+            return;
+        }
+
+        if ($this->alertChildPid !== null) {
+            // >0 reaped here, -1 already reaped by the SIGCHLD handler; 0 means
+            // it is still running and this round is skipped.
+            if (pcntl_waitpid($this->alertChildPid, $status, WNOHANG) === 0) {
+                error_log('[NightOwl Agent] Health alert dispatch still in flight, skipping this round.');
+
+                return;
+            }
+
+            $this->alertChildPid = null;
+        }
+
+        $pid = pcntl_fork();
+
+        if ($pid === -1) {
+            error_log('[NightOwl Agent] Could not fork for health alert dispatch — sending inline.');
+            $this->dispatchHealthAlertsInline($active, $resolved);
+
+            return;
+        }
+
+        if ($pid === 0) {
+            // === Child ===
+            // The SIGKILL is in a finally, not trailing the body: anything that
+            // escapes here would reach PHP's fatal handler, which shuts the
+            // process down through the destructors this whole approach exists to
+            // avoid. The child never runs the loop, so it is not stopped — only
+            // the listeners are dropped, so a slow dispatch cannot hold the
+            // ingest port open.
+            try {
+                $this->server?->close();
+                $this->udpSocket?->close();
+                $this->healthServer?->close();
+
+                $this->dispatchHealthAlertsInline($active, $resolved);
+            } catch (\Throwable $e) {
+                error_log("[NightOwl Agent] Health alert dispatch child failed: {$e->getMessage()}");
+            } finally {
+                posix_kill(posix_getpid(), SIGKILL);
+            }
+        }
+
+        $this->alertChildPid = $pid;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $active
+     * @param  array<int, array<string, mixed>>  $resolved
+     */
+    private function dispatchHealthAlertsInline(array $active, array $resolved): void
+    {
+        try {
+            $this->healthAlertNotifier?->dispatch($active);
+            $this->healthAlertNotifier?->dispatchRecovered($resolved);
+        } catch (\Throwable $e) {
+            error_log("[NightOwl Agent] Health alert dispatch failed: {$e->getMessage()}");
+        }
     }
 
     private function forkDrainWorker(int $workerId = 0): void

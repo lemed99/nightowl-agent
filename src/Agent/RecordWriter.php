@@ -2406,7 +2406,25 @@ final class RecordWriter
                 $bucketLow,
                 $bucketHigh,
                 includeV2: $this->v2Enabled(),
+                // Probed EVERY tick, never cached: prune's v1-EOL drops this
+                // table under the running daemon, and a stale `true` names a
+                // relation that no longer exists — 42P01 aborts the whole
+                // recompute, so the table silently stops advancing while every
+                // other rollup stays current. A stale `false` is merely a
+                // slightly narrower scan for one tick.
+                includeV1: (bool) $pdo->query(
+                    "SELECT to_regclass('public.nightowl_requests') IS NOT NULL"
+                )->fetchColumn(),
             );
+
+            // Neither family present — nothing to aggregate. The DELETE above
+            // still stands: an empty window is the correct answer.
+            if ($q === null) {
+                $pdo->commit();
+
+                return;
+            }
+
             $pdo->prepare($q['sql'])->execute($q['bindings']);
 
             $pdo->commit();

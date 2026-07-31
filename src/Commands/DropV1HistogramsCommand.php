@@ -27,19 +27,17 @@ class DropV1HistogramsCommand extends Command
             return self::FAILURE;
         }
 
-        $this->error('DO NOT RUN THIS YET — nightowl_ddsketch_agg is too slow to be the only percentile source.');
-        $this->warn('The bins are what every percentile read falls back to. Once they are gone, every percentile at every');
-        $this->warn('tier goes through nightowl_ddsketch_agg, whose STYPE is bytea: each input row copies, re-decodes and');
-        $this->warn('re-encodes the whole accumulated sketch state, so cost per row grows with the state rather than');
-        $this->warn('staying flat. Measured on a 14d hourly profile (~380 distinct indices): ~6.5ms per input row — 500');
-        $this->warn('rows 3.2s, 4000 rows 26.3s. A 20s statement_timeout is exhausted around 3000 rows, and a 14d');
-        $this->warn('per-route read (16,800 rows) never returns at all. Wide ranges are NOT unaffected — they are the');
-        $this->warn('case that breaks, and after the drop there is no cheaper path left to degrade to.');
-        $this->newLine();
-        $this->warn('This drops 39 columns from every duration-bearing rollup table (all tiers). Requires:');
+        $this->warn('This drops 39 columns from every duration-bearing rollup table (all tiers). It is irreversible:');
+        $this->warn('the bins can only be restored by re-running the rollups from raw telemetry, which is gone past');
+        $this->warn('retention. After it, every percentile at every tier is served by nightowl_ddsketch_agg alone —');
+        $this->warn('there is no cheaper path left to degrade to, so a wide-range chart that used to be slow becomes');
+        $this->warn('a chart that does not return. Requires:');
         $this->warn('  1. An agent restart AFTER this command (running drains cache the column layout).');
         $this->warn('  2. A NightOwl API release with histogram-conditional reads — do not run against an API older than the one shipping this command.');
-        $this->warn('  3. An agent release whose merge/aggregate is linear in its input. Until that ships, the disk win is not worth an unrecoverable regression: the bins can only be restored by re-running the rollups from raw telemetry, which is gone past retention.');
+        $this->warn('  3. Migration 000070, the linear aggregate (verify() blocks without it). On the 200-route x 336-hour');
+        $this->warn('     profile this command was written against, a 14d 50-group percentile read goes from 103s to 0.5s on');
+        $this->warn('     narrow sketches and from not returning inside 120s to 2s on wide ones; a sketch-only read path is');
+        $this->warn('     only survivable with it.');
 
         if (! $this->option('force') && ! $this->confirm('Proceed?')) {
             return self::FAILURE;
@@ -57,10 +55,11 @@ class DropV1HistogramsCommand extends Command
 
     /**
      * Operator-facing explanation for each verify() blocker. MISSING_COUNT_FN
-     * is a database-global condition (migration 000062's coverage function is
-     * absent for the whole DB) that verify() surfaces on every hist-bearing
-     * table, so its remedy — nightowl:migrate — is a property of the database,
-     * not of any single table.
+     * and MISSING_LINEAR_AGG are database-global conditions (migration 000062's
+     * coverage function / 000070's linear aggregate are absent for the whole
+     * DB) that verify() surfaces on every hist-bearing table, so their remedy —
+     * nightowl:migrate — is a property of the database, not of any single
+     * table.
      *
      * @param  array<string, int>  $offenders  from V1HistogramCleanup::verify
      * @return list<string>
@@ -69,12 +68,16 @@ class DropV1HistogramsCommand extends Command
     {
         $lines = [];
 
+        if (in_array(V1HistogramCleanup::MISSING_LINEAR_AGG, $offenders, true)) {
+            $lines[] = '  nightowl_ddsketch_agg is still the bytea-state fold for this database (migration 000070) — it cannot serve a wide range as the only percentile source. Run nightowl:migrate first, then re-run this command.';
+        }
+
         if (in_array(V1HistogramCleanup::MISSING_COUNT_FN, $offenders, true)) {
             $lines[] = '  nightowl_ddsketch_count() is missing for this database (migration 000062) — run nightowl:migrate first, then re-run this command.';
         }
 
         foreach ($offenders as $table => $count) {
-            if ($count === V1HistogramCleanup::MISSING_COUNT_FN) {
+            if ($count === V1HistogramCleanup::MISSING_COUNT_FN || $count === V1HistogramCleanup::MISSING_LINEAR_AGG) {
                 continue;
             }
 

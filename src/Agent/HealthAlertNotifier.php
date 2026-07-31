@@ -9,9 +9,15 @@ use PDO;
  * threshold (e.g., DRAIN_STOPPED, PG_LATENCY_CRITICAL).
  *
  * Reads alert channels from nightowl_alert_channels (cached), dispatches via
- * raw HTTP (Slack/Discord/Webhook) or raw SMTP (Email). Runs in the parent
- * process on the 10s diagnosis timer — uses blocking I/O but only fires when
- * a genuinely new diagnosis appears (rare).
+ * raw HTTP (Slack/Discord/Webhook) or raw SMTP (Email).
+ *
+ * EVERY step of a round is blocking I/O — loadChannels() opens a Postgres
+ * connection, the sends are raw SMTP and HTTP — bounded only by
+ * MAX_DISPATCH_SECONDS below. This used to run inline on the 10s diagnosis
+ * timer, on the assumption that a new diagnosis is rare; it is not, because the
+ * dispatch fires on TRANSITIONS and a struggling agent flaps. AsyncServer now
+ * calls this from a short-lived forked child (see dispatchHealthAlerts) and
+ * NOTHING here may be moved back onto the loop.
  */
 final class HealthAlertNotifier
 {
