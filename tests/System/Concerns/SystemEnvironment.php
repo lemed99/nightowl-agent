@@ -82,4 +82,93 @@ final class SystemEnvironment
 
         Assert::markTestSkipped($reason);
     }
+
+    /**
+     * Wait for the harness subprocess to accept TCP, and say WHY when it does not.
+     *
+     * Returns null once the port answers, otherwise a reason string for
+     * agentUnavailable(). Three things the four per-class copies this replaces
+     * got wrong — none of them caught yet, which is the point: each one turns a
+     * specific failure into the same uninformative "did not start within Ns".
+     *
+     *  - A dead subprocess was waited out to the full deadline and then reported
+     *    as a timeout, which reads as slow. proc_get_status() ends the wait the
+     *    moment it exits and reports the exit code, so a fatal is never dressed
+     *    up as slowness.
+     *  - stdout was read ONCE, after the deadline. A pipe buffer is finite
+     *    (64KB on Linux): a subprocess that fills it blocks in fwrite() and
+     *    never reaches listen(), i.e. the diagnostic could cause the failure it
+     *    reports. Drain every iteration.
+     *  - The deadline was 5s, which is not a startup budget but a stopwatch on
+     *    MigrationRunner: a harness whose warm-schema probe misses builds 69
+     *    migrations before it binds, and nothing says a CI disk does that in
+     *    five seconds. The ceiling is generous now precisely BECAUSE exit
+     *    detection is what ends the wait early — a genuinely broken agent still
+     *    fails in the time it takes to die, not in the full timeout.
+     */
+    public static function awaitAgentPort(
+        mixed $process,
+        mixed $stdout,
+        string $host,
+        int $port,
+        float $timeout,
+    ): ?string {
+        $started = microtime(true);
+        $deadline = $started + $timeout;
+        $output = '';
+
+        $pump = static function () use ($stdout, &$output): void {
+            if (is_resource($stdout)) {
+                $output .= (string) stream_get_contents($stdout);
+            }
+        };
+
+        while (microtime(true) < $deadline) {
+            $pump();
+
+            $sock = @stream_socket_client('tcp://'.$host.':'.$port, $errno, $errstr, 0.5);
+            if ($sock) {
+                fclose($sock);
+
+                return null;
+            }
+
+            // Only after the connect attempt: a process that bound the port and
+            // exited in the same tick should still be reported as bound.
+            $status = proc_get_status($process);
+            if ($status['running'] === false) {
+                $pump();
+
+                return sprintf(
+                    'the agent exited (code %s) after %.1fs without binding %s:%d. Output: %s',
+                    var_export($status['exitcode'], true),
+                    microtime(true) - $started,
+                    $host,
+                    $port,
+                    self::describeOutput($output),
+                );
+            }
+
+            usleep(100_000);
+        }
+
+        $pump();
+
+        return sprintf(
+            'the agent was still running but had not bound %s:%d after %.0fs — its boot is either slower '
+            .'than the budget (a cold MigrationRunner replay) or blocked (a lock held by another session). '
+            .'Output: %s',
+            $host,
+            $port,
+            $timeout,
+            self::describeOutput($output),
+        );
+    }
+
+    private static function describeOutput(string $output): string
+    {
+        $output = trim($output);
+
+        return $output === '' ? '(nothing on stdout/stderr)' : $output;
+    }
 }

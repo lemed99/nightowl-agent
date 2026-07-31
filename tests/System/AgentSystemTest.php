@@ -49,8 +49,13 @@ class AgentSystemTest extends TestCase
     /** Maximum seconds to wait for drain to flush data to PG */
     private const DRAIN_TIMEOUT = 15;
 
-    /** Maximum seconds to wait for agent process to start */
-    private const STARTUP_TIMEOUT = 5;
+    /**
+     * Maximum seconds to wait for the agent process to bind its port. Sized for
+     * a harness that has to build the whole schema before it listens, not for a
+     * warm one — a dead subprocess ends the wait immediately (awaitAgentPort),
+     * so the only thing a generous ceiling buys is a slow CI disk.
+     */
+    private const STARTUP_TIMEOUT = 60;
 
     private static ?PDO $pdo = null;
 
@@ -170,28 +175,17 @@ class AgentSystemTest extends TestCase
         // Non-blocking reads on stdout
         stream_set_blocking(self::$agentPipes[1], false);
 
-        // Wait for the agent to be ready (accepts TCP connections)
-        $deadline = microtime(true) + self::STARTUP_TIMEOUT;
-        $ready = false;
+        $reason = SystemEnvironment::awaitAgentPort(
+            self::$agentProcess,
+            self::$agentPipes[1],
+            self::AGENT_HOST,
+            self::AGENT_PORT,
+            self::STARTUP_TIMEOUT,
+        );
 
-        while (microtime(true) < $deadline) {
-            $sock = @stream_socket_client(
-                'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
-                $errno, $errstr, 0.5,
-            );
-            if ($sock) {
-                fclose($sock);
-                $ready = true;
-                break;
-            }
-            usleep(100_000); // 100ms
-        }
-
-        if (! $ready) {
-            // Read any output for diagnostics
-            $output = stream_get_contents(self::$agentPipes[1]);
+        if ($reason !== null) {
             self::stopAgent();
-            SystemEnvironment::agentUnavailable('Agent did not start within '.self::STARTUP_TIMEOUT."s. Output: {$output}");
+            SystemEnvironment::agentUnavailable($reason);
         }
     }
 

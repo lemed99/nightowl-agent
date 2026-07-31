@@ -3,6 +3,7 @@
 namespace NightOwl\Tests\System;
 
 use NightOwl\Simulator\NightwatchSimulator;
+use NightOwl\Tests\Integration\MigrationRunner;
 use NightOwl\Tests\System\Concerns\ReadsRawFamily;
 use NightOwl\Tests\System\Concerns\SystemEnvironment;
 use PDO;
@@ -62,7 +63,8 @@ class AgentPgOutageSystemTest extends TestCase
 
     private const AGENT_PORT = 2413;
 
-    private const STARTUP_TIMEOUT = 5;
+    /** Ceiling only — awaitAgentPort ends the wait the moment the harness dies. */
+    private const STARTUP_TIMEOUT = 60;
 
     private const PG_RECOVERY_TIMEOUT = 30;
 
@@ -85,7 +87,31 @@ class AgentPgOutageSystemTest extends TestCase
     // actually caught transactions rather than trusting this number.
     private const KILL_WINDOW_SECONDS = 8;
 
+    /**
+     * How long ingest may keep refusing after the drain has caught up.
+     *
+     * Three back-pressure monitor ticks (5s each). Generous on purpose: the point
+     * of the wait is to prove the door reopens, and one tick of slack would make
+     * the test flaky again on a loaded runner. A drain that is actually wedged
+     * never gets here — waitForDrainCatchup fails first.
+     */
+    private const RECOVERY_ACCEPT_TIMEOUT = 15.0;
+
     private static string $containerName;
+
+    /**
+     * Did THIS class stop the container? Only the outage leg ever does, and only
+     * that leg may restart it.
+     *
+     * The teardown used to restart the container whenever Docker was present and
+     * the container was not running — which on CI means every run: the runner has
+     * a docker CLI, Postgres arrives as a service container, and nothing named
+     * `nightowl-test-pg` has ever existed there. `docker start` on a container
+     * that was never created is not a recoverable "it's already up", it is
+     * `No such container`, and the class errored out at teardown on both storage
+     * legs. "Not running" cannot stand in for "we stopped it".
+     */
+    private static bool $containerStopped = false;
 
     private static string $dbHost;
 
@@ -134,10 +160,20 @@ class AgentPgOutageSystemTest extends TestCase
             SystemEnvironment::postgresUnavailable($e);
         }
 
-        // Leftover tables from a prior run break MigrationRunner — it uses
-        // Schema::create not createIfNotExists. Drop the agent's tables so
-        // the harness subprocess can migrate from a clean slate.
-        self::dropAgentTables();
+        // Clean slate, built HERE rather than left for the harness subprocess.
+        // Dropping the tables and letting the subprocess re-migrate puts a
+        // 69-migration schema build inside the window the test spends waiting
+        // for a port to open — and every later System class inherits whatever
+        // state that leaves. rebuild() does the same drop-and-replay in-process,
+        // where nothing is racing a stopwatch, and leaves MigrationRunner's
+        // warm-DB probe satisfied so each harness binds immediately.
+        MigrationRunner::rebuild(
+            self::$dbHost,
+            self::$dbPort,
+            self::$dbDatabase,
+            self::$dbUsername,
+            self::$dbPassword,
+        );
 
         self::startAgent();
     }
@@ -173,18 +209,25 @@ class AgentPgOutageSystemTest extends TestCase
 
     public static function tearDownAfterClass(): void
     {
-        // Make sure pg is back up no matter what the test left behind. Only the
-        // outage leg ever stops it, and that leg only runs when Docker is present —
-        // so probe Docker first rather than shelling out on a box without it.
-        if (isset(self::$containerName)
-            && self::dockerAvailable()
-            && self::containerRunning(self::$containerName) === false) {
-            self::dockerExec('start', self::$containerName);
-            self::waitForPg(self::PG_RECOVERY_TIMEOUT);
+        // Make sure pg is back up no matter what the test left behind — but only
+        // if this class is what took it down. See $containerStopped: a container
+        // that is "not running" because it does not exist is not ours to start.
+        //
+        // Wrapped in try/finally because dockerExec throws, and that exception used
+        // to skip stopAgent() entirely — the harness subprocess outlived the class
+        // holding port 2413, which is how one teardown error turns into a hung run.
+        try {
+            if (self::$containerStopped
+                && isset(self::$containerName)
+                && self::dockerAvailable()
+                && self::containerRunning(self::$containerName) === false) {
+                self::dockerExec('start', self::$containerName);
+                self::waitForPg(self::PG_RECOVERY_TIMEOUT);
+            }
+        } finally {
+            self::stopAgent();
+            self::$pdo = null;
         }
-
-        self::stopAgent();
-        self::$pdo = null;
     }
 
     // ─── The chaos run ─────────────────────────────────────────
@@ -281,18 +324,7 @@ class AgentPgOutageSystemTest extends TestCase
 
         // 6. Verify ingest is healthy again — back-pressure should lift.
         $traceB = self::uuid();
-        $recoveryResp = null;
-        $deadline = microtime(true) + 10;
-        while (microtime(true) < $deadline) {
-            $recoveryResp = $this->sim->send([
-                $this->sim->makeRequest(['trace_id' => $traceB, 'method' => 'GET', 'status_code' => 200]),
-            ]);
-            if ($recoveryResp === '2:OK') {
-                break;
-            }
-            usleep(500_000);
-        }
-        $this->assertSame('2:OK', $recoveryResp, 'agent should accept ingest again after recovery');
+        $this->sendUntilAccepted($traceB, self::RECOVERY_ACCEPT_TIMEOUT);
         $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $traceB), 1);
 
         // 7. Verify the checkpoint path actually ran. With CHECKPOINT_INTERVAL_SECONDS=3
@@ -426,10 +458,19 @@ class AgentPgOutageSystemTest extends TestCase
         );
 
         // 5. And the pipeline is genuinely alive again, not merely idle.
+        //
+        // Retried rather than asserted outright, because catch-up and back-pressure
+        // run off different clocks: waitForDrainCatchup returns the instant the
+        // buffer reads zero, while $backPressure is only re-evaluated by a 5s
+        // periodic monitor (AsyncServer::BACK_PRESSURE_CHECK_INTERVAL). The kill
+        // window does latch it — the agent logs "Back-pressure ON" during this
+        // test — which leaves a gap of up to one tick where the buffer is empty
+        // and the door is still shut. A single send into that gap is what
+        // returned 5:ERROR and failed both CI legs; the same one-sample assertion
+        // would equally fail on a transient SQLite-busy from this class's very
+        // aggressive TRUNCATE checkpoint cadence. Retrying covers both.
         $after = self::uuid();
-        $this->assertSame('2:OK', $this->sim->send([
-            $this->sim->makeRequest(['trace_id' => $after, 'method' => 'GET', 'status_code' => 200]),
-        ]));
+        $this->sendUntilAccepted($after, self::RECOVERY_ACCEPT_TIMEOUT);
         $this->waitForDrain('nightowl_requests', self::traceEq('nightowl_requests', $after), 1);
 
         // Rows accepted before the kills started are already in; the assertion that
@@ -464,6 +505,42 @@ class AgentPgOutageSystemTest extends TestCase
         $stmt->execute(['db' => self::$dbDatabase]);
 
         return count(array_filter($stmt->fetchAll(PDO::FETCH_COLUMN)));
+    }
+
+    /**
+     * Send one request until the agent accepts it, and say why if it never does.
+     *
+     * Back-pressure is a latch, not a per-payload verdict: it flips only on the
+     * 5s monitor tick, so "the buffer is empty" and "ingest is open" become true
+     * at different moments. Every post-recovery liveness check therefore has to
+     * wait out a tick rather than sample once.
+     */
+    private function sendUntilAccepted(string $trace, float $timeout): void
+    {
+        $deadline = microtime(true) + $timeout;
+        $last = null;
+
+        while (microtime(true) < $deadline) {
+            $last = $this->sim->send([
+                $this->sim->makeRequest(['trace_id' => $trace, 'method' => 'GET', 'status_code' => 200]),
+            ]);
+
+            if ($last === '2:OK') {
+                return;
+            }
+
+            usleep(500_000);
+        }
+
+        $this->fail(sprintf(
+            'agent still refusing ingest %.0fs after the drain caught up (last response: %s). '
+            .'That is three back-pressure ticks with an empty buffer — read the log below for '
+            .'"Back-pressure ON" (never lifted) or "SQLite buffer error" (the append itself failed). '
+            .'Agent output: %s',
+            $timeout,
+            var_export($last, true),
+            $this->pumpAgentOutput(),
+        ));
     }
 
     /**
@@ -509,6 +586,14 @@ class AgentPgOutageSystemTest extends TestCase
         exec($cmd, $out, $rc);
         if ($rc !== 0) {
             throw new \RuntimeException("docker {$verb} {$name} failed: ".implode("\n", $out));
+        }
+
+        // Bookkeeping lives here rather than at the call sites so the teardown's
+        // "did we stop it?" answer cannot drift from what actually ran.
+        if ($verb === 'stop') {
+            self::$containerStopped = true;
+        } elseif ($verb === 'start') {
+            self::$containerStopped = false;
         }
     }
 
@@ -579,21 +664,17 @@ class AgentPgOutageSystemTest extends TestCase
 
         stream_set_blocking(self::$agentPipes[1], false);
 
-        $deadline = microtime(true) + self::STARTUP_TIMEOUT;
-        $ready = false;
-        while (microtime(true) < $deadline) {
-            $sock = @stream_socket_client('tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT, $errno, $errstr, 0.5);
-            if ($sock) {
-                fclose($sock);
-                $ready = true;
-                break;
-            }
-            usleep(100_000);
-        }
-        if (! $ready) {
-            $output = stream_get_contents(self::$agentPipes[1]);
+        $reason = SystemEnvironment::awaitAgentPort(
+            self::$agentProcess,
+            self::$agentPipes[1],
+            self::AGENT_HOST,
+            self::AGENT_PORT,
+            self::STARTUP_TIMEOUT,
+        );
+
+        if ($reason !== null) {
             self::stopAgent();
-            SystemEnvironment::agentUnavailable('agent did not start: '.$output);
+            SystemEnvironment::agentUnavailable($reason);
         }
     }
 
@@ -635,20 +716,6 @@ class AgentPgOutageSystemTest extends TestCase
                 @unlink($f);
             }
         }
-    }
-
-    private static function dropAgentTables(): void
-    {
-        $rows = self::$pdo->query(
-            "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'nightowl_%'"
-        )->fetchAll(PDO::FETCH_COLUMN);
-
-        foreach ($rows as $table) {
-            self::$pdo->exec("DROP TABLE IF EXISTS \"{$table}\" CASCADE");
-        }
-
-        // Also drop the migrations table so MigrationRunner starts clean.
-        self::$pdo->exec('DROP TABLE IF EXISTS "migrations" CASCADE');
     }
 
     protected static function pdo(): PDO

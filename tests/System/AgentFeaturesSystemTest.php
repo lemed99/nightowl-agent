@@ -33,7 +33,8 @@ class AgentFeaturesSystemTest extends TestCase
 
     private const DRAIN_TIMEOUT = 15;
 
-    private const STARTUP_TIMEOUT = 5;
+    /** Ceiling only — awaitAgentPort ends the wait the moment the harness dies. */
+    private const STARTUP_TIMEOUT = 60;
 
     private static ?PDO $pdo = null;
 
@@ -152,25 +153,17 @@ class AgentFeaturesSystemTest extends TestCase
 
         stream_set_blocking(self::$agentPipes[1], false);
 
-        $deadline = microtime(true) + self::STARTUP_TIMEOUT;
-        $ready = false;
-        while (microtime(true) < $deadline) {
-            $sock = @stream_socket_client(
-                'tcp://'.self::AGENT_HOST.':'.self::AGENT_PORT,
-                $errno, $errstr, 0.5,
-            );
-            if ($sock) {
-                fclose($sock);
-                $ready = true;
-                break;
-            }
-            usleep(100_000);
-        }
+        $reason = SystemEnvironment::awaitAgentPort(
+            self::$agentProcess,
+            self::$agentPipes[1],
+            self::AGENT_HOST,
+            self::AGENT_PORT,
+            self::STARTUP_TIMEOUT,
+        );
 
-        if (! $ready) {
-            $output = stream_get_contents(self::$agentPipes[1]);
+        if ($reason !== null) {
             self::stopAgent();
-            SystemEnvironment::agentUnavailable('Agent did not start within '.self::STARTUP_TIMEOUT."s. Output: {$output}");
+            SystemEnvironment::agentUnavailable($reason);
         }
     }
 
