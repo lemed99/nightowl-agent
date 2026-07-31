@@ -27,10 +27,19 @@ class DropV1HistogramsCommand extends Command
             return self::FAILURE;
         }
 
+        $this->error('DO NOT RUN THIS YET — nightowl_ddsketch_agg is too slow to be the only percentile source.');
+        $this->warn('The bins are what every percentile read falls back to. Once they are gone, every percentile at every');
+        $this->warn('tier goes through nightowl_ddsketch_agg, whose STYPE is bytea: each input row copies, re-decodes and');
+        $this->warn('re-encodes the whole accumulated sketch state, so cost per row grows with the state rather than');
+        $this->warn('staying flat. Measured on a 14d hourly profile (~380 distinct indices): ~6.5ms per input row — 500');
+        $this->warn('rows 3.2s, 4000 rows 26.3s. A 20s statement_timeout is exhausted around 3000 rows, and a 14d');
+        $this->warn('per-route read (16,800 rows) never returns at all. Wide ranges are NOT unaffected — they are the');
+        $this->warn('case that breaks, and after the drop there is no cheaper path left to degrade to.');
+        $this->newLine();
         $this->warn('This drops 39 columns from every duration-bearing rollup table (all tiers). Requires:');
         $this->warn('  1. An agent restart AFTER this command (running drains cache the column layout).');
         $this->warn('  2. A NightOwl API release with histogram-conditional reads — do not run against an API older than the one shipping this command.');
-        $this->warn('  3. On high-volume apps (millions of req/day), 1h/24h percentile charts get slower after the drop: those windows read the minute tier, where percentiles then come from aggregating one sketch per row (~20µs each) instead of the C-speed bin sums. Measured at an 8M req/day profile: ~4.4s for the 24h chart vs ~0.9s on the bins. Wide ranges (7d/30d) are unaffected. Weigh the disk win against that before dropping.');
+        $this->warn('  3. An agent release whose merge/aggregate is linear in its input. Until that ships, the disk win is not worth an unrecoverable regression: the bins can only be restored by re-running the rollups from raw telemetry, which is gone past retention.');
 
         if (! $this->option('force') && ! $this->confirm('Proceed?')) {
             return self::FAILURE;

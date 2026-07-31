@@ -5,6 +5,29 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.0.2] - 2026-07-31
+
+### Changed
+
+- **`nightowl:drop-v1-histograms` now tells operators not to run it.** Its cost
+  warning claimed the post-drop regression was confined to 1h/24h minute-tier
+  charts and that "wide ranges (7d/30d) are unaffected" — the opposite of what
+  the aggregate actually does. `nightowl_ddsketch_agg` declares `STYPE = bytea`,
+  so Postgres copies the accumulated sketch into the transition function on
+  every input row, where the merge re-decodes it into a jsonb map (one
+  `jsonb_set` per accumulated index) and re-packs it (one bytea concat per
+  pair). Per-row cost therefore scales with the accumulated state, not with the
+  row: measured on a 14d hourly profile (~380 distinct indices, 1141-byte
+  saturated state), **~6.5ms per input row** — 500 rows 3.2s, 1000 rows 6.5s,
+  4000 rows 26.3s, while the same 1000 rows confined to 20 indices take 91ms. A
+  20s tenant `statement_timeout` is exhausted around 3000 rows, and a 14d
+  per-route read (50 groups × 336 hourly buckets = 16,800 rows) does not return
+  at all. Wide ranges are precisely the case that breaks. Dropping the bins
+  removes the only cheaper path the reader can degrade to, and they cannot be
+  restored once the raw telemetry behind them ages out — so the command now
+  leads with a refusal-shaped warning and lists a linear merge as a
+  prerequisite. No schema or drain behaviour changed.
+
 ## [2.0.1] - 2026-07-30
 
 ### Fixed
