@@ -2821,6 +2821,13 @@ final class RecordWriter
         // the raw row would (see copyBatch).
         $limits = $this->columnLimits($table);
 
+        // $groups arrives keyed by the conflict key but in hash order, which differs
+        // between agents. Two drains sharing a key then lock the same rows in
+        // opposite orders and Postgres kills one with a deadlock, losing the whole
+        // batch. Sorting gives every writer one global lock order, so overlapping
+        // batches wait instead of deadlocking.
+        ksort($groups);
+
         foreach (array_chunk($groups, self::ROLLUP_UPSERT_CHUNK) as $chunk) {
             $flat = [];
             foreach ($chunk as $g) {
