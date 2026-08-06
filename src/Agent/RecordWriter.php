@@ -2821,6 +2821,18 @@ final class RecordWriter
         // the raw row would (see copyBatch).
         $limits = $this->columnLimits($table);
 
+        // Lock order. $groups is keyed by the conflict key but iterates in the order
+        // records happened to land in this batch, which differs per agent — so two
+        // drains sharing a key take the same row locks in opposite orders and
+        // Postgres kills one of them, losing that batch's whole aggregate (reported
+        // against nightowl_user_rollups from a three-host deployment, one drainer
+        // each). Sorting gives every writer one global order, so overlapping batches
+        // queue instead of forming a cycle. SORT_STRING, not the default: the
+        // guarantee has to be a byte order that cannot depend on a key ever looking
+        // numeric to PHP. The tuples and their contents are untouched.
+        // Its bespoke twin upsertQueryRollupGroups() sorts for the same reason.
+        ksort($groups, SORT_STRING);
+
         foreach (array_chunk($groups, self::ROLLUP_UPSERT_CHUNK) as $chunk) {
             $flat = [];
             foreach ($chunk as $g) {
@@ -3249,6 +3261,12 @@ final class RecordWriter
         $clamp = fn (string $column, mixed $value): mixed => isset($limits[$column])
             ? $this->clampToColumn($table, $column, $value, $limits[$column])
             : $value;
+
+        // Same global lock order as upsertRollupGroups — see the note there. This
+        // path is bespoke, so it needs its own sort, and it is the one that matters
+        // most in the field: nightowl_query_rollups is the widest-fanout rollup, so
+        // it is where two drains are likeliest to share a key.
+        ksort($groups, SORT_STRING);
 
         foreach (array_chunk($groups, self::ROLLUP_UPSERT_CHUNK) as $chunk) {
             $flat = [];

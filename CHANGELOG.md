@@ -5,7 +5,31 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
-## [2.1.0] - 2026-07-31
+## [2.1.1] - 2026-08-06
+
+### Fixed
+
+- **Two hosts draining into one database no longer deadlock each other out of a
+  batch of rollups.** The rollup upserts chunked their `$groups` array straight
+  into a multi-row `INSERT … ON CONFLICT`. The array is keyed by the conflict
+  key but iterated in the order records happened to land in that batch, which is
+  not the same order on any two agents — so two drains whose batches shared a
+  key took the row locks in opposite orders, Postgres detected the cycle, and
+  killed one of them. The victim lost its entire batch of aggregates, silently:
+  the raw rows had already gone in, so nothing looked missing until a rollup-fed
+  chart disagreed with the raw one. Both upsert paths now `ksort` before
+  chunking, giving every writer one global lock order so overlapping batches
+  queue instead of forming a cycle. The sort is `SORT_STRING` rather than PHP's
+  default comparison, so the ordering can't shift on a key that happens to look
+  numeric. The tuples and their contents are unchanged. Reported and diagnosed
+  in [#5](https://github.com/lemed99/nightowl-agent/pull/5), against
+  `nightowl_user_rollups` on a three-host deployment running v1.4.1 — one
+  drainer per host, `drain_workers` at its default of 1, so this needs no
+  in-process concurrency to hit. That patch covered the shared upsert only;
+  `nightowl_query_rollups` reaches Postgres through a bespoke second upsert that
+  does **not** route through it, and being the widest-fanout rollup it is the
+  likeliest place of all for two drains to share a key — it is the table in the
+  reported deadlock trace, and it is fixed here too.
 
 ### Fixed
 
