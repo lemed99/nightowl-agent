@@ -5,6 +5,79 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.2.0] - 2026-08-14
+
+### Added
+
+- **`nightowl:repair-cache-rollup-keys` — repairs cache rollups written before
+  key templating existed.** Templating (2.0.0) bounds cache-rollup cardinality
+  at drain time, but only for rows written after the upgrade; the rows already
+  on disk keep their literal, near-unique keys, and the hourly/daily tiers keep
+  them for `rollup_tier_retention.hourly_days` / `daily_days` — 366 and 1100 days
+  by default. That legacy shape is worse than merely large: because a literal
+  cache key is near-unique, the tier backfill that built hourly and daily out of
+  the minute table collapsed almost nothing, measured in the field at a 45.6M-row
+  minute table producing a 45.3M-row hourly and a 45.4M-row daily table. One
+  bloated table became three. Once those tables and their four-column primary
+  keys no longer fit in cache — a Postgres restart is enough to lose the warm
+  state that was holding it together — every rollup write goes to disk, the drain
+  falls below the ingest rate, the SQLite buffer fills past
+  `NIGHTOWL_MAX_PENDING_ROWS`, and the agent starts rejecting live telemetry.
+  The new command re-aggregates those rows: every key whose `CacheKeyTemplate`
+  pattern differs from the key itself is summed into the pattern's row for the
+  same store, bucket and environment. Counters and durations are regrouped, never
+  discarded, so no chart point is lost and no history is shortened.
+
+  By default it does that by **rebuilding the table and swapping it in**, the way
+  `pg_repack` does. The collapsed copy is built beside the live table from an
+  exported snapshot while an `AFTER INSERT OR UPDATE OR DELETE` trigger records
+  everything the drain writes meanwhile; the two are folded together and the
+  tables are renamed under the rollup advisory lock, held for **milliseconds**.
+  The snapshot is what makes that safe — a trigger alone would count a row
+  written between the trigger going live and the scan reaching it twice — and
+  deletes are captured as negative deltas rather than tombstones, because a
+  templated group is the sum of many raw keys and retention pruning only ever
+  removes some of them. The rebuild needs roughly the largest table's size in
+  free disk and ownership of the table (the swap ends in a `DROP TABLE`, so it
+  says so up front rather than after a rebuild that can take minutes), and in
+  exchange it leaves **no dead space** (so no `pg_repack`
+  afterwards), collapses the current bucket too, and finishes one operator step
+  instead of several. A measured run: three tables holding 135,040 legacy rows
+  collapsed to 30,765 in 1.3s total with a 6–8ms lock hold, 73.6 MB reclaimed to
+  7.6 MB, byte-identical to the same telemetry drained by a templating agent.
+
+  `--in-place` keeps the original merge-inside-the-live-table strategy for the
+  tenant whose disk cannot hold a second copy. It is far slower, leaves dead
+  space until a `pg_repack`, and cannot touch the buckets the drain is still
+  writing. It batches by key rather than by time window — the key is the primary
+  key's leading column, and the insert merges additively, so splitting one
+  pattern across two transactions gives the same totals as doing it in one. That
+  makes the batch size free to be paced by measured hold time toward one second,
+  which matters because each batch holds the same advisory lock the drain pairs
+  with; the 2.0.0 field incident was a 24s-per-chunk hold that had the drain
+  rejecting every payload for two hours. Because the drain safety margin rounds
+  down to the tier's own bucket, an in-place run against a live agent always
+  leaves the current day's daily row literal-keyed, so it names the skipped
+  ceiling per table and says to come back for the tail rather than letting the
+  collapse counts read as complete. `--since` / `--until` bound that walk, and
+  are refused outright under the rebuild, which has no window to bound.
+
+  Either way keys that already equal their own pattern are never rewritten and
+  the pass is idempotent. `--dry-run` reports the collapse without writing.
+
+### Fixed
+
+- **Slack alerts no longer arrive as "[no preview available]".** The issue
+  payload carried its content entirely inside `attachments[].blocks`, and Slack
+  builds desktop and push previews from the top-level `text` field — mobile
+  notifications use nothing else. With that field absent there was nothing to
+  extract, so every alert pushed a notification with no indication of which app
+  or which exception it was about; you had to open Slack to find out. The
+  payload now carries a one-line plain-text summary (severity label, app,
+  exception name, message) in both `text` and the attachment's `fallback`,
+  collapsed to a single line and capped at 250 characters. The in-channel
+  message is unchanged — Slack suppresses `text` when blocks are present.
+
 ## [2.1.1] - 2026-08-06
 
 ### Fixed

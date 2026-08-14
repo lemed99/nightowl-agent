@@ -675,6 +675,26 @@ final class AlertNotifier
         return $message;
     }
 
+    /**
+     * Plain-text summary Slack shows in desktop/mobile notification previews.
+     *
+     * A payload carrying only attachments[].blocks gives Slack nothing to
+     * extract, so notifications render as "[no preview available]" — mobile
+     * notifications use the top-level `text` field exclusively.
+     */
+    private function slackNotificationText(array $style, string $appName, string $name, string $message): string
+    {
+        $parts = array_values(array_filter([$style['label'], $appName, $name, $message], static fn ($part) => $part !== '' && $part !== null));
+        $summary = $style['emoji'].' '.implode(" \xC2\xB7 ", $parts);
+        $summary = trim((string) preg_replace('/\s+/u', ' ', $summary));
+
+        if (mb_strlen($summary) > 250) {
+            $summary = mb_substr($summary, 0, 250).'...';
+        }
+
+        return $summary;
+    }
+
     private function logoUrl(): string
     {
         return rtrim($this->frontendUrl, '/').'/logo.png';
@@ -704,6 +724,19 @@ final class AlertNotifier
             throw new \RuntimeException('slack channel has no webhook_url configured');
         }
 
+        $payload = $this->buildSlackPayload($appName, $prefix, $group, $issueType);
+
+        $this->webhook->post($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
+    }
+
+    /**
+     * Build the Slack incoming-webhook payload for an issue group.
+     *
+     * @param  array<string, mixed>  $group
+     * @return array<string, mixed>
+     */
+    private function buildSlackPayload(string $appName, string $prefix, array $group, string $issueType = 'exception'): array
+    {
         $name = $this->issueName($group);
         $message = $this->issueMessage($group);
         $occurrences = (int) ($group['count'] ?? 0);
@@ -812,19 +845,22 @@ final class AlertNotifier
         ];
 
         $attachmentColor = $style['color_hex'];
+        $notificationText = $this->slackNotificationText($style, $appName, $name, $message);
 
         $payload = [
             'username' => 'NightOwl',
             'icon_url' => $this->logoUrl(),
+            'text' => $notificationText,
             'attachments' => [
                 [
                     'color' => $attachmentColor,
+                    'fallback' => $notificationText,
                     'blocks' => $blocks,
                 ],
             ],
         ];
 
-        $this->webhook->post($url, json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE));
+        return $payload;
     }
 
     private function sendDiscord(array $config, string $appName, string $prefix, array $group, string $issueType = 'exception'): void

@@ -279,6 +279,85 @@ class AlertNotifierTest extends TestCase
         $this->assertSame("A\r\nB\r\nC\r\nD", $smtpBody);
     }
 
+    // ─── Slack Notification Preview ──────────────────────────────────
+
+    /**
+     * A Slack payload that carries only attachments[].blocks gives Slack
+     * nothing to extract for push/desktop notifications, which then render as
+     * "[no preview available]" (reported by a customer, Aug 2026). Mobile
+     * notifications use the top-level `text` field exclusively, so both it and
+     * the attachment `fallback` must carry a plain-text summary.
+     */
+    public function testSlackPayloadCarriesNotificationFallbackText(): void
+    {
+        $payload = $this->captureSlackPayload([
+            'class' => 'RuntimeException',
+            'message' => 'Something went wrong',
+            'count' => 5,
+            'users_count' => 3,
+            'issue_id' => 42,
+        ]);
+
+        $this->assertArrayHasKey('text', $payload);
+        $this->assertNotSame('', $payload['text']);
+        $this->assertSame($payload['text'], $payload['attachments'][0]['fallback']);
+
+        $this->assertStringContainsString('New Issue', $payload['text']);
+        $this->assertStringContainsString('TestApp', $payload['text']);
+        $this->assertStringContainsString('RuntimeException', $payload['text']);
+        $this->assertStringContainsString('Something went wrong', $payload['text']);
+    }
+
+    public function testSlackNotificationTextIsSingleLineAndBounded(): void
+    {
+        $payload = $this->captureSlackPayload([
+            'class' => "Multi\nLine\tException",
+            'message' => str_repeat('B', 400),
+            'count' => 1,
+            'users_count' => 0,
+        ]);
+
+        $text = $payload['text'];
+
+        $this->assertNotSame('', $text);
+        $this->assertDoesNotMatchRegularExpression('/\s{2,}|[\r\n\t]/', $text);
+        $this->assertLessThanOrEqual(253, mb_strlen($text));
+    }
+
+    public function testSlackNotificationTextOmitsEmptyMessage(): void
+    {
+        $payload = $this->captureSlackPayload([
+            'class' => 'RuntimeException',
+            'message' => '',
+            'count' => 1,
+            'users_count' => 0,
+        ]);
+
+        $this->assertStringEndsWith('RuntimeException', $payload['text']);
+    }
+
+    /**
+     * Builds the Slack payload the same way sendSlack() posts it, and returns
+     * it decoded from the wire JSON.
+     *
+     * @param  array<string, mixed>  $group
+     * @return array<string, mixed>
+     */
+    private function captureSlackPayload(array $group, string $prefix = 'New Issue'): array
+    {
+        $notifier = new AlertNotifier;
+
+        $method = new \ReflectionMethod($notifier, 'buildSlackPayload');
+        $payload = $method->invoke($notifier, 'TestApp', $prefix, $group, 'exception');
+
+        // Assert against what actually goes on the wire, not the PHP array:
+        // JSON_INVALID_UTF8_SUBSTITUTE is part of the contract.
+        $encoded = json_encode($payload, JSON_INVALID_UTF8_SUBSTITUTE);
+        $this->assertIsString($encoded);
+
+        return json_decode($encoded, true);
+    }
+
     // ─── JSON Encoding Safety ────────────────────────────────────────
 
     public function testJsonEncodeWithInvalidUtf8DoesNotReturnFalse(): void

@@ -24,6 +24,7 @@ use NightOwl\Commands\InstallCommand;
 use NightOwl\Commands\MigrateCommand;
 use NightOwl\Commands\PartitionCommand;
 use NightOwl\Commands\PruneCommand;
+use NightOwl\Commands\RepairCacheRollupKeysCommand;
 use NightOwl\Commands\TestAlertCommand;
 use NightOwl\Support\InstalledVersionReader;
 use NightOwl\Support\MultiIngest;
@@ -281,6 +282,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 PartitionCommand::class,
                 DropV1HistogramsCommand::class,
                 BackfillRollupsCommand::class,
+                RepairCacheRollupKeysCommand::class,
                 ClearCommand::class,
                 GcDictTracesCommand::class,
                 TestAlertCommand::class,
