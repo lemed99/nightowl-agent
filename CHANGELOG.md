@@ -5,6 +5,75 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.2.1] - 2026-08-16
+
+### Fixed
+
+- **`nightowl:repair-cache-rollup-keys` now checks the snapshot handshake before
+  it touches anything.** In the field the rebuild died on all three cache rollup
+  tables with `SQLSTATE[25001] SET TRANSACTION SNAPSHOT must be called before any
+  query`, each after the capture trigger and delta table were already in place.
+  Nothing was damaged — the abort path dropped the scratch objects and left every
+  table as it found it — but the operator paid a failed run per table to learn
+  that the second session could not import the first session's snapshot.
+
+  The command now runs that handshake once, up front, against a scratch
+  transaction. It costs two statements. On failure it reports the server version
+  and both backend PIDs, which is what separates the two possible causes: the
+  same PID on both connections means they collapsed onto one server session and
+  no ordering fix can help, while different PIDs mean the second session is
+  genuinely separate and something ran a query on it before the import.
+
+  In that second case it also names the query. The connection's own log is
+  switched on for the length of the handshake, so a listener in the host app
+  that reaches for the second session is reported outright rather than left to
+  be guessed at, and the negative reading is worth as much: nothing in the log
+  means the snapshot was taken by something the log cannot see, which rules the
+  host app out. A log the host app had already enabled is handed back untouched.
+
+  It then offers `--in-place`, or under a non-interactive run says to use it and
+  exits non-zero without starting.
+
+- **The snapshot import is now the first statement in its transaction.**
+  `SET TRANSACTION SNAPSHOT` is refused once anything in the transaction has
+  taken a snapshot, so the isolation level now rides on the `BEGIN` itself
+  instead of arriving as a separate statement, and both go through the simple
+  query protocol on the PDO rather than a prepare/execute round trip that fires
+  Laravel query events. The released 2.2.0 sequence was verified to work against
+  the Postgres 18.4 server that rejected it in the field, so this removes the
+  remaining suspects on the client side rather than fixing a server difference.
+
+- **A pass no longer runs out of memory on a large table.** The agent is normally
+  installed beside `laravel/nightwatch`, whose query sensor keeps a copy of every
+  statement it is handed. This command issues thousands, and each merge or
+  projection carries a `VALUES` list of up to 20,000 key pairs, so the sensor
+  ends up holding several hundred KB of SQL text per batch for the length of the
+  run. Measured on a seeded 4.7M-row hourly table shaped like a real tenant's:
+  404 MB peak with the sensor attached, against 92 MB without, and PHP's usual
+  128 MB CLI limit was exhausted partway through — `Allowed memory size of
+  134217728 bytes exhausted`, on a table an order of magnitude smaller than the
+  ones this command exists for.
+
+  Both connections now come off the event dispatcher for the length of the pass
+  and are handed back afterwards. Maintenance SQL was never telemetry anyone
+  asked to keep, and the same change removes the last explanation left for the
+  25001 above: a host `QueryExecuted` listener that queries the rebuild's second
+  session in response to our own query can no longer run between the `BEGIN` and
+  the snapshot import. The per-connection query log is independent of the
+  dispatcher, so the preflight can still name an interfering query.
+
+### Changed
+
+- The `--in-place` fallback offered after a failed preflight defaults to **no**.
+  The two strategies do not clean up the same way: in-place leaves dead space
+  that only a `pg_repack` or a `VACUUM FULL` returns, and on a table large enough
+  to be worth repairing that is a maintenance window. Pressing enter should not
+  book one.
+
+- `--since` and `--until` are refused on a rebuild instead of being silently
+  ignored. A rebuild re-aggregates the whole table and has no time cursor to
+  bound; the bounds only ever applied to `--in-place`.
+
 ## [2.2.0] - 2026-08-14
 
 ### Added

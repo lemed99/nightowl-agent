@@ -167,6 +167,39 @@ class RepairCacheRollupKeysCommand extends Command
     public function handle(): int
     {
         $conn = DB::connection('nightowl');
+
+        // A pass issues thousands of statements, and its merge and projection
+        // SQL each carry a VALUES list of up to MAX_KEY_BATCH key pairs. Any
+        // listener that keeps the SQL then holds a copy of every one of them
+        // for the length of the command — Laravel's own query log, and above
+        // all Nightwatch's query sensor, since the agent is normally installed
+        // beside it. Measured on a 4.7M-row hourly table: 404 MB peak with the
+        // sensor attached against 92 MB without, and PHP's usual 128 MB CLI
+        // limit is exhausted long before a large tenant's table is finished.
+        //
+        // Detaching also settles a second problem. A host QueryExecuted
+        // listener that queries this connection in response to our own query is
+        // the one explanation left for a rebuild whose snapshot import is
+        // refused mid-handshake (SQLSTATE 25001); off the dispatcher, no such
+        // listener can run between the two statements.
+        //
+        // Maintenance SQL is not telemetry anyone asked to keep, so take this
+        // connection off the dispatcher for the pass and hand it back exactly
+        // as it was.
+        $dispatcher = $conn->getEventDispatcher();
+        $conn->unsetEventDispatcher();
+
+        try {
+            return $this->runPass($conn);
+        } finally {
+            if ($dispatcher !== null) {
+                $conn->setEventDispatcher($dispatcher);
+            }
+        }
+    }
+
+    private function runPass($conn): int
+    {
         $dryRun = (bool) $this->option('dry-run');
 
         $tables = RollupTiers::tables(self::BASE_TABLE);
@@ -218,9 +251,21 @@ class RepairCacheRollupKeysCommand extends Command
                 }
             }
 
-            return $this->rebuildAll($conn, array_keys($present));
+            return $this->rebuildAll($conn, $present);
         }
 
+        return $this->repairAllInPlace($conn, $present, $dryRun);
+    }
+
+    /**
+     * The merge-inside-the-live-table strategy: the original repair, now reached
+     * by --in-place or as the fallback when the database will not allow the
+     * rebuild's cross-session snapshot.
+     *
+     * @param  array<string, int>  $present  table => bucket granularity in seconds
+     */
+    private function repairAllInPlace($conn, array $present, bool $dryRun): int
+    {
         $rewrote = false;
         foreach ($present as $table => $granularity) {
             $rewrote = $this->repairTable($conn, $table, $granularity, $dryRun) || $rewrote;
@@ -271,15 +316,47 @@ class RepairCacheRollupKeysCommand extends Command
      * (BYO Postgres is frequently a different host), so this reports what will be
      * needed and asks, rather than pretending to have checked.
      *
-     * @param  list<string>  $tables
+     * @param  array<string, int>  $present  table => bucket granularity in seconds
      */
-    private function rebuildAll($conn, array $tables): int
+    private function rebuildAll($conn, array $present): int
     {
+        $tables = array_keys($present);
         $sizes = [];
         $largest = 0;
         foreach ($tables as $table) {
             $sizes[$table] = $this->relationSize($conn, $table);
             $largest = max($largest, $sizes[$table]);
+        }
+
+        // Ask the database whether it will allow the handshake the rebuild is
+        // built on BEFORE announcing a plan that depends on it. Field report
+        // 2026-08-14: a managed Postgres refused the import, and because the
+        // check happened at the import rather than up front, the operator paid
+        // one failed rebuild per table to learn it.
+        $work = $this->workConnection();
+        $probe = new CacheRollupSwap($conn, $work, 1000, static fn (string $line) => null);
+        if (($reason = $probe->snapshotUnavailable()) !== '') {
+            $this->warn("Cannot rebuild here: {$reason}");
+            $this->line('The rebuild builds the collapsed table on a second session that reads the first session\'s snapshot, so without it there is no safe way to swap a table the drain is writing to.');
+
+            if (! $this->input->isInteractive()) {
+                $this->error('Re-run with --in-place, which repairs inside the live table on one session.');
+
+                return self::FAILURE;
+            }
+
+            // Defaults to no. The two strategies do not clean up the same way —
+            // in-place leaves dead space that only a pg_repack or a VACUUM FULL
+            // returns, and on a table big enough to be worth repairing that is a
+            // maintenance window, not an afterthought. Pressing enter should not
+            // book one.
+            if (! $this->confirm('Repair --in-place instead? Slower, and it leaves dead space until a pg_repack, but it needs no extra disk and no second session', false)) {
+                $this->line('Nothing was changed.');
+
+                return self::SUCCESS;
+            }
+
+            return $this->repairAllInPlace($conn, $present, false);
         }
 
         $this->line('Rebuilding each cache rollup table and swapping it in.');
@@ -299,7 +376,6 @@ class RepairCacheRollupKeysCommand extends Command
             return self::SUCCESS;
         }
 
-        $work = $this->workConnection();
         $chunkDays = max(1, (int) $this->option('chunk-days'));
         $lockTimeout = (int) config('nightowl.drain_connection.lock_timeout_ms', 10000);
 
@@ -353,7 +429,17 @@ class RepairCacheRollupKeysCommand extends Command
         config(['database.connections.nightowl_rebuild' => $config]);
         DB::purge('nightowl_rebuild');
 
-        return DB::connection('nightowl_rebuild');
+        $work = DB::connection('nightowl_rebuild');
+
+        // Off the dispatcher for the same two reasons as the control connection
+        // in handle(): the rebuild's aggregate statements are not telemetry, and
+        // nothing of the host app's may run on this session between the BEGIN
+        // and the snapshot import. The query log is untouched — it is a
+        // per-connection buffer, independent of the dispatcher, which is what
+        // lets CacheRollupSwap still name an interfering query if one appears.
+        $work->unsetEventDispatcher();
+
+        return $work;
     }
 
     /**

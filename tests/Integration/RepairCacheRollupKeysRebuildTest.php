@@ -273,4 +273,145 @@ final class RepairCacheRollupKeysRebuildTest extends CacheRollupRepairTestCase
         $this->assertStringContainsString('--since only applies to --in-place', $output->fetch());
         $this->assertSame(['user:1:profile', 'user:2:profile'], $this->keys());
     }
+
+    /**
+     * The preflight's happy path. It is the only thing standing between an
+     * operator and a doomed run, so it has to be right in BOTH directions —
+     * a false positive here would push every healthy database onto the slow
+     * strategy for nothing.
+     */
+    public function test_the_snapshot_preflight_passes_on_a_database_that_supports_it(): void
+    {
+        $swap = $this->probe();
+
+        $this->assertSame('', $swap->snapshotUnavailable());
+    }
+
+    /**
+     * The failure Eskie hit in production on 2026-08-15: three tables, each
+     * dying at the import with
+     *
+     *   SQLSTATE[25001]: SET TRANSACTION SNAPSHOT must be called before any query
+     *
+     * Reproduced the only way the message can be produced — by letting the
+     * second session run a query before the import — to prove the preflight
+     * catches that shape of database instead of discovering it minutes into a
+     * rebuild. The version goes in the message because "why here and not
+     * anywhere else" is a question about the server.
+     */
+    public function test_the_snapshot_preflight_catches_a_session_that_refuses_the_import(): void
+    {
+        $work = $this->workConnection();
+        $work->beginTransaction();
+        $work->select('SELECT 1');
+
+        $reason = $this->probe($work)->snapshotUnavailable();
+
+        $this->assertStringContainsString('refused a cross-session snapshot', $reason);
+        // Postgres refuses at whichever of the two statements it reaches
+        // first — the isolation level on a dirty session, the import on a
+        // clean one — so pin the half of the message both refusals share.
+        $this->assertStringContainsString('must be called before any query', $reason);
+        $this->assertMatchesRegularExpression('/Postgres \d+/', $reason);
+        $this->assertStringContainsString('are separate, so something ran a query', $reason);
+        // Nothing dirtied the session while the handshake was OPEN — the poison
+        // above ran before it — so the recorder must say so rather than invent a
+        // culprit. The negative is the useful half of that answer: it rules the
+        // host app out and leaves the driver.
+        $this->assertStringContainsString('Nothing this application ran through Laravel touched that session', $reason);
+    }
+
+    /**
+     * The other half: when the host app DOES query the second session while the
+     * handshake is open, the failure must name that query. Guessing which
+     * listener dirtied a session is the expensive part of this diagnosis, and it
+     * is the one thing the operator cannot work out from the Postgres error.
+     *
+     * The listener here reacts to a query on the FIRST connection by querying
+     * the SECOND, which is the shape the field failure has, and holds it open so
+     * the snapshot it takes is still there when the import arrives.
+     */
+    public function test_the_snapshot_preflight_names_the_query_that_dirtied_the_session(): void
+    {
+        $this->app->singleton('events', fn () => new \Illuminate\Events\Dispatcher($this->app));
+        $this->app['db']->purge('nightowl');
+        $this->app['db']->purge('probe_work');
+
+        $control = $this->app['db']->connection('nightowl');
+        $work = $this->workConnection();
+
+        $this->app['events']->listen(\Illuminate\Database\Events\QueryExecuted::class, static function ($query) use ($work) {
+            if (str_contains($query->sql, 'pg_export_snapshot')) {
+                $work->beginTransaction();
+                $work->select('SELECT 1 AS audit_probe');
+            }
+        });
+
+        $reason = $this->probe($work)->snapshotUnavailable();
+
+        $this->assertStringContainsString('refused a cross-session snapshot', $reason);
+        $this->assertStringContainsString('This application ran it:', $reason);
+        $this->assertStringContainsString('audit_probe', $reason);
+    }
+
+    /** Whichever way it answers, it must hand both sessions back clean. */
+    public function test_the_snapshot_preflight_leaves_no_transaction_behind(): void
+    {
+        $control = $this->app['db']->connection('nightowl');
+
+        $this->assertSame('', (new CacheRollupSwap($control, $this->workConnection(), 1000, static fn (string $l) => null))->snapshotUnavailable());
+
+        $this->assertSame(0, $control->transactionLevel());
+        $this->assertSame(1, (int) $control->selectOne('SELECT 1 AS n')->n);
+    }
+
+    /**
+     * End to end: when the second session cannot be had at all, the command
+     * must stop at the preflight — before the trigger, the delta table or the
+     * scan — and say which strategy to use instead. Non-interactive, because
+     * that is how it runs under a deploy script.
+     */
+    public function test_a_rebuild_stops_at_the_preflight_when_the_second_session_cannot_be_opened(): void
+    {
+        $this->insert('nightowl_cache_rollups', 'user:1:profile');
+        $this->insert('nightowl_cache_rollups', 'user:2:profile');
+
+        // Resolve (and so cache) the control connection on the good config,
+        // then poison the config the work connection is cloned from.
+        $this->app['db']->connection('nightowl');
+        $this->app['config']->set('database.connections.nightowl.port', 1);
+
+        $command = new \NightOwl\Commands\RepairCacheRollupKeysCommand;
+        $command->setLaravel($this->app);
+        $output = new \Symfony\Component\Console\Output\BufferedOutput;
+        // Non-interactive, the way Symfony's Application configures a TTY-less
+        // run — under a deploy script this must be an error, not a prompt.
+        $input = new \Symfony\Component\Console\Input\ArrayInput(['--force' => true]);
+        $input->setInteractive(false);
+        $exit = $command->run($input, $output);
+        $text = $output->fetch();
+
+        $this->assertSame(1, $exit, $text);
+        $this->assertStringContainsString('Cannot rebuild here', $text);
+        $this->assertStringContainsString('--in-place', $text);
+        $this->assertSame(['user:1:profile', 'user:2:profile'], $this->keys());
+    }
+
+    private function workConnection()
+    {
+        $this->app['config']->set('database.connections.probe_work', $this->app['config']->get('database.connections.nightowl'));
+        $this->app['db']->purge('probe_work');
+
+        return $this->app['db']->connection('probe_work');
+    }
+
+    private function probe($work = null): CacheRollupSwap
+    {
+        return new CacheRollupSwap(
+            $this->app['db']->connection('nightowl'),
+            $work ?? $this->workConnection(),
+            1000,
+            static fn (string $line) => null,
+        );
+    }
 }

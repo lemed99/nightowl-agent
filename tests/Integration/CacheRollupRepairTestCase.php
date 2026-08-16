@@ -4,6 +4,8 @@ namespace NightOwl\Tests\Integration;
 
 use Illuminate\Config\Repository;
 use Illuminate\Database\DatabaseServiceProvider;
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Events\Dispatcher;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use NightOwl\Commands\RepairCacheRollupKeysCommand;
@@ -200,6 +202,43 @@ abstract class CacheRollupRepairTestCase extends TestCase
         sort($keys, SORT_STRING);
 
         return $keys;
+    }
+
+    public function test_the_pass_keeps_its_own_sql_off_the_query_listeners(): void
+    {
+        // The agent is normally installed beside laravel/nightwatch, whose query
+        // sensor keeps a copy of every statement it is handed. A pass issues
+        // thousands, and each merge or projection carries a VALUES list of up to
+        // MAX_KEY_BATCH key pairs, so a listener holding them exhausts PHP's
+        // usual 128MB CLI limit long before a large tenant's table is finished:
+        // measured 404MB peak against 92MB detached, on a 4.7M-row hourly table.
+        // The pass therefore runs off the dispatcher — and has to hand it back,
+        // or every later query in the process goes unrecorded.
+        $this->app->singleton('events', fn () => new Dispatcher($this->app));
+        $this->app['db']->purge('nightowl');
+
+        $seen = [];
+        $this->app['events']->listen(QueryExecuted::class, static function (QueryExecuted $query) use (&$seen): void {
+            $seen[] = $query->sql;
+        });
+
+        $connection = $this->app['db']->connection('nightowl');
+        $this->assertNotNull(
+            $connection->getEventDispatcher(),
+            'the connection must start ON the dispatcher, or this test proves nothing',
+        );
+
+        $this->insert('nightowl_cache_rollups', 'user:1:profile');
+        $this->insert('nightowl_cache_rollups', 'user:2:profile');
+
+        $this->runRepair();
+
+        $this->assertSame([], $seen, 'the pass handed its own SQL to a query listener: '
+            .implode(' | ', array_slice($seen, 0, 3)));
+        $this->assertNotNull(
+            $connection->getEventDispatcher(),
+            'the pass kept the dispatcher it borrowed',
+        );
     }
 
     public function test_collapses_literal_keys_into_one_pattern_group(): void

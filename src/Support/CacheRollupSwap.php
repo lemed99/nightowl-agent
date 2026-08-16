@@ -85,6 +85,118 @@ final class CacheRollupSwap
         private \Closure $log,
     ) {}
 
+    /**
+     * Prove the export/import handshake works on THIS database before touching a
+     * single table.
+     *
+     * The rebuild is worthless without it, and finding that out at the import —
+     * which happens after the trigger and delta table are already in place, and
+     * on a 45M-row table can be minutes in — costs the operator a failed run per
+     * table for nothing. It is two statements against a scratch transaction, so
+     * ask up front. Reports the server version alongside the failure because the
+     * answer to "why did the import get refused here and nowhere else" is almost
+     * always something about the server or what fronts it.
+     *
+     * @return string empty when the handshake works, otherwise the reason
+     */
+    public function snapshotUnavailable(): string
+    {
+        $version = 'unknown';
+        $controlPid = 0;
+        $workPid = 0;
+
+        try {
+            $version = (string) $this->control->selectOne('SHOW server_version')->server_version;
+            // Both backend PIDs, because when this handshake fails there are only
+            // two shapes of cause and the PIDs tell them apart. Same PID means the
+            // two Laravel connections landed on ONE server session (a persistent
+            // PDO, or something in front of Postgres collapsing them), so the
+            // import is being handed a snapshot the session already exported and
+            // no ordering fix can help. Different PIDs means the second session
+            // really is separate and something ran a query on it before the
+            // import — an event listener or instrumentation in the host app.
+            $controlPid = (int) $this->control->selectOne('SELECT pg_backend_pid() AS p')->p;
+            $workPid = (int) $this->work->selectOne('SELECT pg_backend_pid() AS p')->p;
+        } catch (\Throwable) {
+        }
+
+        // Record whatever else runs on the second session while the handshake is
+        // open. When the import is refused for "a query already ran", the
+        // expensive part of the diagnosis is working out WHICH query, and the
+        // connection's own log already knows. Both outcomes are worth having: a
+        // named query points at a listener in the host app, while NO named query
+        // says the snapshot was taken by something the query log cannot see.
+        // Leave a log the host app had already switched on exactly as it was.
+        $wasLogging = $this->work->logging();
+        $logged = count($this->work->getQueryLog());
+        $this->work->enableQueryLog();
+
+        try {
+            $this->control->beginTransaction();
+            $snapshot = (string) $this->control->selectOne('SELECT pg_export_snapshot() AS s')->s;
+
+            $pdo = $this->work->getPdo();
+            $pdo->exec('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+            $pdo->exec("SET TRANSACTION SNAPSHOT '{$snapshot}'");
+            $pdo->exec('ROLLBACK');
+
+            $this->control->rollBack();
+
+            return '';
+        } catch (\Throwable $e) {
+            try {
+                $this->work->getPdo()->exec('ROLLBACK');
+            } catch (\Throwable) {
+            }
+
+            try {
+                if ($this->control->transactionLevel() > 0) {
+                    $this->control->rollBack();
+                }
+            } catch (\Throwable) {
+            }
+
+            // The handshake's own statements go through the PDO rather than the
+            // connection, so they never reach this log — these prefixes are here
+            // only so a future edit that routes them back through Laravel does
+            // not start reporting us as the interloper.
+            $foreign = [];
+
+            foreach (array_slice($this->work->getQueryLog(), $logged) as $entry) {
+                $sql = trim(preg_replace('/\s+/', ' ', (string) ($entry['query'] ?? '')));
+
+                if ($sql === ''
+                    || str_starts_with($sql, 'SET TRANSACTION SNAPSHOT')
+                    || str_starts_with($sql, 'BEGIN TRANSACTION ISOLATION LEVEL')) {
+                    continue;
+                }
+
+                $foreign[] = mb_substr($sql, 0, 120);
+            }
+
+            if ($controlPid !== 0 && $controlPid === $workPid) {
+                $sessions = ' Both connections are the same server session (backend '.$controlPid.'), so they cannot export and import a snapshot to each other.';
+            } elseif ($workPid !== 0) {
+                $sessions = ' Backends '.$controlPid.' and '.$workPid.' are separate, so something ran a query on the second one before the import.';
+
+                $sessions .= $foreign !== []
+                    ? ' This application ran it: '.implode('; ', array_slice($foreign, 0, 3))
+                        .(count($foreign) > 3 ? ' (and '.(count($foreign) - 3).' more)' : '')
+                    : ' Nothing this application ran through Laravel touched that session while the handshake was open, so the snapshot was taken by something the query log cannot see, such as a raw PDO call or the driver preparing a statement.';
+            } else {
+                $sessions = '';
+            }
+
+            return "this database refused a cross-session snapshot (Postgres {$version}): "
+                .trim(explode("\n", $e->getMessage())[0]).$sessions;
+        } finally {
+            if (! $wasLogging) {
+                $this->work->disableQueryLog();
+                $this->work->flushQueryLog();
+            }
+        }
+    }
+
     /** @param \Closure(string): void $hook */
     public function onPhase(\Closure $hook): void
     {
@@ -125,7 +237,7 @@ final class CacheRollupSwap
             ($this->log)("    key map: {$mapped} of the table's distinct keys collapse onto a pattern.");
 
             $this->buildNewTable($table, $new, $map, $pk, $chunkDays);
-            $this->work->commit();
+            $this->work->getPdo()->exec('COMMIT');
 
             $this->buildIndexes($new, $indexes);
             $this->applyGrants($new, $grants);
@@ -366,9 +478,17 @@ final class CacheRollupSwap
 
     private function beginSnapshotTransaction(string $snapshot): void
     {
-        $this->work->beginTransaction();
-        $this->work->statement('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
-        $this->work->statement("SET TRANSACTION SNAPSHOT '{$snapshot}'");
+        // `SET TRANSACTION SNAPSHOT` must be the FIRST command in its transaction:
+        // anything that executes ahead of it takes the transaction's own snapshot
+        // and Postgres then rejects the import with 25001. So resolve the PDO
+        // first, which is what runs the driver's session setup (search_path,
+        // timezone, application_name) and runs it OUTSIDE any transaction; carry
+        // the isolation level on the BEGIN itself so there is no second statement
+        // to get in the way; and send both through the simple query protocol
+        // rather than a prepare/execute round trip.
+        $pdo = $this->work->getPdo();
+        $pdo->exec('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        $pdo->exec("SET TRANSACTION SNAPSHOT '{$snapshot}'");
     }
 
     /**
@@ -592,7 +712,19 @@ final class CacheRollupSwap
 
     private function abort(string $table, string $trigger, string $fn): void
     {
-        foreach ([$this->work, $this->control] as $conn) {
+        // The work transaction is opened with a raw BEGIN (see
+        // beginSnapshotTransaction), so Laravel's counter never saw it — roll it
+        // back at the PDO, where it actually lives.
+        try {
+            $this->work->getPdo()->exec('ROLLBACK');
+        } catch (\Throwable) {
+            try {
+                $this->work->disconnect();
+            } catch (\Throwable) {
+            }
+        }
+
+        foreach ([$this->control] as $conn) {
             try {
                 if ($conn->transactionLevel() > 0) {
                     $conn->rollBack();
