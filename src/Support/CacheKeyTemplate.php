@@ -4,7 +4,8 @@ namespace NightOwl\Support;
 
 /**
  * Hardcoded cache-key templating: collapse machine-generated key segments
- * (uuid, ulid, hex digests, integers, emails, datetimes) into placeholders so
+ * (uuid, ulid, hex digests, integers, emails, datetimes, session ids) into
+ * placeholders so
  * the cache rollup groups by key SHAPE instead of key instance. `user:8213:
  * profile` and `user:44:profile` become one `user:{int}:profile` group; keys
  * with no variable segment pass through byte-identical.
@@ -30,12 +31,15 @@ namespace NightOwl\Support;
  * timestamp shatters into `{int}-{int}-{int}` soup.
  *
  * Conservative by design — only classes recognisable with high confidence
- * collapse; anything else passes through literally, including bare high-
- * entropy tokens (nanoid, base62 session ids). Those need the entropy
- * backstop this rule deliberately omits: with no per-app config, a false
- * collapse is imposed on every customer, and the measured backstop designs
- * all destroyed real vocabulary. Session-id noise is better fixed at the
- * source (SESSION_DRIVER on its own store).
+ * collapse; anything else passes through literally, including bare high-entropy
+ * tokens (nanoid, and base62 ids of any length but one). There is still no
+ * general entropy backstop: with no per-app config a false collapse would be
+ * imposed on every customer, and the measured backstop designs all destroyed
+ * real vocabulary.
+ *
+ * The one exception is the Laravel session id, which is not an entropy guess
+ * but a shape the framework defines exactly — see {session} in classify(). It
+ * earned the exception in the field, at 96.8% of one customer's cache rollup.
  *
  * The PHP form is the ONLY implementation: the rollup's SQL group form reads
  * the key_pattern column this code populated at ingest (COALESCE(key_pattern,
@@ -417,6 +421,48 @@ final class CacheKeyTemplate
             // Mixed case is nearly always an identifier, not a digest.
             if ($allHex && ! ($hasUpper && $hasLower)) {
                 return '{hex}';
+            }
+        }
+
+        // A 40-byte alphanumeric token carrying an upper, a lower AND a digit:
+        // Laravel's own definition of a session id, minus the guard.
+        // Illuminate\Session\Store::isValidId is `ctype_alnum($id) &&
+        // strlen($id) === 40` (SESSION_ID_LENGTH), and a redis/memcached/apc/
+        // array SESSION_DRIVER routes every session read and write through
+        // CacheBasedSessionHandler into the cache repository, so each one emits
+        // a cache event keyed by that id. Measured on a customer's live
+        // database: 96.8% of the minute rollup's rows and 433k distinct keys,
+        // adding ~400k hourly rollup rows a day, kept for hourly_days.
+        //
+        // The token is ASCII alnum by construction — high-byte tokens returned
+        // above, and classifyTokens only ever hands over word-byte runs — so
+        // ctype_alnum needs no test here, only the length.
+        //
+        // AFTER the hex rule on purpose: a 40-char sha1 is also 40 alnum bytes
+        // and must stay {hex}. The three-class requirement is the
+        // false-positive guard a general entropy backstop could not give —
+        // vocabulary does not mix case and digits in a single 40-byte word — and
+        // it costs only the ~0.09% of real session ids that draw no digit at
+        // all. Those pass through literally, which is what every session id did
+        // before this rule existed, so the cost is a smaller collapse and never
+        // a wrong one.
+        if ($len === 40) {
+            $hasAlphaUpper = false;
+            $hasAlphaLower = false;
+            $hasDigit = false;
+            for ($k = 0; $k < $len; $k++) {
+                $b = ord($t[$k]);
+                if ($b >= 0x41 && $b <= 0x5A) {
+                    $hasAlphaUpper = true;
+                } elseif ($b >= 0x61 && $b <= 0x7A) {
+                    $hasAlphaLower = true;
+                } elseif (self::isDigit($b)) {
+                    $hasDigit = true;
+                }
+            }
+
+            if ($hasAlphaUpper && $hasAlphaLower && $hasDigit) {
+                return '{session}';
             }
         }
 

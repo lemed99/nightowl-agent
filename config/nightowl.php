@@ -104,7 +104,11 @@ return [
     | Group the cache rollup by key SHAPE instead of key instance: uuid/ulid/
     | hex/int/email/datetime segments collapse to placeholders at drain time
     | (`user:8213:profile` → `user:{int}:profile`), bounding the rollup's
-    | cardinality for machine-generated key families. The rule is hardcoded
+    | cardinality for machine-generated key families. A bare 40-character
+    | alphanumeric token carrying an upper, a lower and a digit collapses to
+    | `{session}` — Laravel's own definition of a session id, which a redis /
+    | memcached / apc / array SESSION_DRIVER turns into one cache key per
+    | visitor per request. The rule is hardcoded
     | (NightOwl\Support\CacheKeyTemplate) — this is a kill switch for a tenant
     | the rule hurts, not a pattern DSL.
     |

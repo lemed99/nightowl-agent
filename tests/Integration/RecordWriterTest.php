@@ -827,6 +827,61 @@ class RecordWriterTest extends TestCase
         $this->assertArrayNotHasKey('user:8213:profile', $byKey, 'literal ids must not appear as rollup groups');
     }
 
+    /**
+     * The payload that actually caused the field incident: a redis
+     * SESSION_DRIVER routes every session read through the cache repository,
+     * so each visitor-request pair emits a cache event keyed by the session
+     * id. These three ids are real, taken off the customer database where
+     * they were 96.8% of the minute cache rollup's rows.
+     */
+    public function test_cache_rollup_collapses_session_ids(): void
+    {
+        $ids = [
+            'Y0xrz025ILHGp8VX2yJLOYI8AOVt6OhmG6OS9L3j',
+            'KywllO9sT7khredx3bfte0iFL35hakXGTcnK4OiE',
+            'CSYt3JQOZJ5lK76YGgTCtWT5d3wd1kU6G8xpShg4',
+        ];
+
+        $records = [];
+        foreach ($ids as $i => $id) {
+            $records[] = $this->sim->makeCacheEvent([
+                'trace_id' => "sess-{$i}",
+                'key' => $id,
+                'store' => 'redis',
+                'type' => 'hit',
+            ]);
+        }
+
+        // A 40-char sha1 is the same length and the same alphabet class. It
+        // must NOT land in the session group.
+        $records[] = $this->sim->makeCacheEvent([
+            'trace_id' => 'sess-sha1',
+            'key' => '9c1185a5c5e9fc54612808977ee8f548b2258d31',
+            'store' => 'redis',
+            'type' => 'hit',
+        ]);
+
+        $this->writer->write($records);
+
+        $raw = self::$pdo->query(
+            "SELECT key, key_pattern FROM nightowl_cache_events WHERE trace_id = 'sess-0'"
+        )->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame($ids[0], $raw['key'], 'raw keeps the literal session id');
+        $this->assertSame('{session}', $raw['key_pattern']);
+
+        $rollup = self::$pdo->query(
+            "SELECT key, SUM(call_count) AS calls FROM nightowl_cache_rollups GROUP BY key ORDER BY key"
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $byKey = array_column($rollup, 'calls', 'key');
+
+        $this->assertSame(3, (int) $byKey['{session}'], 'three session ids, one rollup group');
+        $this->assertSame(1, (int) $byKey['{hex}'], 'the sha1 stays a digest, not a session');
+
+        foreach ($ids as $id) {
+            $this->assertArrayNotHasKey($id, $byKey, 'a literal session id must never be a rollup group');
+        }
+    }
+
     // ─── Per-user rollups (powers the users list) ──────────
 
     /** @return array<string, array<string, string>> rollup rows indexed by user_id */

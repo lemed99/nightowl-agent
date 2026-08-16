@@ -34,9 +34,26 @@ final class CacheKeyTemplateTest extends TestCase
             'livewire limiter' => ['livewire-rate-limiter:c772620bca44ae9fb6a02d3d0573c2393af133ac', 'livewire-rate-limiter:{hex}'],
             'idempotency response' => ['idempotency:16f38194-b403-4016-a8a1-0a43b1fc1034:response', 'idempotency:{uuid}:response'],
             'idempotency processing' => ['idempotency:16f38194-b403-4016-a8a1-0a43b1fc1034:processing', 'idempotency:{uuid}:processing'],
-            // Bare base62 session token — conservatively UNTOUCHED (documented:
-            // no prefix, no delimiter, nothing to classify with confidence).
-            'session token' => ['Y0xrz025ILHGp8VX2yJLOYI8AOVt6OhmG6OS9L3j', 'Y0xrz025ILHGp8VX2yJLOYI8AOVt6OhmG6OS9L3j'],
+            // Bare base62 session tokens, the shape Laravel's own isValidId
+            // defines (ctype_alnum, exactly 40). All three off a real customer
+            // database, where they were 96.8% of the cache rollup.
+            'session token' => ['Y0xrz025ILHGp8VX2yJLOYI8AOVt6OhmG6OS9L3j', '{session}'],
+            'session token 2' => ['KywllO9sT7khredx3bfte0iFL35hakXGTcnK4OiE', '{session}'],
+            'session token 3' => ['CSYt3JQOZJ5lK76YGgTCtWT5d3wd1kU6G8xpShg4', '{session}'],
+            'prefixed session token' => ['laravel_session:KywllO9sT7khredx3bfte0iFL35hakXGTcnK4OiE', 'laravel_session:{session}'],
+
+            // ── The session rule's guards ──
+            // A sha1 is ALSO 40 alnum bytes. The hex rule runs first and must win.
+            'sha1 is not a session' => ['9c1185a5c5e9fc54612808977ee8f548b2258d31', '{hex}'],
+            'sha1 upper is not a session' => ['9C1185A5C5E9FC54612808977EE8F548B2258D31', '{hex}'],
+            // 40 bytes but only two of the three character classes: declined,
+            // exactly as it was before the rule existed.
+            'forty no digit' => ['abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN', 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN'],
+            'forty no upper' => ['abcdefghij0123456789abcdefghij0123456789', 'abcdefghij0123456789abcdefghij0123456789'],
+            'forty no lower' => ['ABCDEFGHIJ0123456789ABCDEFGHIJ0123456789', 'ABCDEFGHIJ0123456789ABCDEFGHIJ0123456789'],
+            // Off by one either way.
+            'thirty nine' => ['KywllO9sT7khredx3bfte0iFL35hakXGTcnK4Oi', 'KywllO9sT7khredx3bfte0iFL35hakXGTcnK4Oi'],
+            'forty one' => ['KywllO9sT7khredx3bfte0iFL35hakXGTcnK4OiEz', 'KywllO9sT7khredx3bfte0iFL35hakXGTcnK4OiEz'],
 
             // ── Common application shapes ──
             'int id' => ['user:8213:profile', 'user:{int}:profile'],
@@ -124,6 +141,51 @@ final class CacheKeyTemplateTest extends TestCase
         $check(str_repeat(':', 100_000));
         $check(str_repeat('🔥', 20_000));
         $check("user:caf\xC3"); // Str::restrict chopping a multibyte tail
+    }
+
+    /**
+     * The whole point of the rule, and the size of what it gives up. A session
+     * id is Str::random(40) over 62 characters; requiring all three character
+     * classes is the false-positive guard, and it costs the runs that happen to
+     * draw no digit at all — under a tenth of a percent, and those merely stay
+     * literal. Deterministic seed: a failure reproduces.
+     */
+    public function test_real_session_ids_collapse_to_one_group(): void
+    {
+        mt_srand(20260816);
+
+        $alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+        $patterns = [];
+        $collapsed = 0;
+        $total = 20_000;
+
+        for ($i = 0; $i < $total; $i++) {
+            $id = '';
+            for ($k = 0; $k < 40; $k++) {
+                $id .= $alphabet[mt_rand(0, 61)];
+            }
+
+            $pattern = CacheKeyTemplate::template($id);
+            if ($pattern === '{session}') {
+                $collapsed++;
+            }
+            $patterns[$pattern] = true;
+        }
+
+        $this->assertGreaterThan(
+            0.99 * $total,
+            $collapsed,
+            'the session rule must collapse essentially every real session id',
+        );
+
+        // Everything that did NOT collapse stayed literal — the rule never
+        // rewrites a session id into some OTHER pattern.
+        foreach (array_keys($patterns) as $pattern) {
+            if ($pattern === '{session}') {
+                continue;
+            }
+            $this->assertSame(40, strlen($pattern), "a declined id was rewritten: {$pattern}");
+        }
     }
 
     public function test_idempotent(): void

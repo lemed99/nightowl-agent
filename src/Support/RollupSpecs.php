@@ -157,8 +157,9 @@ final class RollupSpecs
             table: 'nightowl_cache_rollups',
             source: 'nightowl_cache_events',
             groupColumns: [
-                // Grouped by the TEMPLATED key (CacheKeyTemplate — uuid/hex/
-                // int/email/datetime segments collapsed to placeholders), which
+                // Grouped by the TEMPLATED key (CacheKeyTemplate — uuid/ulid/
+                // hex/int/email/datetime/session-id segments collapsed to
+                // placeholders), which
                 // bounds cardinality for machine-generated key families. The
                 // pattern is computed once in writeCacheEvents (PHP), stashed
                 // as _key_pattern AND stored in the raw key_pattern column —

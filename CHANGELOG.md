@@ -5,6 +5,38 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.3.0] - 2026-08-17
+
+### Changed
+
+- **`CacheKeyTemplate` now collapses Laravel session ids to `{session}`.** A
+  bare 40-character alphanumeric token carrying at least one uppercase letter,
+  one lowercase letter and one digit templates to `{session}`. That is Laravel's
+  own definition of a session id minus the guard —
+  `Illuminate\Session\Store::isValidId` is `ctype_alnum($id) && strlen($id) ===
+  40`, and `generateSessionId()` is `Str::random(40)`.
+
+  It matters because a `redis`, `memcached`, `apc` or `array` `SESSION_DRIVER`
+  routes every session read and write through `CacheBasedSessionHandler` into
+  the cache repository, so each one fires a cache event keyed by that id. On a
+  customer database those ids were 96.8% of the minute cache rollup's rows and
+  433k of its distinct keys, adding roughly 400k hourly rollup rows a day, kept
+  for `rollup_tier_retention.hourly_days`. The template previously declined
+  them: they are bare high-entropy tokens, and a general entropy backstop
+  destroys real vocabulary. The framework defining the shape exactly is what
+  makes this one safe.
+
+  The rule runs after the hex rule on purpose, so a 40-character sha1 stays
+  `{hex}`. Requiring all three character classes is the false-positive guard —
+  vocabulary does not mix case and digits inside a single 40-byte word — and it
+  costs the ~0.09% of real session ids that happen to draw no digit. Measured
+  over 200,000 `Str::random(40)` ids, 99.912% collapse; the rest pass through
+  literally, which is what all of them did before.
+
+  Rows written before the upgrade keep their literal keys.
+  `nightowl:repair-cache-rollup-keys` calls the same class, so re-running it
+  after upgrading folds session ids already on disk.
+
 ## [2.2.1] - 2026-08-16
 
 ### Fixed
