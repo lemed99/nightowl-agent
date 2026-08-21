@@ -8,6 +8,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Facade;
 use NightOwl\Commands\MigrateCommand;
+use NightOwl\Tests\Integration\Concerns\ReleasesAppConnections;
 use PDO;
 use PHPUnit\Framework\TestCase;
 
@@ -33,6 +34,8 @@ use PHPUnit\Framework\TestCase;
  */
 final class RollupTailFreezeTest extends TestCase
 {
+    use ReleasesAppConnections;
+
     private const ROLLUP = 'nightowl_request_concurrency_rollups';
 
     private static ?PDO $pdo = null;
@@ -108,6 +111,8 @@ final class RollupTailFreezeTest extends TestCase
 
     protected function tearDown(): void
     {
+        $this->releaseAppConnections();
+
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication(null);
     }

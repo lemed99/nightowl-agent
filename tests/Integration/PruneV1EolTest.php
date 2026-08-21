@@ -7,6 +7,7 @@ use Illuminate\Database\DatabaseServiceProvider;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use NightOwl\Commands\PruneCommand;
+use NightOwl\Tests\Integration\Concerns\ReleasesAppConnections;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
@@ -20,6 +21,8 @@ use Symfony\Component\Console\Output\BufferedOutput;
  */
 class PruneV1EolTest extends TestCase
 {
+    use ReleasesAppConnections;
+
     private static ?PDO $pdo = null;
 
     private static string $host;
@@ -108,6 +111,8 @@ class PruneV1EolTest extends TestCase
 
     protected function tearDown(): void
     {
+        $this->releaseAppConnections();
+
         // Restore ANY v1 table the EOL retired (it drops every qualifying
         // empty table, not just the one under test) and reset the fence.
         if (self::$pdo !== null) {

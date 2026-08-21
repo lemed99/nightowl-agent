@@ -13,6 +13,7 @@ use NightOwl\Agent\RecordWriter;
 use NightOwl\Commands\BackfillRollupsCommand;
 use NightOwl\Commands\MigrateCommand;
 use NightOwl\Simulator\NightwatchSimulator;
+use NightOwl\Tests\Integration\Concerns\ReleasesAppConnections;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
@@ -46,6 +47,8 @@ use Symfony\Component\Console\Output\BufferedOutput;
  */
 final class RollupBackfillDrainContentionTest extends TestCase
 {
+    use ReleasesAppConnections;
+
     private const MINUTE_TABLE = 'nightowl_query_rollups';
 
     private const TIER_TABLE = 'nightowl_query_hourly_rollups';
@@ -124,6 +127,8 @@ final class RollupBackfillDrainContentionTest extends TestCase
 
     protected function tearDown(): void
     {
+        $this->releaseAppConnections();
+
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication(null);
     }

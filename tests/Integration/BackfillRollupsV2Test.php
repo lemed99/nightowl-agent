@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Facade;
 use NightOwl\Agent\RecordWriter;
 use NightOwl\Commands\BackfillRollupsCommand;
 use NightOwl\Simulator\NightwatchSimulator;
+use NightOwl\Tests\Integration\Concerns\ReleasesAppConnections;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
@@ -24,6 +25,8 @@ use Symfony\Component\Console\Output\BufferedOutput;
  */
 class BackfillRollupsV2Test extends TestCase
 {
+    use ReleasesAppConnections;
+
     private static ?PDO $pdo = null;
 
     private static string $host;
@@ -100,6 +103,8 @@ class BackfillRollupsV2Test extends TestCase
 
     protected function tearDown(): void
     {
+        $this->releaseAppConnections();
+
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication(null);
     }

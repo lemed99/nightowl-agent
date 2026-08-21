@@ -8,6 +8,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use NightOwl\Commands\TestAlertCommand;
 use NightOwl\Tests\Fixtures\ScriptedServer;
+use NightOwl\Tests\Integration\Concerns\ReleasesAppConnections;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
@@ -34,6 +35,8 @@ use Symfony\Component\Console\Output\BufferedOutput;
  */
 final class TestAlertCommandTest extends TestCase
 {
+    use ReleasesAppConnections;
+
     private const SCHEMA = 'nightowl_test_alert_cmd';
 
     private static ?PDO $pdo = null;
@@ -120,6 +123,8 @@ final class TestAlertCommandTest extends TestCase
 
     protected function tearDown(): void
     {
+        $this->releaseAppConnections();
+
         foreach ($this->servers as $server) {
             $server->cleanup();
         }

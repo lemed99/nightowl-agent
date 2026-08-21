@@ -7,6 +7,7 @@ use Illuminate\Database\DatabaseServiceProvider;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use NightOwl\Commands\PruneCommand;
+use NightOwl\Tests\Integration\Concerns\ReleasesAppConnections;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
@@ -26,6 +27,8 @@ use Symfony\Component\Console\Output\BufferedOutput;
  */
 final class PruneCommandTest extends TestCase
 {
+    use ReleasesAppConnections;
+
     private const SCHEMA = 'nightowl_prune_test';
 
     private static ?PDO $pdo = null;
@@ -101,6 +104,8 @@ final class PruneCommandTest extends TestCase
 
     protected function tearDown(): void
     {
+        $this->releaseAppConnections();
+
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication(null);
 

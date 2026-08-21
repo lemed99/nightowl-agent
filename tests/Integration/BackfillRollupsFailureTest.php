@@ -8,6 +8,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use NightOwl\Commands\BackfillRollupsCommand;
 use NightOwl\Support\QueryHistogram;
+use NightOwl\Tests\Integration\Concerns\ReleasesAppConnections;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
@@ -28,6 +29,8 @@ use Symfony\Component\Console\Output\BufferedOutput;
  */
 final class BackfillRollupsFailureTest extends TestCase
 {
+    use ReleasesAppConnections;
+
     private const SCHEMA = 'nightowl_backfill_failure_test';
 
     /** rollup table => raw source table, per RollupSpecs */
@@ -112,6 +115,8 @@ final class BackfillRollupsFailureTest extends TestCase
 
     protected function tearDown(): void
     {
+        $this->releaseAppConnections();
+
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication(null);
 

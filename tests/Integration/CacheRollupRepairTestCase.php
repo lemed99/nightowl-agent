@@ -9,6 +9,7 @@ use Illuminate\Events\Dispatcher;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use NightOwl\Commands\RepairCacheRollupKeysCommand;
+use NightOwl\Tests\Integration\Concerns\ReleasesAppConnections;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
@@ -35,6 +36,8 @@ use Symfony\Component\Console\Output\BufferedOutput;
  */
 abstract class CacheRollupRepairTestCase extends TestCase
 {
+    use ReleasesAppConnections;
+
     /** Options that select the strategy under test. */
     abstract protected function strategyOptions(): array;
 
@@ -136,6 +139,10 @@ abstract class CacheRollupRepairTestCase extends TestCase
 
     protected function tearDown(): void
     {
+        // A rebuild test opens three connections (nightowl, nightowl_rebuild,
+        // probe_work), so this case is the suite's heaviest accumulator.
+        $this->releaseAppConnections();
+
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication(null);
 

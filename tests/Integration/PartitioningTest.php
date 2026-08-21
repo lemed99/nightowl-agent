@@ -9,6 +9,7 @@ use NightOwl\Commands\PartitionCommand;
 use NightOwl\Support\ConversionInProgressException;
 use NightOwl\Support\PoolerAffinityException;
 use NightOwl\Support\RawPartitions;
+use NightOwl\Tests\Integration\Concerns\ReleasesAppConnections;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
@@ -24,6 +25,8 @@ use Symfony\Component\Console\Output\BufferedOutput;
  */
 final class PartitioningTest extends TestCase
 {
+    use ReleasesAppConnections;
+
     private static ?PDO $pdo = null;
 
     private static string $dsn = '';
@@ -156,6 +159,8 @@ final class PartitioningTest extends TestCase
 
     protected function tearDown(): void
     {
+        $this->releaseAppConnections();
+
         self::ensureLiveConnection();
 
         if (self::$pdo !== null) {
