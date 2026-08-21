@@ -70,7 +70,7 @@ Laravel package installed in customer apps. Receives telemetry from `laravel/nig
 
 ```
 src/Agent/
-  AsyncServer.php        — Event loop, TCP/UDP, multi-fork, health, threshold polling (30s), update-drift warn poll
+  AsyncServer.php        — Event loop, TCP/UDP, multi-fork, health, threshold polling (30s), update-drift warn poll. PINS StreamSelectLoop (never Loop::get()'s auto-pick): kernel-backed loops (ExtUvLoop et al.) share their epoll/io_uring backend across pcntl_fork(), so a forked child's server close() deregisters the PARENT's listeners — agent binds but never accepts, silently, from boot (issue #6, ext-uv hosts). Guarded by EventLoopPinningTest
   VersionDriftWatcher.php — WARN-ONLY update check: logs once per version when installed.php shows a newer agent than the running process (2-tick debounce vs a half-written vendor tree). Never exits — restarting is the operator's call, because supervisor behaviour on a self-initiated exit is unverifiable from inside the agent
   DrainWorker.php        — Child process: batch drain (COPY), WAL checkpoint, IPC metrics, worker ID
   MetricsCollector.php   — Ring buffers, 21 diagnosis rules, lifecycle tracking, system metrics

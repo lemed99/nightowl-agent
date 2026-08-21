@@ -5,6 +5,35 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.3.1] - 2026-08-21
+
+### Fixed
+
+- **The async agent no longer goes deaf at boot on hosts with `ext-uv` (or
+  `ext-ev`/`ext-event`) installed.** `AsyncServer` took whatever loop
+  `Loop::get()` auto-selected; with `ext-uv` loaded that is `ExtUvLoop`, whose
+  backend (an epoll fd, plus an io_uring ring on libuv >= 1.45) is a kernel
+  object shared across `pcntl_fork()`. When the forked drain worker — and the
+  health-alert dispatch child — closed the inherited servers, those `close()`
+  calls deregistered the *parent's* listeners from the shared backend: the
+  agent bound 2407/2409 but never accepted a connection, with nothing in the
+  log and every SDK transmission silently dropped by the fail-open path.
+  Whether it bites at boot depends on the libuv build (the reporter's libuv
+  1.48 host was deaf from boot), but a container repro (strace: the child's
+  `epoll_ctl(EPOLL_CTL_DEL)` removing the parent's listener) proved it bites
+  **deterministically on every drain-worker restart fork and health-alert
+  fork** — the loop is mid-flight there, so the listener is always registered
+  in the shared backend. `ext-uv` is common in the wild because
+  Reverb's docs recommend it, and nothing in the agent's configuration hinted
+  at the difference.
+
+  `AsyncServer` now pins `StreamSelectLoop`, whose watcher state is
+  process-local PHP arrays — the only loop the fork architecture is sound on
+  (php-uv exposes no `uv_loop_fork()`, so there is no safe way to fork under
+  it at all). Nothing is lost: every published throughput number was measured
+  on `stream_select`. Reported with a full root-cause analysis, forensics and
+  a minimal repro by @refringe (GitHub issue #6).
+
 ## [2.3.0] - 2026-08-17
 
 ### Changed

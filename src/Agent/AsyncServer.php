@@ -6,6 +6,7 @@ use NightOwl\Support\AgentInstanceId;
 use React\Datagram\Socket as DatagramSocket;
 use React\EventLoop\Loop;
 use React\EventLoop\LoopInterface;
+use React\EventLoop\StreamSelectLoop;
 use React\EventLoop\TimerInterface;
 use React\Socket\ConnectionInterface;
 use React\Socket\TcpServer;
@@ -101,7 +102,27 @@ final class AsyncServer
         $this->expectedTokenHash = $token !== null
             ? substr(hash('xxh128', $token), 0, 7)
             : null;
-        $this->loop = Loop::get();
+        // Pin the select loop, whatever extensions the host has loaded.
+        // Loop::get() auto-picks a kernel-backed loop (ExtUvLoop / ExtEvLoop /
+        // ExtEventLoop) whenever its extension is present — ext-uv is common
+        // because Reverb's docs recommend it — and those loops cannot coexist
+        // with this class's pcntl_fork() architecture: their backend (an epoll
+        // fd, plus an io_uring ring on libuv >= 1.45) is a kernel object the
+        // fork SHARES, so a child closing an inherited server deregisters the
+        // PARENT's listeners and the agent goes permanently deaf at boot while
+        // looking healthy to the supervisor (GitHub issue #6). php-uv exposes
+        // no uv_loop_fork(), so there is no safe way to fork under it at all.
+        // StreamSelectLoop keeps watcher state in process-local PHP arrays —
+        // the only loop the forked children can safely drop listeners under —
+        // and every published throughput number was measured on it. Replace
+        // only when needed so a select loop a harness already registered
+        // watchers on is never discarded.
+        $loop = Loop::get();
+        if (! $loop instanceof StreamSelectLoop) {
+            $loop = new StreamSelectLoop;
+            Loop::set($loop);
+        }
+        $this->loop = $loop;
         $this->metrics = new MetricsCollector($maxPendingRows, $maxBufferMemory);
         $this->metrics->setDrainWedgeSeconds($drainWedgeSeconds);
     }
@@ -476,7 +497,8 @@ final class AsyncServer
             // process down through the destructors this whole approach exists to
             // avoid. The child never runs the loop, so it is not stopped — only
             // the listeners are dropped, so a slow dispatch cannot hold the
-            // ingest port open.
+            // ingest port open. (Dropping them via close() is fork-safe only
+            // under the pinned StreamSelectLoop — see forkDrainWorker.)
             try {
                 $this->server?->close();
                 $this->udpSocket?->close();
@@ -531,9 +553,13 @@ final class AsyncServer
         if ($pid === 0) {
             // === Child process ===
             // Close inherited sockets so neither the exec'd process nor the
-            // in-process drain loop holds the parent's listeners open. The event
-            // loop's internal FDs (epoll/kqueue) are also inherited but harmless
-            // in a child that never runs the loop.
+            // in-process drain loop holds the parent's listeners open. Going
+            // through close() — which calls removeReadStream on the loop — is
+            // safe ONLY because the constructor pins StreamSelectLoop, whose
+            // watcher lists are process-local PHP arrays. Under a kernel-backed
+            // loop these same calls would issue epoll_ctl against the backend
+            // the fork shares with the parent, deregistering the parent's own
+            // listeners (issue #6).
             $this->server?->close();
             $this->udpSocket?->close();
             $this->healthServer?->close();
