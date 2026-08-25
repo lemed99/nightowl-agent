@@ -1989,14 +1989,22 @@ final class RawPartitions
      */
     public static function unpartitionedPopulated(PDO $conn, ?array $tables = null): array
     {
+        $tables ??= self::TABLES;
+
+        // One catalog read for the whole list — this runs on every
+        // nightowl:migrate, and per-table it was 11 round trips answering a
+        // question the server settles in microseconds (a deploy-path cost that
+        // scales with the customer's app→DB latency, not their data).
+        $stmt = $conn->prepare(
+            "SELECT c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relname = ANY(?::text[])"
+        );
+        $stmt->execute([TableCatalog::textArray($tables)]);
+        $kinds = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+
         $out = [];
-        foreach ($tables ?? self::TABLES as $table) {
-            $stmt = $conn->prepare(
-                "SELECT relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = 'public' AND c.relname = ?"
-            );
-            $stmt->execute([$table]);
-            if ($stmt->fetchColumn() !== 'r') {
+        foreach ($tables as $table) {
+            if (($kinds[$table] ?? null) !== 'r') {
                 continue; // partitioned already, or absent
             }
             if ((bool) $conn->query("SELECT EXISTS (SELECT 1 FROM {$table} LIMIT 1)")->fetchColumn()) {

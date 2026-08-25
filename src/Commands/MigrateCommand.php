@@ -4,10 +4,11 @@ namespace NightOwl\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema;
 use NightOwl\Support\RollupSpec;
 use NightOwl\Support\RollupSpecs;
 use NightOwl\Support\RollupTiers;
+use NightOwl\Support\StorageV2;
+use NightOwl\Support\TableCatalog;
 use NightOwl\Support\V2SequenceFence;
 
 class MigrateCommand extends Command
@@ -34,6 +35,19 @@ class MigrateCommand extends Command
      * one repairs, and repair costs a raw scan, so it waits for certainty.
      */
     private const TAIL_FREEZE_TOLERANCE_SECONDS = 7200;
+
+    /** The bespoke rollup outside RollupSpecs::all() (000063). */
+    private const CONCURRENCY_ROLLUP = 'nightowl_request_concurrency_rollups';
+
+    /**
+     * Which of the tables this command ever asks about exist (name => relkind),
+     * read in ONE statement per phase (TableCatalog) instead of one
+     * `hasTable` / `to_regclass` per question. Reset after the migrate step,
+     * which is the only thing in this run that creates tables.
+     *
+     * @var array<string, string>|null
+     */
+    private ?array $catalog = null;
 
     public function handle(): int
     {
@@ -62,6 +76,10 @@ class MigrateCommand extends Command
             '--force' => true,
         ]);
 
+        // The step above is the only one that creates tables: re-read presence
+        // once before anything below asks.
+        $this->catalog = null;
+
         // Unconditional, and not gated on $exit: the v2 id sequences drift
         // whenever a v1 insert lands after the fence was set, which has nothing
         // to do with whether a migration was pending this run. Re-applying it
@@ -86,6 +104,49 @@ class MigrateCommand extends Command
         }
 
         return $exit;
+    }
+
+    /**
+     * Presence of every table this command can ask about, one statement.
+     *
+     * @return array<string, string>  name => relkind
+     */
+    private function catalog(): array
+    {
+        return $this->catalog ??= TableCatalog::relkinds(
+            DB::connection('nightowl')->getPdo(),
+            self::catalogNames(),
+        );
+    }
+
+    private function tableExists(string $table): bool
+    {
+        return isset($this->catalog()[$table]);
+    }
+
+    /**
+     * Every name any phase of this run probes: rollup bases and tiers, the
+     * concurrency rollup, both raw families, and the singletons.
+     *
+     * @return list<string>
+     */
+    public static function catalogNames(): array
+    {
+        $names = ['nightowl_settings', self::CONCURRENCY_ROLLUP];
+
+        foreach (RollupSpecs::all() as $spec) {
+            $names[] = $spec->table;
+            foreach (RollupTiers::tierTables($spec->table) as $tier) {
+                $names[] = $tier;
+            }
+        }
+
+        foreach (StorageV2::TABLES as $v1 => $v2) {
+            $names[] = $v1;
+            $names[] = $v2;
+        }
+
+        return array_values(array_unique($names));
     }
 
     /**
@@ -188,9 +249,8 @@ class MigrateCommand extends Command
     private function warnIfSketchUnavailable(): void
     {
         $conn = DB::connection('nightowl');
-        $schema = Schema::connection('nightowl');
 
-        if (! $schema->hasTable('nightowl_query_rollups')) {
+        if (! $this->tableExists('nightowl_query_rollups')) {
             return;
         }
 
@@ -205,8 +265,8 @@ class MigrateCommand extends Command
     }
 
     /**
-     * Populate any rollup table that exists but is empty from existing raw
-     * telemetry.
+     * Populate any rollup table that exists but is empty or incomplete from
+     * existing raw telemetry.
      *
      * This closes a trap the API's read path sets: it switches a section to its
      * rollup table the moment that table EXISTS (a per-tenant `to_regclass`
@@ -217,19 +277,23 @@ class MigrateCommand extends Command
      * tables and left them empty until someone remembered to run
      * `nightowl:backfill-rollups`. Doing it here makes migrate self-healing.
      *
-     * Scoped to *empty* tables so a routine re-deploy doesn't re-scan the raw
-     * history behind already-maintained rollups: a populated table is left to
-     * the live drain. An empty table on a no-traffic install is a cheap no-op
-     * (backfill finds no source rows). Backfill is idempotent (replace-per-
-     * bucket) and throttled, so this is safe to run on every deploy.
+     * Scoped to tables with something to heal so a routine re-deploy doesn't
+     * re-scan the raw history behind already-maintained rollups: a populated,
+     * current table is left to the live drain, and an empty table whose raw
+     * source is ALSO empty is complete — there is nothing to roll up, and
+     * treating it as a hole ran a pointless backfill sub-command and printed
+     * the "restart the daemon" warning on every deploy of every app that
+     * simply has no cache events / notifications / outgoing requests yet.
+     * Backfill is idempotent (replace-per-bucket) and throttled, so this is
+     * safe to run on every deploy.
      *
      * Beyond emptiness, migrate detects INCOMPLETE rollups, so no state this
      * release can produce needs a manual nightowl:backfill-rollups:
      *
      * - A base minute table whose earliest bucket is YOUNGER than the raw
      *   history (rollups enabled after raw already existed, or an aborted
-     *   first backfill): full chain for that type. Cheap — two index-backed
-     *   MINs per type.
+     *   first backfill), or whose latest bucket has STOPPED while raw kept
+     *   arriving (baseIsIncompleteFrom): full chain for that type.
      * - A tier whose call_count sum falls SHORT of its chain source's. The
      *   drain writes minute and tier rows in one transaction, so a complete
      *   tier always covers its source — any shortfall is a gap, wherever it
@@ -239,8 +303,16 @@ class MigrateCommand extends Command
      *   whole span, so it heals middle holes too. Retention asymmetry never
      *   false-triggers: tiers keep MORE history than their source (366d/1100d
      *   vs 90d), so pruning only ever pushes the tier sum ABOVE the source's.
-     *   Costs one SUM per rollup table per deploy — ms for typical tenants,
-     *   ~1s per big minute table at an 8M req/day profile.
+     *
+     * Every measurement above comes back in ONE statement (completenessSql):
+     * bounds, raw floor and ceiling, and tier sums for all 15 bases at once.
+     * It used to be ~200 statements — six per base plus a `hasTable` per
+     * table — and on a tenant whose Postgres is a ~100ms hop away that was
+     * the entire 72-second deploy step, on an idle dev box as much as on
+     * prod. A single statement also reads under a single snapshot, which
+     * retires the read-ordering arguments the per-query version needed
+     * (rollup ceiling before raw ceiling, source sum before tier sum): a
+     * drain batch can no longer commit BETWEEN two of these reads.
      *
      * Empty tiers never serve reads (the resolver degrades to the minute
      * tier), but on a high-volume tenant that fallback is exactly the
@@ -251,45 +323,54 @@ class MigrateCommand extends Command
      */
     private function backfillEmptyRollups(): void
     {
-        $schema = Schema::connection('nightowl');
         $conn = DB::connection('nightowl');
 
-        $basesNeedingFull = [];
-        $basesOk = [];
-        $incompleteTiers = [];
+        // Chain order matters: hourly is judged against the minute table,
+        // daily against hourly — mirroring how backfillTiers aggregates.
+        $bases = [];
         foreach (RollupSpecs::all() as $spec) {
-            if (! $schema->hasTable($spec->table)) {
+            if (! $this->tableExists($spec->table)) {
                 continue;
             }
-
-            if ($this->baseIsIncomplete($conn, $spec)) {
-                $basesNeedingFull[] = $spec->table;
-            } else {
-                $basesOk[] = $spec->table;
-            }
-
-            // Chain order matters: hourly is judged against the minute table,
-            // daily against hourly — mirroring how backfillTiers aggregates.
-            $sourceTable = $spec->table;
-            foreach (RollupTiers::tierTables($spec->table) as $tierTable) {
-                if (! $schema->hasTable($tierTable)) {
-                    continue;
-                }
-                if ($this->tierIsIncomplete($conn, $sourceTable, $tierTable)) {
-                    $incompleteTiers[] = $tierTable;
-                }
-                $sourceTable = $tierTable;
-            }
+            $bases[$spec->table] = [
+                'source' => $spec->source,
+                'tiers' => array_values(array_filter(
+                    RollupTiers::tierTables($spec->table),
+                    fn (string $tier): bool => $this->tableExists($tier),
+                )),
+            ];
         }
 
         // The bespoke concurrency rollup sits outside RollupSpecs::all() and
         // would otherwise be created by 000063 and never populated — the API's
         // coverage gate then keeps peak reads on the clamped raw path for up
         // to raw retention after upgrade. Same incompleteness rule as the spec
-        // bases: empty, or its floor younger than raw history.
-        if ($schema->hasTable('nightowl_request_concurrency_rollups')
-            && $this->concurrencyIsIncomplete($conn)) {
-            $basesNeedingFull[] = 'nightowl_request_concurrency_rollups';
+        // bases; no tiers of its own.
+        if ($this->tableExists(self::CONCURRENCY_ROLLUP)) {
+            $bases[self::CONCURRENCY_ROLLUP] = ['source' => 'nightowl_requests', 'tiers' => []];
+        }
+
+        $states = $this->probeCompleteness($conn, $bases);
+
+        $basesNeedingFull = [];
+        $basesOk = [];
+        $incompleteTiers = [];
+        foreach ($bases as $table => $base) {
+            $state = $states[$table];
+
+            if (self::baseIsIncompleteFrom($state['lo'], $state['hi'], $state['raw_min'], $state['raw_max'])) {
+                $basesNeedingFull[] = $table;
+            } elseif ($table !== self::CONCURRENCY_ROLLUP) {
+                $basesOk[] = $table;
+            }
+
+            $sourceSum = $state['sums'][$table];
+            foreach ($base['tiers'] as $tierTable) {
+                if (self::tierIsIncompleteFrom($sourceSum, $state['sums'][$tierTable])) {
+                    $incompleteTiers[] = $tierTable;
+                }
+                $sourceSum = $state['sums'][$tierTable];
+            }
         }
 
         $plan = self::backfillPlan($basesNeedingFull, $basesOk, $incompleteTiers);
@@ -441,25 +522,124 @@ class MigrateCommand extends Command
         return $repaired;
     }
 
-    /** The concurrency-rollup twin of baseIsIncomplete (bespoke, no spec). */
+    /**
+     * The concurrency-rollup twin of the spec-base check (bespoke, no spec).
+     * Kept as its own seam: RollupTailFreezeTest reaches it by reflection to
+     * pin the predicate's detection AND false-positive behaviour.
+     */
     private function concurrencyIsIncomplete($conn): bool
     {
-        return $this->baseIsIncompleteFor(
-            $conn,
-            'nightowl_request_concurrency_rollups',
-            'nightowl_requests',
-        );
-    }
+        $state = $this->probeCompleteness($conn, [
+            self::CONCURRENCY_ROLLUP => ['source' => 'nightowl_requests', 'tiers' => []],
+        ])[self::CONCURRENCY_ROLLUP];
 
-    private function baseIsIncomplete($conn, \NightOwl\Support\RollupSpec $spec): bool
-    {
-        return $this->baseIsIncompleteFor($conn, $spec->table, $spec->source);
+        return self::baseIsIncompleteFrom($state['lo'], $state['hi'], $state['raw_min'], $state['raw_max']);
     }
 
     /**
-     * A minute rollup base is incomplete when it is empty, missing history the
-     * raw table still holds (HEAD), or has stopped advancing while raw kept
-     * arriving (TAIL).
+     * Run completenessSql for the given bases and reshape its single row.
+     *
+     * @param  array<string, array{source: string, tiers: list<string>}>  $bases
+     * @return array<string, array{lo: ?string, hi: ?string, raw_min: ?string, raw_max: ?string, sums: array<string, ?string>}>
+     */
+    private function probeCompleteness($conn, array $bases): array
+    {
+        if ($bases === []) {
+            return [];
+        }
+
+        $rawPresent = array_keys(array_filter(
+            $this->catalog(),
+            static fn (string $kind, string $name): bool => isset(StorageV2::TABLES[$name])
+                || in_array($name, StorageV2::TABLES, true),
+            ARRAY_FILTER_USE_BOTH,
+        ));
+
+        $row = (array) $conn->selectOne(self::completenessSql($bases, $rawPresent));
+
+        $states = [];
+        $i = 0;
+        foreach ($bases as $table => $base) {
+            $key = 'b'.$i++;
+            $sums = [$table => $row["{$key}_sum"]];
+            foreach ($base['tiers'] as $j => $tierTable) {
+                $sums[$tierTable] = $row["{$key}_t{$j}_sum"];
+            }
+            $states[$table] = [
+                'lo' => $row["{$key}_lo"],
+                'hi' => $row["{$key}_hi"],
+                'raw_min' => $row["{$key}_raw_min"],
+                'raw_max' => $row["{$key}_raw_max"],
+                'sums' => $sums,
+            ];
+        }
+
+        return $states;
+    }
+
+    /**
+     * One statement, one row, every number the completeness pass needs.
+     *
+     * Per base `b{i}`: `_lo`/`_hi` (rollup bucket bounds), `_raw_min`/`_raw_max`
+     * (raw floor and ceiling across BOTH storage families — pre-fence rows
+     * live in v1, post-fence in the v2 twin — NULL when neither table exists
+     * or both are empty), `_sum` (call_count over the base) and `_t{j}_sum`
+     * per listed tier. The concurrency base has no call_count; its `_sum`
+     * is emitted as NULL and never read.
+     *
+     * Pure so the shape is unit-testable: every name comes from a constant
+     * (RollupSpecs / RollupTiers / StorageV2), never from input.
+     *
+     * @param  array<string, array{source: string, tiers: list<string>}>  $bases
+     * @param  list<string>  $rawPresent  raw tables (either family) that exist
+     */
+    public static function completenessSql(array $bases, array $rawPresent): string
+    {
+        $cols = [];
+        $i = 0;
+        foreach ($bases as $table => $base) {
+            $key = 'b'.$i++;
+
+            $cols[] = "(SELECT MIN(bucket_start)::text FROM {$table}) AS {$key}_lo";
+            $cols[] = "(SELECT MAX(bucket_start)::text FROM {$table}) AS {$key}_hi";
+
+            $legs = array_values(array_filter(
+                [$base['source'], StorageV2::v2Name($base['source'])],
+                static fn (string $t): bool => in_array($t, $rawPresent, true),
+            ));
+            foreach (['MIN' => 'raw_min', 'MAX' => 'raw_max'] as $agg => $suffix) {
+                if ($legs === []) {
+                    $cols[] = "NULL::text AS {$key}_{$suffix}";
+
+                    continue;
+                }
+                $union = implode(' UNION ALL ', array_map(
+                    static fn (string $t): string => "SELECT {$agg}(created_at) AS m FROM {$t}",
+                    $legs,
+                ));
+                $cols[] = "(SELECT {$agg}(m)::text FROM ({$union}) {$key}_{$suffix}_legs) AS {$key}_{$suffix}";
+            }
+
+            $cols[] = $table === self::CONCURRENCY_ROLLUP
+                ? "NULL::text AS {$key}_sum"
+                : "(SELECT SUM(call_count)::text FROM {$table}) AS {$key}_sum";
+            foreach ($base['tiers'] as $j => $tierTable) {
+                $cols[] = "(SELECT SUM(call_count)::text FROM {$tierTable}) AS {$key}_t{$j}_sum";
+            }
+        }
+
+        return 'SELECT '.implode(', ', $cols);
+    }
+
+    /**
+     * A minute rollup base is incomplete when raw history exists that it does
+     * not cover: it is empty, it is missing history the raw table still holds
+     * (HEAD), or it has stopped advancing while raw kept arriving (TAIL).
+     *
+     * No raw history at all is never incomplete — an empty base over an empty
+     * source has nothing to roll up, and this runs on every deploy of every
+     * tenant, so calling it a hole meant every app without, say, notifications
+     * ran a no-op backfill and got told to restart its daemon each time.
      *
      * Head and tail are separate failures and neither implies the other. The
      * head arm has been here since the tiers shipped: a base whose earliest
@@ -489,54 +669,45 @@ class MigrateCommand extends Command
      * genuinely FILTERED rows would break that: its source ceiling would run
      * ahead of its rollup ceiling with nothing wrong, and every deploy would
      * rescan raw. Such a spec needs its own predicate, not this one.
+     *
+     * All four inputs are read in ONE statement (completenessSql), i.e. under
+     * one snapshot, so no drain batch can land between them.
+     *
+     * @param  ?string  $lo  earliest rollup bucket (NULL: empty base)
+     * @param  ?string  $hi  latest rollup bucket
+     * @param  ?string  $rawMin  earliest raw created_at across both families (NULL: no raw)
+     * @param  ?string  $rawMax  latest raw created_at across both families
      */
-    private function baseIsIncompleteFor($conn, string $rollupTable, string $rawSource): bool
+    public static function baseIsIncompleteFrom(?string $lo, ?string $hi, ?string $rawMin, ?string $rawMax): bool
     {
-        $bounds = $conn->table($rollupTable)
-            ->selectRaw('MIN(bucket_start) AS lo, MAX(bucket_start) AS hi')
-            ->first();
-
-        if ($bounds === null || $bounds->lo === null) {
-            return true; // empty
-        }
-
-        $pdo = $conn->getPdo();
-
-        $rawMin = \NightOwl\Support\StorageV2::rawMinCreatedAt($pdo, $rawSource);
         if ($rawMin === null) {
             return false; // no raw history to be missing
         }
 
-        if (\Carbon\Carbon::parse($rawMin)->startOfMinute()->lessThan(\Carbon\Carbon::parse($bounds->lo))) {
+        if ($lo === null) {
+            return true; // empty, with raw waiting to be rolled up
+        }
+
+        if (\Carbon\Carbon::parse($rawMin)->startOfMinute()->lessThan(\Carbon\Carbon::parse($lo))) {
             return true; // head: raw predates the earliest bucket
         }
 
-        $rawMax = \NightOwl\Support\StorageV2::rawMaxCreatedAt($pdo, $rawSource);
-        if ($rawMax === null) {
+        if ($rawMax === null || $hi === null) {
             return false;
         }
 
-        // Read the ROLLUP ceiling first (above) and raw's second: a drain batch
-        // committing between the two reads then only advances the raw side,
-        // which can at most trigger a redundant repair. The reverse order could
-        // hide a real freeze behind a stale raw ceiling.
-        return \Carbon\Carbon::parse($bounds->hi)->addSeconds(self::TAIL_FREEZE_TOLERANCE_SECONDS)
+        return \Carbon\Carbon::parse($hi)->addSeconds(self::TAIL_FREEZE_TOLERANCE_SECONDS)
             ->lessThan(\Carbon\Carbon::parse($rawMax));
     }
 
     /**
      * A complete tier's call_count sum always covers its chain source's — the
      * drain writes both in one transaction and pruning only removes from the
-     * shorter-retention source. Read the SOURCE first: a drain batch committing
-     * between the two reads then only inflates the tier side, which cannot
-     * false-trigger.
+     * shorter-retention source. Both sums come from the same snapshot.
      */
-    private function tierIsIncomplete($conn, string $sourceTable, string $tierTable): bool
+    public static function tierIsIncompleteFrom(?string $sourceSum, ?string $tierSum): bool
     {
-        $sourceSum = (float) ($conn->table($sourceTable)->sum('call_count') ?? 0);
-        $tierSum = (float) ($conn->table($tierTable)->sum('call_count') ?? 0);
-
-        return $tierSum < $sourceSum;
+        return (float) ($tierSum ?? 0) < (float) ($sourceSum ?? 0);
     }
 
     /**
@@ -603,8 +774,8 @@ class MigrateCommand extends Command
         $primaryHistory = self::primaryHistory();
         // Either family counts: a post-EOL tenant (v1 retired by prune) must
         // still baseline-adopt, or it would misread its own DB as fresh.
-        $tableExists = Schema::connection('nightowl')->hasTable('nightowl_requests')
-            || Schema::connection('nightowl')->hasTable('nightowl_requests_v2');
+        $tableExists = $this->tableExists('nightowl_requests')
+            || $this->tableExists('nightowl_requests_v2');
 
         $toRecord = self::migrationsToRecord($all, $nightowlHistory, $primaryHistory, $tableExists);
 

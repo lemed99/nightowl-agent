@@ -205,4 +205,135 @@ final class MigrateCommandTest extends TestCase
         $this->assertSame([], $plan['full']);
         $this->assertSame([], $plan['tiers_only']);
     }
+
+    // ------------------------------------------------- completeness predicate
+
+    /**
+     * The tinybit.farm shape (2026-08-25): an app that has produced no
+     * outgoing requests, cache events or notifications has three empty rollup
+     * bases over three empty raw sources. Nothing is missing — there is
+     * nothing to roll up — yet every deploy ran three backfill sub-commands
+     * that found "no source rows" and then told the operator to restart the
+     * daemon. Empty over empty is complete.
+     */
+    public function test_empty_base_over_empty_raw_is_complete(): void
+    {
+        $this->assertFalse(MigrateCommand::baseIsIncompleteFrom(lo: null, hi: null, rawMin: null, rawMax: null));
+    }
+
+    public function test_empty_base_with_raw_waiting_is_incomplete(): void
+    {
+        $this->assertTrue(MigrateCommand::baseIsIncompleteFrom(
+            lo: null, hi: null, rawMin: '2026-08-25 10:00:00', rawMax: '2026-08-25 11:00:00',
+        ));
+    }
+
+    public function test_head_raw_predating_the_earliest_bucket_is_incomplete(): void
+    {
+        $this->assertTrue(MigrateCommand::baseIsIncompleteFrom(
+            lo: '2026-08-25 10:00:00', hi: '2026-08-25 11:00:00',
+            rawMin: '2026-08-25 09:00:00', rawMax: '2026-08-25 11:00:00',
+        ));
+    }
+
+    public function test_tail_frozen_past_the_tolerance_is_incomplete(): void
+    {
+        $this->assertTrue(MigrateCommand::baseIsIncompleteFrom(
+            lo: '2026-08-25 06:00:00', hi: '2026-08-25 06:00:00',
+            rawMin: '2026-08-25 06:00:00', rawMax: '2026-08-25 12:00:00',
+        ), 'six hours behind raw is a freeze');
+    }
+
+    public function test_drain_lag_inside_the_tolerance_is_complete(): void
+    {
+        $this->assertFalse(MigrateCommand::baseIsIncompleteFrom(
+            lo: '2026-08-25 06:00:00', hi: '2026-08-25 10:20:00',
+            rawMin: '2026-08-25 06:00:00', rawMax: '2026-08-25 12:00:00',
+        ), '100 minutes behind is a backlog, not a freeze (tolerance is 120)');
+    }
+
+    public function test_populated_base_with_raw_pruned_away_is_complete(): void
+    {
+        $this->assertFalse(MigrateCommand::baseIsIncompleteFrom(
+            lo: '2026-08-25 06:00:00', hi: '2026-08-25 12:00:00', rawMin: null, rawMax: null,
+        ));
+    }
+
+    public function test_tier_short_of_its_source_is_incomplete(): void
+    {
+        $this->assertTrue(MigrateCommand::tierIsIncompleteFrom(sourceSum: '100', tierSum: '99'));
+        $this->assertFalse(MigrateCommand::tierIsIncompleteFrom(sourceSum: '100', tierSum: '100'));
+        $this->assertFalse(MigrateCommand::tierIsIncompleteFrom(sourceSum: '100', tierSum: '150'), 'retention asymmetry pushes the tier ABOVE its source');
+        $this->assertFalse(MigrateCommand::tierIsIncompleteFrom(sourceSum: null, tierSum: null), 'empty over empty');
+        $this->assertTrue(MigrateCommand::tierIsIncompleteFrom(sourceSum: '1', tierSum: null), 'an empty tier over a populated source is the classic hole');
+    }
+
+    // ---------------------------------------------------- one-statement probe
+
+    /**
+     * The whole reason migrate is fast again on a distant database: every
+     * measurement for every base rides ONE statement. The SQL shape is pinned
+     * here so a future per-table "just one more query" cannot creep back in
+     * unnoticed — that is exactly how it reached ~200 statements per deploy.
+     */
+    public function test_completeness_sql_is_one_statement_covering_every_base(): void
+    {
+        $sql = MigrateCommand::completenessSql(
+            [
+                'nightowl_request_rollups' => [
+                    'source' => 'nightowl_requests',
+                    'tiers' => ['nightowl_request_hourly_rollups', 'nightowl_request_daily_rollups'],
+                ],
+                'nightowl_notification_rollups' => [
+                    'source' => 'nightowl_notifications',
+                    'tiers' => ['nightowl_notification_hourly_rollups'],
+                ],
+                'nightowl_request_concurrency_rollups' => [
+                    'source' => 'nightowl_requests',
+                    'tiers' => [],
+                ],
+            ],
+            rawPresent: ['nightowl_requests', 'nightowl_requests_v2'],
+        );
+
+        $this->assertStringStartsWith('SELECT ', $sql);
+        $this->assertSame(1, substr_count($sql, 'SELECT (SELECT MIN(bucket_start)'), 'a single SELECT list, not a batch of statements');
+
+        // Base 0: both raw families present → both legs in the union.
+        $this->assertStringContainsString('SELECT MIN(created_at) AS m FROM nightowl_requests UNION ALL SELECT MIN(created_at) AS m FROM nightowl_requests_v2', $sql);
+        $this->assertStringContainsString('AS b0_raw_min', $sql);
+        $this->assertStringContainsString('AS b0_raw_max', $sql);
+        $this->assertStringContainsString('(SELECT SUM(call_count)::text FROM nightowl_request_rollups) AS b0_sum', $sql);
+        $this->assertStringContainsString('(SELECT SUM(call_count)::text FROM nightowl_request_hourly_rollups) AS b0_t0_sum', $sql);
+        $this->assertStringContainsString('(SELECT SUM(call_count)::text FROM nightowl_request_daily_rollups) AS b0_t1_sum', $sql);
+
+        // Base 1: neither raw family exists → NULL, and no reference to the
+        // absent tables (a 42P01 would take the whole statement down).
+        $this->assertStringContainsString('NULL::text AS b1_raw_min', $sql);
+        $this->assertStringContainsString('NULL::text AS b1_raw_max', $sql);
+        $this->assertStringNotContainsString('FROM nightowl_notifications ', $sql);
+        $this->assertStringContainsString('AS b1_t0_sum', $sql);
+        $this->assertStringNotContainsString('b1_t1_sum', $sql);
+
+        // Base 2: the concurrency rollup has no call_count column.
+        $this->assertStringContainsString('NULL::text AS b2_sum', $sql);
+        $this->assertStringNotContainsString('SUM(call_count)::text FROM nightowl_request_concurrency_rollups', $sql);
+    }
+
+    public function test_catalog_names_cover_every_table_the_run_asks_about(): void
+    {
+        $names = MigrateCommand::catalogNames();
+
+        $this->assertSame($names, array_values(array_unique($names)), 'no duplicates');
+        foreach ([
+            'nightowl_settings',
+            'nightowl_request_concurrency_rollups',
+            'nightowl_query_rollups', 'nightowl_query_hourly_rollups', 'nightowl_query_daily_rollups',
+            'nightowl_notification_rollups',
+            'nightowl_requests', 'nightowl_requests_v2',
+            'nightowl_logs', 'nightowl_logs_v2',
+        ] as $expected) {
+            $this->assertContains($expected, $names);
+        }
+    }
 }

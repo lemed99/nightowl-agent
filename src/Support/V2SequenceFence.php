@@ -89,17 +89,28 @@ final class V2SequenceFence
         $overlapping = [];
         $failures = [];
 
-        foreach (self::presentPairs($conn, $pairs ?? StorageV2::TABLES) as $v1 => $v2) {
+        $present = self::presentPairs($conn, $pairs ?? StorageV2::TABLES);
+        if ($present === []) {
+            return ['refenced' => [], 'overlapping' => [], 'failures' => []];
+        }
+
+        // Two round trips for the whole fleet of pairs — the states of every
+        // pair in one statement, then every sequence's next value in one — on
+        // the healthy path, which is every path but a broken one. It was two
+        // PER pair, and this runs on every nightowl:migrate, so on a tenant
+        // whose Postgres is a ~100ms hop away the fence alone cost ~2s of
+        // deploy. The batch is an optimisation, not a change of contract: if
+        // it fails at all, the per-pair reads below take over unchanged, so
+        // one unreadable table still costs only its own fence.
+        $states = self::readStates($conn, $present);
+        $nexts = $states === null ? null : self::nextValues($conn, array_filter(
+            array_column($states, 'seq'),
+            static fn (?string $seq): bool => $seq !== null,
+        ));
+
+        foreach ($present as $v1 => $v2) {
             try {
-                // One round trip for everything the decision needs. MAX/MIN(id)
-                // are index-backed via the PK's leading column (a MergeAppend of
-                // one descent per partition child), so this stays instant on a
-                // populated tenant.
-                $state = $conn->query(
-                    "SELECT pg_get_serial_sequence('{$v2}', 'id') AS seq,
-                            (SELECT COALESCE(MAX(id), 0) FROM {$v1}) AS v1_max,
-                            (SELECT MIN(id) FROM {$v2}) AS v2_min"
-                )->fetch(PDO::FETCH_ASSOC);
+                $state = $states[$v1] ?? self::readState($conn, $v1, $v2);
 
                 if ($state === false || $state['seq'] === null) {
                     // Partitioned parents DO resolve here (000067's own fence
@@ -122,7 +133,7 @@ final class V2SequenceFence
                     $overlapping[] = $v1;
                 }
 
-                $next = self::nextValue($conn, $state['seq']);
+                $next = $nexts[$state['seq']] ?? self::nextValue($conn, $state['seq']);
                 if ($next - $v1Max >= self::MIN_HEADROOM) {
                     continue;
                 }
@@ -137,6 +148,87 @@ final class V2SequenceFence
         }
 
         return ['refenced' => $refenced, 'overlapping' => $overlapping, 'failures' => $failures];
+    }
+
+    /**
+     * Everything the decision needs for one pair. MAX/MIN(id) are index-backed
+     * via the PK's leading column (a MergeAppend of one descent per partition
+     * child), so this stays instant on a populated tenant.
+     */
+    private static function stateSql(string $v1, string $v2): string
+    {
+        return "SELECT '{$v1}' AS v1,
+                       pg_get_serial_sequence('{$v2}', 'id') AS seq,
+                       (SELECT COALESCE(MAX(id), 0) FROM {$v1}) AS v1_max,
+                       (SELECT MIN(id) FROM {$v2}) AS v2_min";
+    }
+
+    /** @return array<string, mixed>|false */
+    private static function readState(PDO $conn, string $v1, string $v2): array|false
+    {
+        return $conn->query(self::stateSql($v1, $v2))->fetch(PDO::FETCH_ASSOC);
+    }
+
+    /**
+     * All pairs' states in one statement, keyed by v1 name; null when the
+     * batch itself fails, which hands every pair to the isolated per-pair path.
+     *
+     * @param  array<string, string>  $pairs
+     * @return array<string, array<string, mixed>>|null
+     */
+    private static function readStates(PDO $conn, array $pairs): ?array
+    {
+        $legs = [];
+        foreach ($pairs as $v1 => $v2) {
+            $legs[] = self::stateSql($v1, $v2);
+        }
+
+        try {
+            $rows = $conn->query(implode(' UNION ALL ', $legs))->fetchAll(PDO::FETCH_ASSOC);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        $states = [];
+        foreach ($rows as $row) {
+            $states[$row['v1']] = $row;
+        }
+
+        return $states;
+    }
+
+    /**
+     * Next id of every sequence in one statement (see nextValue for why the
+     * relation is read directly); null on failure — per-sequence reads then
+     * take over, isolated.
+     *
+     * @param  array<int|string, string>  $sequences
+     * @return array<string, int>|null
+     */
+    private static function nextValues(PDO $conn, array $sequences): ?array
+    {
+        $sequences = array_values(array_unique($sequences));
+        if ($sequences === []) {
+            return [];
+        }
+
+        $legs = array_map(
+            static fn (string $seq): string => "SELECT '{$seq}' AS seq, last_value + (CASE WHEN is_called THEN 1 ELSE 0 END) AS next FROM {$seq}",
+            $sequences,
+        );
+
+        try {
+            $rows = $conn->query(implode(' UNION ALL ', $legs))->fetchAll(PDO::FETCH_ASSOC);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        $nexts = [];
+        foreach ($rows as $row) {
+            $nexts[$row['seq']] = (int) $row['next'];
+        }
+
+        return $nexts;
     }
 
     /**

@@ -211,6 +211,19 @@ final class RollupTailFreezeTest extends TestCase
         $this->assertFalse($this->isIncomplete(), 'with raw pruned away there is nothing to rebuild from');
     }
 
+    /**
+     * Empty over empty. An app that has never produced this telemetry has an
+     * empty rollup AND an empty raw source, and "empty" used to be judged
+     * before raw was even looked at — so every deploy of such an app ran a
+     * backfill sub-command that found "no source rows" and then told the
+     * operator to restart the daemon (tinybit.farm, 2026-08-25: three rollup
+     * types, every deploy, dev and prod).
+     */
+    public function test_an_empty_rollup_over_an_empty_source_is_not_repaired(): void
+    {
+        $this->assertFalse($this->isIncomplete(), 'nothing to roll up is not a hole');
+    }
+
     // ---------------------------------------------------------------- fixtures
 
     private function rawAt(int $epoch): void

@@ -191,13 +191,10 @@ final class StorageV2
      */
     public static function rawMinCreatedAt(PDO $pdo, string $v1Table): ?string
     {
-        $legs = [];
-        foreach ([$v1Table, self::v2Name($v1Table)] as $table) {
-            $exists = $pdo->query("SELECT to_regclass('{$table}') IS NOT NULL AS e")->fetchColumn();
-            if ($exists) {
-                $legs[] = "SELECT MIN(created_at) AS m FROM {$table}";
-            }
-        }
+        $legs = array_map(
+            static fn (string $table): string => "SELECT MIN(created_at) AS m FROM {$table}",
+            self::presentFamily($pdo, $v1Table),
+        );
         if ($legs === []) {
             return null;
         }
@@ -205,6 +202,30 @@ final class StorageV2
         $min = $pdo->query('SELECT MIN(m)::text FROM ('.implode(' UNION ALL ', $legs).') mins')->fetchColumn();
 
         return $min === false || $min === null ? null : (string) $min;
+    }
+
+    /**
+     * Which of a raw table's two family members exist, one round trip (it was
+     * one per member — schema-relative to_regclass, no `public.`).
+     *
+     * @return list<string>
+     */
+    private static function presentFamily(PDO $pdo, string $v1Table): array
+    {
+        $v2Table = self::v2Name($v1Table);
+        $row = $pdo->query(
+            "SELECT to_regclass('{$v1Table}') IS NOT NULL AS v1, to_regclass('{$v2Table}') IS NOT NULL AS v2"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $present = [];
+        if ($row && $row['v1']) {
+            $present[] = $v1Table;
+        }
+        if ($row && $row['v2']) {
+            $present[] = $v2Table;
+        }
+
+        return $present;
     }
 
     /**
@@ -217,13 +238,10 @@ final class StorageV2
      */
     public static function rawMaxCreatedAt(PDO $pdo, string $v1Table): ?string
     {
-        $legs = [];
-        foreach ([$v1Table, self::v2Name($v1Table)] as $table) {
-            $exists = $pdo->query("SELECT to_regclass('{$table}') IS NOT NULL AS e")->fetchColumn();
-            if ($exists) {
-                $legs[] = "SELECT MAX(created_at) AS m FROM {$table}";
-            }
-        }
+        $legs = array_map(
+            static fn (string $table): string => "SELECT MAX(created_at) AS m FROM {$table}",
+            self::presentFamily($pdo, $v1Table),
+        );
         if ($legs === []) {
             return null;
         }

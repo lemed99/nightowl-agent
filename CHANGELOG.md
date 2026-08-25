@@ -5,6 +5,33 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.3.2] - 2026-08-25
+
+### Fixed
+
+- **`nightowl:migrate` no longer takes over a minute per deploy on a database
+  that is a network hop away.** The steady-state run ("Nothing to migrate",
+  every rollup already complete) issued ~250 statements — a `hasTable` per
+  rollup table, two `to_regclass` probes plus an aggregate per raw family, two
+  `SUM`s per tier, two per storage-v2 sequence pair, a relkind per raw table —
+  each a catalog lookup the server answers in microseconds and the network
+  charges a full round trip for. Nothing about that count depended on data
+  volume, which is why a customer measured the same 72 seconds on an idle dev
+  server and on production: 0.6s against a local database, 80s through a
+  100ms-RTT link. The completeness pass now reads every base's bounds, raw
+  floor and ceiling, and tier sums in ONE statement (`completenessSql`, under
+  one snapshot — which also retires the read-ordering arguments the per-query
+  version needed), table presence comes from one catalog statement per phase
+  (`TableCatalog`), and the v2 sequence fence reads all pairs in two. 249
+  statements → 16; 80s → 6s on the same 100ms link.
+
+- **An empty rollup table over an empty raw source is no longer treated as
+  incomplete.** An app that has produced no outgoing requests, cache events or
+  notifications used to have those three types flagged on every deploy, run a
+  backfill sub-command each that found "no source rows", and then be told to
+  restart the daemon. Empty over empty is complete; the warning only prints
+  when work was done.
+
 ## [2.3.1] - 2026-08-21
 
 ### Fixed
