@@ -57,7 +57,7 @@ final class MigrationRunner
         // with its own static state. Probe the NEWEST migration's observable
         // effect — probing an early artifact would skip every migration added
         // since the test DB was first provisioned. Update this probe whenever
-        // a migration is added (high-water 000070 linear ddsketch aggregate;
+        // a migration is added (high-water 000071 rollup tier autovacuum floor; 000070 linear ddsketch aggregate;
         // 000069 v2 id-sequence re-fence is artifact-less and rides
         // REPLAY_ALWAYS instead of a clause; before that 000068
         // dict_trace.created_at, 000066 dictionaries + 000067 raw v2 family,
@@ -86,6 +86,18 @@ final class MigrationRunner
                 "SELECT (SELECT format_type(a.aggtranstype, NULL) FROM pg_aggregate a
                          JOIN pg_proc p ON p.oid = a.aggfnoid
                          WHERE p.proname = 'nightowl_ddsketch_agg') = 'bigint[]' AS present"
+            )->present
+            && Schema::connection('nightowl')->getConnection()->selectOne(
+                // 000071's only artifact is reloptions, so probe them directly.
+                // A tier table is the right probe: the absolute vacuum floor is
+                // applied to the coarse tiers and nowhere else.
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_class c
+                       JOIN pg_namespace n ON n.oid = c.relnamespace
+                      WHERE n.nspname = current_schema()
+                        AND c.relname = 'nightowl_request_daily_rollups'
+                        AND c.reloptions @> ARRAY['autovacuum_vacuum_threshold=50000']
+                 ) AS present"
             )->present) {
             // Warm DB: the glob/replay loop below never runs, so an
             // artifact-less migration would never execute in CI once the test DB

@@ -5,6 +5,39 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.3.3] - 2026-08-28
+
+### Fixed
+
+- **Rollup tier tables no longer thrash autovacuum.** Migration 000055 set
+  `autovacuum_vacuum_scale_factor = 0.02` on every rollup table. On the minute
+  tables that is right, but the drain upserts all three tiers on every batch, so
+  the coarse tiers absorb the SAME update volume while holding 60x/1440x fewer
+  rows — and 2% of a 574-row daily table is ~61 dead tuples, reached in seconds.
+  Postgres re-read those tables from disk every `autovacuum_naptime`, forever.
+  A live tenant showed 3,227 lifetime vacuums on `nightowl_job_daily_rollups`
+  (574 rows, 67 MB) against 32 on `nightowl_query_rollups` (1.3M rows, 1.7 GB),
+  totalling ~45 GB/hour of reads across the rollup tables — contending for the
+  buffer pool and IOPS the drain needs, which showed up as peak-hour drain
+  backlog and a trailing gap at the right edge of every chart. Migration 000071
+  adds an absolute `autovacuum_vacuum_threshold`/`autovacuum_analyze_threshold`
+  of 50,000 to the hourly and daily tiers, keeping the 0.02 factor alongside it
+  so large tier tables on big tenants still scale proportionally. The minute
+  tables are deliberately left proportional — retention DELETEs against them
+  produce dead tuples that genuinely need collecting.
+- **`nightowl:repair-cache-rollup-keys` no longer strips reloptions.**
+  `CacheRollupSwap` built the replacement table with `CREATE TABLE ... (LIKE ...)`,
+  which does not copy reloptions at any `INCLUDING` level, then renamed it over
+  the original — so every cache-rollup key repair silently dropped `fillfactor`
+  and the autovacuum tuning and left the tables on server defaults. It now copies
+  the live table's reloptions onto the rebuilt copy before the swap.
+- **Rollup reloptions are now applied by catalog discovery, not a hand-list.**
+  The hand-listed table sets in 000053/000054/000055 are why
+  `nightowl_request_concurrency_rollups` (added afterwards in 000063) and the
+  three `nightowl_cache_*_rollups` tables were sitting in production with no
+  reloptions at all. 000071 enumerates `nightowl\_%\_rollups` from `pg_class`,
+  so a rollup type added later cannot silently miss the policy again.
+
 ## [2.3.2] - 2026-08-25
 
 ### Fixed

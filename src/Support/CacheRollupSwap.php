@@ -561,6 +561,35 @@ final class CacheRollupSwap
     }
 
     /**
+     * `CREATE TABLE ... LIKE` does NOT copy reloptions at any INCLUDING level
+     * (migration 000054 documents the same trap for the tier tables), and the
+     * rebuilt table is RENAMEd over the original — so without this every swap
+     * silently strips fillfactor and the autovacuum tuning from the cache
+     * rollups and leaves them on the server defaults. Observed in production:
+     * all three nightowl_cache_*_rollups tables sat with no reloptions while
+     * every other rollup table carried them.
+     *
+     * Copied from the live table rather than restated, so this keeps tracking
+     * whatever the migrations set without needing to know the values.
+     */
+    private function copyRelOptions(string $table, string $new): void
+    {
+        $opts = $this->work->selectOne(
+            'SELECT array_to_string(c.reloptions, \', \') AS opts
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = current_schema() AND c.relname = ?',
+            [$table]
+        );
+
+        if ($opts === null || ($opts->opts ?? '') === '') {
+            return;
+        }
+
+        $this->work->statement("ALTER TABLE {$new} SET ({$opts->opts})");
+    }
+
+    /**
      * Chunked by bucket range so the aggregate's working set stays bounded — a
      * single GROUP BY over 45M rows is one enormous sort or hash. Every chunk
      * merges additively, so the chunk size changes nothing about the result.
@@ -569,6 +598,7 @@ final class CacheRollupSwap
     {
         $this->work->statement("CREATE TABLE {$new} (LIKE {$table} INCLUDING DEFAULTS INCLUDING COMMENTS INCLUDING STORAGE)");
         $this->work->statement("ALTER TABLE {$new} ADD PRIMARY KEY (".implode(', ', $pk).')');
+        $this->copyRelOptions($table, $new);
 
         $bounds = $this->work->selectOne("SELECT min(bucket_start) AS lo, max(bucket_start) AS hi FROM {$table}");
         if ($bounds->lo === null) {

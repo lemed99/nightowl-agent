@@ -119,6 +119,16 @@ abstract class CacheRollupRepairTestCase extends TestCase
                 max_duration bigint,
                 PRIMARY KEY (key, store, bucket_start, environment)
             )');
+
+            // Migrations 000053/000055/000071. Carried here because the swap
+            // RENAMEs its rebuild over the live table, so a fixture without
+            // reloptions cannot detect the swap dropping them — which is
+            // exactly how the real cache rollups ended up on server defaults.
+            $opts = 'fillfactor = 70, autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02';
+            if (str_ends_with($table, '_hourly_rollups') || str_ends_with($table, '_daily_rollups')) {
+                $opts .= ', autovacuum_vacuum_threshold = 50000, autovacuum_analyze_threshold = 50000';
+            }
+            self::$pdo->exec('ALTER TABLE '.static::schema().'.'.$table.' SET ('.$opts.')');
         }
 
         $this->app = new Application(sys_get_temp_dir().'/nightowl-cache-repair-test');

@@ -81,6 +81,50 @@ final class RepairCacheRollupKeysRebuildTest extends CacheRollupRepairTestCase
             FROM '.static::schema().'.nightowl_cache_rollups ORDER BY key')->fetchAll(PDO::FETCH_ASSOC);
     }
 
+    /**
+     * The rebuilt table is RENAMEd over the live one, so anything the swap does
+     * not carry across is silently lost for good. `CREATE TABLE ... (LIKE ...)`
+     * does NOT copy reloptions at any INCLUDING level — which is how all three
+     * nightowl_cache_*_rollups tables ended up in production on the server
+     * defaults, alone among the rollup tables, after a key repair. Losing the
+     * autovacuum tuning here is invisible until the table is being re-read from
+     * disk every naptime (see migration 000071).
+     */
+    public function test_the_swap_carries_reloptions_onto_the_rebuilt_table(): void
+    {
+        $before = $this->relOptions('nightowl_cache_rollups');
+
+        $this->assertNotSame(
+            '', $before,
+            'fixture table has no reloptions, so this test could not detect losing them'
+        );
+
+        $this->insert('nightowl_cache_rollups', 'user:1:profile', ['call_count' => 2, 'total_duration' => 200, 'min_duration' => 90, 'max_duration' => 110]);
+
+        $this->swap()->rebuild('nightowl_cache_rollups');
+
+        $this->assertSame(
+            $before,
+            $this->relOptions('nightowl_cache_rollups'),
+            'the rebuilt table lost the reloptions the live table carried'
+        );
+    }
+
+    /** reloptions of a table, normalised to a sorted comma list. */
+    private function relOptions(string $table): string
+    {
+        $row = DB::connection('nightowl')->selectOne(
+            "SELECT COALESCE((SELECT string_agg(o, ',' ORDER BY o)
+                                FROM unnest(c.reloptions) AS o), '') AS opts
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = current_schema() AND c.relname = ?",
+            [$table]
+        );
+
+        return $row->opts ?? '';
+    }
+
     public function test_an_insert_after_the_snapshot_is_folded_in_exactly_once(): void
     {
         $this->insert('nightowl_cache_rollups', 'user:1:profile', ['call_count' => 2, 'total_duration' => 200, 'min_duration' => 90, 'max_duration' => 110]);
