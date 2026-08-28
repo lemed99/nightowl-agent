@@ -437,9 +437,34 @@ class AgentScalingSystemTest extends TestCase
             $accepted,
         );
 
-        // Agent must still be alive
-        $response = $this->sim->ping();
-        $this->assertSame('2:OK', $response, 'Agent must survive back-pressure load');
+        // Agent must still be alive — and must have RECOVERED, which is a
+        // separate thing this used to conflate with the timer's phase.
+        //
+        // backPressure is set and cleared ONLY by the 5s periodic monitor
+        // (AsyncServer::BACK_PRESSURE_CHECK_INTERVAL); draining the buffer does
+        // not clear it inline. waitForDrain() returns the instant the rows are
+        // visible in PG, which lands at an arbitrary point inside that 5s
+        // window, so pinging immediately after it asserted against where the
+        // timer happened to be rather than against the agent's health — a live,
+        // fully drained agent answers 5:ERROR for up to one whole interval.
+        // Poll instead, which is the same wait the recovery test below spends
+        // as a flat sleep(6). A genuinely dead agent still fails: it never
+        // answers 2:OK, and the deadline expires.
+        $response = null;
+        $deadline = microtime(true) + 15.0;
+        while (microtime(true) < $deadline) {
+            $response = $this->sim->ping();
+            if ($response === '2:OK') {
+                break;
+            }
+            usleep(500_000);
+        }
+
+        $this->assertSame(
+            '2:OK',
+            $response,
+            'Agent must survive back-pressure load and accept again once the buffer has drained',
+        );
     }
 
     public function test_back_pressure_recovery_accepts_after_drain(): void
