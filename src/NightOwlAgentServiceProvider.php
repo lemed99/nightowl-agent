@@ -15,6 +15,7 @@ use NightOwl\Agent\RecordWriter;
 use NightOwl\Agent\VersionDriftWatcher;
 use NightOwl\Agent\Server;
 use NightOwl\Commands\AgentCommand;
+use NightOwl\Commands\BackfillLogContextCommand;
 use NightOwl\Commands\BackfillRollupsCommand;
 use NightOwl\Commands\ClearCommand;
 use NightOwl\Commands\DrainWorkerCommand;
@@ -282,6 +283,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 PartitionCommand::class,
                 DropV1HistogramsCommand::class,
                 BackfillRollupsCommand::class,
+                BackfillLogContextCommand::class,
                 RepairCacheRollupKeysCommand::class,
                 ClearCommand::class,
                 GcDictTracesCommand::class,

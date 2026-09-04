@@ -140,6 +140,32 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Searchable log context
+    |--------------------------------------------------------------------------
+    |
+    | Under storage v2 a log's `context` is stored deflate-compressed, and
+    | PostgreSQL has no inflate — so no SQL predicate can see the plaintext and
+    | the dashboard's log search is narrowed to the message alone. Turning this
+    | on makes the drain store log context UNCOMPRESSED instead, which lets the
+    | search match inside it.
+    |
+    | It trades storage for that: contexts under ~256 bytes barely compress (a
+    | small one gets BIGGER after deflate framing), but large ones compress
+    | well, so what this costs depends entirely on your own payloads. Measure
+    | yours before deciding — `nightowl:backfill-log-context --dry-run` samples
+    | your real rows and reports both sizes.
+    |
+    | Forward-only: flipping this on changes what the drain writes from that
+    | moment. Existing rows stay compressed until you convert them with
+    | `nightowl:backfill-log-context`. Only v2 storage is affected; v1 always
+    | stored context as plain text and has always been searchable.
+    |
+    */
+
+    'log_context_searchable' => (bool) env('NIGHTOWL_LOG_CONTEXT_SEARCHABLE', false),
+
+    /*
+    |--------------------------------------------------------------------------
     | Trace-dictionary GC
     |--------------------------------------------------------------------------
     |

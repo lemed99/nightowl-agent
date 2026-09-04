@@ -131,6 +131,19 @@ final class RecordWriter
      */
     private ?bool $v2Checked = null;
 
+    /**
+     * What the last successfully-reconciled log-context fence state was for
+     * this process: true = open (plaintext), false = closed, null = unknown
+     * (reconcile on the next log batch). Not a cache of the DB value — it is
+     * the edge detector that keeps noteLogContextFence off the hot path.
+     */
+    private ?bool $logContextFenceState = null;
+
+    /** Positive column probe, cached for process life — see logContextColumnExists(). */
+    private ?bool $logContextColumnChecked = null;
+
+    private bool $logContextColumnWarned = false;
+
     private DictionaryCache $dict;
 
     public function __construct(
@@ -157,6 +170,7 @@ final class RecordWriter
         private int $idleTxnTimeoutMs = 30000,
         private bool $cacheKeyTemplateEnabled = true,
         private bool $storageV2Config = true,
+        private bool $logContextSearchable = false,
     ) {
         $this->notifier = $notifier ?? new AlertNotifier;
         $this->dict = new DictionaryCache;
@@ -366,6 +380,7 @@ final class RecordWriter
             // Top-level key (shallow-merge rule) — the operational kill switch:
             // false makes the drain write v1 even when the v2 tables exist.
             storageV2Config: (bool) config('nightowl.storage_v2', true),
+            logContextSearchable: (bool) config('nightowl.log_context_searchable', false),
         );
     }
 
@@ -2146,11 +2161,18 @@ final class RecordWriter
 
     private function writeLogsV2(array $records, int $nowTs): void
     {
+        // Searchable log context: the plaintext goes in `context` instead of
+        // the deflated `context_z`, which is what lets the dashboard's log
+        // search reach inside it (PG has no inflate, so a compressed context
+        // is invisible to every predicate). One column or the other per batch,
+        // never both — the API renders whichever a row populated.
+        $plain = $this->logContextSearchable && $this->logContextColumnExists();
+
         $columns = [
             'created_at', 'ts_us', 'trace_id', 'execution_id',
             'environment_id', 'server_id', 'deploy_id', 'execution_source_id', 'execution_stage_id',
             'execution_preview', 'user_id',
-            'level_id', 'message', 'context_z', 'extra_z', 'channel_id',
+            'level_id', 'message', $plain ? 'context' : 'context_z', 'extra_z', 'channel_id',
         ];
 
         $envId = $this->v2Sid('environment', $this->environment);
@@ -2171,13 +2193,136 @@ final class RecordWriter
                 $r['user'] ?? null,
                 $this->v2Sid('level', $r['level'] ?? 'info'),
                 $r['message'] ?? null,
-                StorageV2::deflateOrNull($r['context'] ?? null),
+                $plain
+                    ? StorageV2::plainOrNull($r['context'] ?? null)
+                    : StorageV2::deflateOrNull($r['context'] ?? null),
                 StorageV2::deflateOrNull($r['extra'] ?? null),
                 $this->v2Sid('channel', $r['channel'] ?? null),
             ];
         }
 
         $this->copyBatch('nightowl_logs_v2', $columns, $rows);
+
+        // Fence AFTER the rows, inside the SAME transaction: it commits with
+        // them or not at all. A fence that outran its rows would advertise a
+        // searchable window the data cannot answer.
+        $this->noteLogContextFence($plain);
+    }
+
+    /**
+     * Keep the searchable-log-context fence in step with what the drain just
+     * wrote (see StorageV2::LOG_CONTEXT_FENCE_KEY for the invariant).
+     *
+     * Fires only on a TRANSITION. The steady state — flag unchanged since the
+     * last batch — is a process-local comparison and costs no statement, so
+     * this is not a per-batch write. A fresh process has no remembered state
+     * and reconciles once on its first log batch, which is what makes a config
+     * change take effect on restart without any other signal.
+     *
+     * Savepoint-isolated, for a reason specific to running inside the drain's
+     * transaction: in PostgreSQL ANY failed statement aborts the whole
+     * transaction, so a plain try/catch here would swallow the cause and then
+     * lose the entire batch at commit with an unrelated 25P02 — the batch
+     * retried forever, the real error nowhere. `nightowl_settings` can
+     * genuinely be missing on a half-migrated tenant, so this is a live path,
+     * not a hypothetical. Rolling back to the savepoint discards only the
+     * fence write and leaves the telemetry intact.
+     *
+     * Failing leaves the fence CONSERVATIVE (absent, or older than it could
+     * be), which costs a narrowed search and never a wrong one. The remembered
+     * state is only updated on success, so the next batch retries.
+     */
+    /**
+     * Whether nightowl_logs_v2 carries the searchable `context` column
+     * (migration 000072) — gating the flag the way v2Enabled() gates the v2
+     * family on its tables.
+     *
+     * Without this gate the flag is a drain-wedge: a customer sets the env var
+     * and updates the package, but the column is not there yet (auto_migrate
+     * off or timed out, a drain worker booted before the migrate ran), and the
+     * COPY into `context` throws 42703. The drain loop rolls the batch back and
+     * retries it, intact, forever — the poison-batch failure mode, with the
+     * buffer filling behind it until back-pressure starts refusing payloads.
+     * Reproduced before this gate existed. Writing compressed instead costs a
+     * narrowed search until the migration runs, and the fence follows $plain so
+     * it correctly stays closed meanwhile.
+     *
+     * Cached for process life on a POSITIVE probe only (run nightowl:migrate
+     * then restart to flip, the same discipline as v2Enabled). A thrown probe
+     * reads as absent for this batch and is not cached, so a transient fault
+     * cannot pin the tenant to compressed for the process's life.
+     */
+    private function logContextColumnExists(): bool
+    {
+        if ($this->logContextColumnChecked === true) {
+            return true;
+        }
+
+        try {
+            $n = $this->pdo()->query(
+                "SELECT count(*) FROM pg_attribute
+                 WHERE attrelid = to_regclass('nightowl_logs_v2')
+                   AND attname = 'context' AND NOT attisdropped"
+            )->fetchColumn();
+            $exists = (int) $n > 0;
+        } catch (\Throwable $e) {
+            error_log('[NightOwl Agent] searchable-log-context column probe failed (writing compressed for this batch): '.$e->getMessage());
+
+            return false;
+        }
+
+        if (! $exists) {
+            if (! $this->logContextColumnWarned) {
+                $this->logContextColumnWarned = true;
+                error_log('[NightOwl Agent] NIGHTOWL_LOG_CONTEXT_SEARCHABLE is on but nightowl_logs_v2 has no `context` column — '
+                    .'writing compressed. Run `php artisan nightowl:migrate` and restart the agent.');
+            }
+
+            return false;
+        }
+
+        return $this->logContextColumnChecked = true;
+    }
+
+    private function noteLogContextFence(bool $plain): void
+    {
+        if ($this->logContextFenceState === $plain) {
+            return;
+        }
+
+        $pdo = $this->pdo();
+        $savepoint = $pdo->inTransaction();
+
+        try {
+            if ($savepoint) {
+                $pdo->exec('SAVEPOINT nightowl_log_context_fence');
+            }
+
+            if ($plain) {
+                StorageV2::openLogContextFence($pdo, gmdate('Y-m-d H:i:s'));
+            } else {
+                StorageV2::closeLogContextFence($pdo);
+            }
+
+            if ($savepoint) {
+                $pdo->exec('RELEASE SAVEPOINT nightowl_log_context_fence');
+            }
+        } catch (\Throwable $e) {
+            if ($savepoint) {
+                // Best-effort: if even the rollback fails the transaction is
+                // already unusable and the drain's own handler owns it.
+                try {
+                    $pdo->exec('ROLLBACK TO SAVEPOINT nightowl_log_context_fence');
+                } catch (\Throwable) {
+                }
+            }
+
+            error_log('[NightOwl Agent] log-context fence update failed (log search stays narrowed): '.$e->getMessage());
+
+            return;
+        }
+
+        $this->logContextFenceState = $plain;
     }
 
     /**

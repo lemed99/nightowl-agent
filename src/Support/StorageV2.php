@@ -45,6 +45,27 @@ final class StorageV2
 
     public const FENCE_KEY = 'v2_fence';
 
+    /**
+     * The searchable-log-context fence: the instant from which EVERY row in
+     * nightowl_logs_v2 carries its context as plaintext in `context` rather
+     * than deflated in `context_z`.
+     *
+     * The API gates log-context search on it — a search is only offered when
+     * the whole window sits at or after this instant, because a predicate the
+     * plaintext rows honour and the compressed rows silently cannot is a
+     * partial match, not a search.
+     *
+     * That makes the invariant load-bearing: every row at or after the fence
+     * MUST be plaintext. Three transitions maintain it (see
+     * RecordWriter::noteLogContextFence and BackfillLogContextCommand):
+     *  - the drain writes plaintext with no fence set  → set it to now
+     *  - the drain writes COMPRESSED while one is set  → delete it (the flag
+     *    was turned back off, so rows after the fence are no longer uniform)
+     *  - a backfill converts a span ending at the fence → move it EARLIER
+     * Only the drain ever deletes it; the backfill only ever walks it back.
+     */
+    public const LOG_CONTEXT_FENCE_KEY = 'log_context_plain_since';
+
     // Mirrors RecordWriter::EVENT_TS_MAX_* — the two clocks must agree so a
     // row's created_at (partition key) and ts_us (event time) never diverge
     // on which guard branch they took.
@@ -87,6 +108,58 @@ final class StorageV2
         $value = $stmt->fetchColumn();
 
         return $value === false ? null : (string) $value;
+    }
+
+    /** The searchable-log-context fence ('Y-m-d H:i:s' UTC), or null. */
+    public static function logContextFence(PDO $pdo): ?string
+    {
+        $stmt = $pdo->prepare('SELECT value FROM nightowl_settings WHERE key = ?');
+        $stmt->execute([self::LOG_CONTEXT_FENCE_KEY]);
+        $value = $stmt->fetchColumn();
+
+        return $value === false ? null : (string) $value;
+    }
+
+    /**
+     * Open the searchable window at $at if it is not open already. DO NOTHING
+     * on conflict: an existing fence is always older (the drain only ever sets
+     * it at now(), the backfill only ever walks it back), and moving it
+     * FORWARD would strand already-plaintext rows outside the searchable
+     * window — visible as a search that quietly stops covering them.
+     */
+    public static function openLogContextFence(PDO $pdo, string $at): void
+    {
+        $stmt = $pdo->prepare(
+            'INSERT INTO nightowl_settings (key, value, created_at, updated_at)
+             VALUES (?, ?, now(), now())
+             ON CONFLICT (key) DO NOTHING'
+        );
+        $stmt->execute([self::LOG_CONTEXT_FENCE_KEY, $at]);
+    }
+
+    /**
+     * Walk the fence back to $at — the backfill's only fence write, called
+     * once a span is fully converted. Guarded on `value > ?` so a re-run, or
+     * two backfills racing on different spans, can never move it forward.
+     */
+    public static function extendLogContextFence(PDO $pdo, string $at): void
+    {
+        $stmt = $pdo->prepare(
+            'UPDATE nightowl_settings SET value = ?, updated_at = now()
+             WHERE key = ? AND value > ?'
+        );
+        $stmt->execute([$at, self::LOG_CONTEXT_FENCE_KEY, $at]);
+    }
+
+    /**
+     * Close the searchable window: the drain wrote a compressed context, so
+     * rows after the fence are no longer uniformly plaintext and the API must
+     * stop offering the search until a later flip re-opens it.
+     */
+    public static function closeLogContextFence(PDO $pdo): void
+    {
+        $stmt = $pdo->prepare('DELETE FROM nightowl_settings WHERE key = ?');
+        $stmt->execute([self::LOG_CONTEXT_FENCE_KEY]);
     }
 
     /**
@@ -154,6 +227,31 @@ final class StorageV2
         self::logOnce($field, 'not a 32-char hex digest');
 
         return null;
+    }
+
+    /**
+     * The searchable twin of deflateOrNull: the SAME normalization (arrays
+     * json_encoded, no-information placeholders mapped to NULL) with the
+     * deflate step omitted, for the uncompressed `context` column.
+     *
+     * Placeholder mapping matters as much here as it does there: storing '{}'
+     * as searchable text would make every empty context a row that any
+     * needle-free search has to consider, and would render an empty JSON
+     * object in the UI where a v1 row shows nothing.
+     */
+    public static function plainOrNull(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (! is_string($value)) {
+            $value = json_encode($value);
+            if ($value === false) {
+                return null;
+            }
+        }
+
+        return in_array($value, self::BLOB_PLACEHOLDERS, true) ? null : $value;
     }
 
     /**

@@ -281,6 +281,9 @@ final class DrainWorker
             // Storage-v2 kill switch — false reverts the drain to the v1
             // tables without a schema change. Top-level key (shallow merge).
             storageV2Config: (bool) config('nightowl.storage_v2', true),
+            // Searchable log context — stores a log's context uncompressed so
+            // the dashboard's log search can match inside it. Top-level key.
+            logContextSearchable: (bool) config('nightowl.log_context_searchable', false),
         );
 
         $workerLabel = $this->totalWorkers > 1

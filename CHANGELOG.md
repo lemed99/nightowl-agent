@@ -5,6 +5,76 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.4.0] - 2026-09-04
+
+### Added
+
+- **Searchable log context (`NIGHTOWL_LOG_CONTEXT_SEARCHABLE`, default off).**
+  Under storage v2 a log's `context` is a deflate stream in `context_z bytea`,
+  and Postgres has no inflate (no built-in, and pgcrypto does not add one), so
+  no predicate can see the plaintext — which is why the dashboard narrows a log
+  search to the message alone. With the flag on, `writeLogsV2` stores the
+  plaintext in the new `context` column (migration 000072) instead, and an
+  ordinary `LIKE` works again. `extra` stays compressed; nothing searches it.
+
+  The flag trades storage for that, by an amount only the tenant's own payloads
+  determine: deflate barely pays under ~256 bytes (a small context comes out
+  BIGGER than it went in) and pays well above it. Hence off by default, and
+  hence `--dry-run` below rather than a documented rule of thumb.
+
+  The flag is gated on the column actually existing (a once-per-process
+  `pg_attribute` probe, `RecordWriter::logContextColumnExists`, the same
+  discipline `v2Enabled()` applies to the v2 tables). Without that gate it was
+  a drain-wedge: flag on, migration not yet run (auto_migrate off or timed out,
+  a drain worker booted first), the COPY into `context` threw 42703 and the
+  drain loop retried the intact batch forever — reproduced before the gate
+  existed. It now writes compressed, warns once, and the fence stays closed.
+
+  The API gates the search on a fence — `log_context_plain_since` in
+  `nightowl_settings` — whose invariant is that every log row at or after it
+  carries plaintext. `RecordWriter::noteLogContextFence` maintains it on
+  TRANSITIONS only (a process-local edge detector, so the steady state costs no
+  statement): the drain opens the fence when it first writes plaintext, and
+  DELETES it if it ever writes a compressed context again, which is what keeps
+  a flag turned back off from stranding unsearchable rows inside a window the
+  dashboard still advertises as searchable. A settings write that fails leaves
+  the fence conservative — a narrowed search, never a wrong one.
+
+- **`nightowl:backfill-log-context`** converts already-stored log context to
+  the searchable form, because the flag alone is forward-only and NightOwl
+  retention is long enough that waiting for old rows to age out is not an
+  answer.
+
+  It walks NEWEST FIRST, moving the fence backwards one committed chunk at a
+  time. That ordering is the design: recent logs (the ones people search)
+  convert first, and an interrupted run leaves a SMALLER searchable window
+  rather than a false one. Rows and the fence move in one transaction, in that
+  direction only — rows without the fence are wasted work a re-run repeats
+  harmlessly, whereas a fence ahead of its rows would advertise a search the
+  data cannot answer. Chunks are paced by measured time with the same
+  proportional controller `nightowl:backfill-rollups` uses, so the pass cannot
+  starve the live drain. `--since` bounds the work, `--vacuum` reclaims the
+  rewritten rows, and `--dry-run` inflates a real sample to report what
+  conversion would actually cost on that tenant's data.
+
+  The pass floors on the oldest LOG ROW rather than the oldest compressed one,
+  which is what makes the off-and-on-again path recoverable: turning the flag
+  off deletes the fence, and a tenant who had already converted their history
+  then has nothing left to convert and only a fence to walk back. Flooring on
+  `context_z IS NOT NULL` would have found no rows, reported "nothing to
+  convert", and left that tenant permanently unsearchable over plaintext data
+  sitting right there. Chunks over converted spans cost one indexed SELECT
+  each, so re-establishing months of coverage is seconds.
+
+### Changed
+
+- Migration 000072 adds `nightowl_logs_v2.context text`. Inert unless the flag
+  is turned on: one nullable column, no rewrite, no index (an unanchored
+  `LIKE '%x%'` cannot use a btree, and the trigram index that could is a
+  `CREATE EXTENSION` the agent must never require of a customer's database).
+  Both columns stay readable forever, so no row ever has to be rewritten to
+  stay VISIBLE — conversion is only ever about SEARCH.
+
 ## [2.3.3] - 2026-08-28
 
 ### Fixed
