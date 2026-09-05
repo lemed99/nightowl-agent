@@ -9,17 +9,6 @@ in the git tags.
 
 ### Changed
 
-- Re-release of 2.4.0 with identical code. The 2.4.0 tag was moved after
-  publication to rewrite its commit message; Packagist keeps a published
-  stable version's reference immutable and blocked the move, so 2.4.0 on
-  Packagist resolves to the original commit and this tag carries the same
-  contents from the rewritten history. Nothing to do on upgrade beyond the
-  2.4.0 steps below.
-
-## [2.4.1] - 2026-09-05
-
-### Changed
-
 - 2.4.0 was withdrawn from Packagist and GitHub shortly after tagging; 2.4.1
   is the same feature release. Everything under 2.4.0 below applies to it,
   including the upgrade steps.
