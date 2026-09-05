@@ -7,13 +7,8 @@ in the git tags.
 
 ## [2.4.1] - 2026-09-05
 
-### Changed
-
-- 2.4.0 was withdrawn from Packagist and GitHub shortly after tagging; 2.4.1
-  is the same feature release. Everything under 2.4.0 below applies to it,
-  including the upgrade steps.
-
-## [2.4.0] - 2026-09-04
+Supersedes the 2.4.0 tag, which was withdrawn shortly after publication; this
+is the feature release.
 
 ### Added
 
