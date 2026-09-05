@@ -16,6 +16,14 @@ in the git tags.
   contents from the rewritten history. Nothing to do on upgrade beyond the
   2.4.0 steps below.
 
+## [2.4.1] - 2026-09-05
+
+### Changed
+
+- 2.4.0 was withdrawn from Packagist and GitHub shortly after tagging; 2.4.1
+  is the same feature release. Everything under 2.4.0 below applies to it,
+  including the upgrade steps.
+
 ## [2.4.0] - 2026-09-04
 
 ### Added
