@@ -194,6 +194,43 @@ class DictionaryCacheTest extends TestCase
         }
     }
 
+    /**
+     * The warm is the one write outside doWrite()'s try, so the classifier that
+     * normally names the failing table never runs for it. warmingTable() is how
+     * RecordWriter names it instead — without it a dict failure reached the drain
+     * worker with a null lastWriteError, which it files as a LOCAL SQLite error:
+     * neither health clock stamped, no DRAIN_WRITE_FAILING, nothing for
+     * quarantine's per-table breaker to count.
+     */
+    public function test_warm_names_the_table_it_died_on(): void
+    {
+        $cache = new DictionaryCache;
+
+        $this->assertNull($cache->warmingTable(), 'no table outside a warm');
+
+        self::$pdo->exec(
+            "ALTER TABLE nightowl_dict_route
+             ADD CONSTRAINT nightowl_dict_route_test_reject CHECK (path <> 'rejected-by-test')"
+        );
+
+        try {
+            $cache->warm(self::$pdo, [
+                'string' => [['environment', 'production']],
+                'route' => [[str_repeat('a', 32), 'GET', '', 'rejected-by-test', 'r', 'A@b', '["GET"]']],
+            ]);
+            $this->fail('the constrained route should have failed the warm');
+        } catch (\PDOException) {
+            $this->assertSame('nightowl_dict_route', $cache->warmingTable());
+        } finally {
+            self::$pdo->exec('ALTER TABLE nightowl_dict_route DROP CONSTRAINT nightowl_dict_route_test_reject');
+        }
+
+        // A later clean warm clears it again — a stale name must never be
+        // attributed to the next batch's failure.
+        $cache->warm(self::$pdo, ['string' => [['queue', 'default']]]);
+        $this->assertNull($cache->warmingTable());
+    }
+
     public function test_in_txn_resolution_is_staged_until_promoted(): void
     {
         $cache = new DictionaryCache;

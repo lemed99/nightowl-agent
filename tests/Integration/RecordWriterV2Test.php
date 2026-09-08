@@ -203,6 +203,122 @@ class RecordWriterV2Test extends TestCase
         $this->assertSame(strtolower((string) $e['_group']), strtolower($issue['group_hash']));
     }
 
+    // ------------------------------------------------- oversized dict values
+
+    /**
+     * A route path longer than 000066's varchar(512) used to reject the entire
+     * batch with SQLSTATE 22001 from DictionaryCache::warm — before the batch
+     * transaction, with quarantine off by default and the batch re-claimed
+     * intact every loop, so the tenant's drain stopped permanently
+     * (BrokerCentral, 2026-09-08). 000073 widens path/action to text, so the
+     * value now lands WHOLE rather than merely not wedging.
+     */
+    public function test_over_long_route_path_and_action_land_whole(): void
+    {
+        $path = '/api/'.str_repeat('segment/', 120).'edge';   // ~965 chars
+        $action = 'App\\Http\\Controllers\\'.str_repeat('Deeply\\Nested\\', 60).'Controller@index';
+
+        $this->writer->write([$this->sim->makeRequest([
+            'route_path' => $path,
+            'route_action' => $action,
+        ])]);
+
+        $row = self::$pdo->query('
+            SELECT rt.path, rt.action
+            FROM nightowl_requests_v2 req
+            JOIN nightowl_dict_route rt ON rt.id = req.route_id
+        ')->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertGreaterThan(512, strlen($path));
+        $this->assertSame($path, $row['path'], 'a long route path must be stored whole, not truncated');
+        $this->assertSame($action, $row['action']);
+    }
+
+    /**
+     * dict_string.value stays varchar(512) (it is half of the (kind, value)
+     * UNIQUE constraint, where text would only trade 22001 for a btree
+     * row-size 54000), so an over-long label is CLAMPED. What matters is that
+     * the batch lands: the clamp is applied at collect time AND in v2Sid, so
+     * the id the row links to is the id of the value actually stored — a clamp
+     * on only one of the two would miss the LRU, fall into
+     * resolveStringInTxn with the full value, and wedge the batch write
+     * instead of the warm.
+     */
+    public function test_over_long_dict_string_label_is_clamped_and_still_links(): void
+    {
+        $server = str_repeat('host-name-', 90); // 900 chars
+
+        $this->writer->write([$this->sim->makeRequest(['server' => $server])]);
+
+        $row = self::$pdo->query("
+            SELECT ds.value
+            FROM nightowl_requests_v2 req
+            JOIN nightowl_dict_string ds ON ds.id = req.server_id
+            WHERE ds.kind = 'server'
+        ")->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertNotFalse($row, 'the request must still link to its server label');
+        $this->assertSame(512, mb_strlen($row['value'], 'UTF-8'));
+        $this->assertSame(mb_substr($server, 0, 512, 'UTF-8'), $row['value']);
+    }
+
+    /** The narrower route columns (varchar(255)) clamp the same way. */
+    public function test_over_long_route_name_is_clamped(): void
+    {
+        $name = str_repeat('a', 400);
+
+        $this->writer->write([$this->sim->makeRequest(['route_name' => $name])]);
+
+        $stored = self::$pdo->query('
+            SELECT rt.name FROM nightowl_requests_v2 req JOIN nightowl_dict_route rt ON rt.id = req.route_id
+        ')->fetchColumn();
+
+        $this->assertSame(str_repeat('a', 255), $stored);
+    }
+
+    /** A query whose origin file overflows 000066's varchar(512) — widened by 000073. */
+    public function test_over_long_query_file_lands_whole(): void
+    {
+        $file = '/var/www/'.str_repeat('vendor/nested/', 45).'Builder.php';
+
+        $this->writer->write([$this->sim->makeQuery(['file' => $file])]);
+
+        $stored = self::$pdo->query('
+            SELECT ds.file FROM nightowl_queries_v2 q JOIN nightowl_dict_sql ds ON ds.id = q.sql_id
+        ')->fetchColumn();
+
+        $this->assertGreaterThan(512, strlen($file));
+        $this->assertSame($file, $stored);
+    }
+
+    /**
+     * The warm runs OUTSIDE the batch transaction, so doWrite()'s catch — which
+     * normally stamps lastWriteError — never sees it. Unstamped, the drain worker
+     * read a null error and filed the failure as a local SQLite one: no SQLSTATE,
+     * no table, no DRAIN_WRITE_FAILING on the health report, and no table name for
+     * quarantine's systematic-poison breaker.
+     */
+    public function test_dict_warm_failure_is_classified_for_the_health_report(): void
+    {
+        self::$pdo->exec(
+            "ALTER TABLE nightowl_dict_string
+             ADD CONSTRAINT nightowl_dict_string_test_reject CHECK (value <> 'rejected-by-test')"
+        );
+
+        try {
+            $this->writer->write([$this->sim->makeRequest(['server' => 'rejected-by-test'])]);
+            $this->fail('the constrained dict value should have failed the batch');
+        } catch (\Throwable) {
+            $err = $this->writer->lastWriteError;
+            $this->assertIsArray($err);
+            $this->assertSame('23514', $err['sqlstate']);
+            $this->assertSame('nightowl_dict_string', $err['table']);
+            $this->assertFalse($err['connection']);
+        } finally {
+            self::$pdo->exec('ALTER TABLE nightowl_dict_string DROP CONSTRAINT nightowl_dict_string_test_reject');
+        }
+    }
+
     // ------------------------------------------- COPY vs INSERT byte identity
 
     public function test_copy_and_insert_fallback_store_identical_bytes(): void

@@ -703,6 +703,31 @@ final class RecordWriter
                 // the maps by one partial batch per attempt, without bound.
                 $this->dict->discardPending();
 
+                // Classify it as well. Being outside the try below also means the
+                // catch that normally stamps lastWriteError never runs, so a dict
+                // failure reached the drain worker as a NULL error — indistinguish-
+                // able from a local SQLite buffer error, which stamps neither health
+                // clock. A drain wedged here therefore reported no SQLSTATE, no
+                // table and no DRAIN_WRITE_FAILING, and quarantine had no table name
+                // to hold the systematic-poison breaker's streak against.
+                //
+                // ONLY when the database actually rejected something. A warm can also
+                // die on a PHP-level fault that has no SQLSTATE — the outside-the-
+                // transaction assertion above all — and stamping THAT would set the
+                // drain worker's write clock, which both suppresses the accurate
+                // DRAIN_STOPPED ("worker is not processing rows") and raises
+                // DRAIN_WRITE_FAILING in its place: "PostgreSQL is reachable but
+                // rejecting writes", pointing the customer at a database that did
+                // nothing wrong. No SQLSTATE, no write-rejection claim.
+                $sqlstate = $this->sqlStateOf($e);
+                if ($sqlstate !== null) {
+                    $this->lastWriteError = [
+                        'sqlstate' => $sqlstate,
+                        'table' => $this->dict->warmingTable(),
+                        'connection' => $this->isConnectionError($e, $sqlstate),
+                    ];
+                }
+
                 throw $e;
             }
         }
@@ -1203,6 +1228,71 @@ final class RecordWriter
         return $params;
     }
 
+    /**
+     * Clamp one positional dictionary miss row against its table's widths.
+     *
+     * The storage-v2 dictionaries are the one write path that never saw
+     * clampParams/copyBatch: DictionaryCache::warm builds its own INSERTs, so a
+     * route path, controller action, query file or label longer than its
+     * varchar wedged the ENTIRE drain with SQLSTATE 22001. The warm runs before
+     * the batch transaction, quarantine is off by default, and the batch is
+     * re-claimed intact every loop — so one over-long value stopped a tenant's
+     * telemetry indefinitely (BrokerCentral, 2026-09-08).
+     *
+     * $columns is positional against $row; null marks a slot that is not a
+     * length-constrained text column (the content hash, a line number). Only the
+     * STORED columns are clamped — the hash the row is keyed by is computed over
+     * the untruncated values, so two routes that differ only past the width stay
+     * two distinct dictionary rows rather than colliding onto one.
+     *
+     * $limits is resolved ONCE per batch by the caller, never per row:
+     * columnLimits() deliberately does not cache a FAILED probe (see its catch),
+     * so calling it per row would fire an information_schema query per dictionary
+     * miss for as long as Postgres is unwell — the cost this whole path exists to
+     * keep bounded.
+     *
+     * @param  array<string, int>  $limits
+     * @param  array<int, string|null>  $columns
+     * @param  array<int, mixed>  $row
+     * @return array<int, mixed>
+     */
+    private function clampDictRow(string $table, array $limits, array $columns, array $row): array
+    {
+        if (empty($limits)) {
+            return $row;
+        }
+
+        foreach ($columns as $i => $column) {
+            // isset() skips nulls, which need no clamping.
+            if ($column !== null && isset($row[$i], $limits[$column])) {
+                $row[$i] = $this->clampToColumn($table, $column, $row[$i], $limits[$column]);
+            }
+        }
+
+        return $row;
+    }
+
+    /**
+     * Clamp a dict_string value to its column width.
+     *
+     * Unlike the hash-keyed dictionaries, dict_string is keyed by the VALUE
+     * itself — (kind, value) is its unique constraint and the LRU key. So the
+     * clamp has to be applied at every point that value is used, or the collector
+     * would warm one key and the writer would look up another: v2Sid would miss
+     * the LRU, fall through to resolveStringInTxn with the full value, and raise
+     * the same 22001 INSIDE the batch transaction — trading a wedged warm for a
+     * wedged write. Both callers therefore route through this one method.
+     */
+    private function clampDictString(string $value): string
+    {
+        // Reads the width resolved once per batch by collectDictMisses, which
+        // always runs before any v2Sid: this is called for EVERY dictionary-encoded
+        // label of every row, and columnLimits() does not cache a failed probe.
+        return (string) $this->clampToColumn(
+            'nightowl_dict_string', 'value', $value, $this->dictStringMax
+        );
+    }
+
     private function copyBatch(string $table, array $columns, array $rows): void
     {
         if (empty($rows)) {
@@ -1570,10 +1660,20 @@ final class RecordWriter
         $misses = ['string' => [], 'sql' => [], 'route' => [], 'trace' => []];
         $seen = ['string' => [], 'sql' => [], 'route' => [], 'trace' => []];
 
+        // One probe per dictionary per batch (cached for the process once it
+        // succeeds), not one per value — see clampDictRow.
+        $this->dictStringMax = min(
+            $this->columnLimits('nightowl_dict_string')['value'] ?? PHP_INT_MAX,
+            self::DICT_STRING_MAX
+        );
+        $sqlLimits = $this->columnLimits('nightowl_dict_sql');
+        $routeLimits = $this->columnLimits('nightowl_dict_route');
+
         $needString = function (string $kind, mixed $value) use (&$misses, &$seen): void {
             if ($value === null || $value === '' || ! is_string($value)) {
                 return;
             }
+            $value = $this->clampDictString($value);
             $key = $kind."\0".$value;
             if (isset($seen['string'][$key]) || $this->dict->stringId($kind, $value) !== null) {
                 return;
@@ -1618,7 +1718,12 @@ final class RecordWriter
                         $r['_v2_sql_hash'] = $hash;
                         if (! isset($seen['sql'][$hash]) && $this->dict->sqlId($hash) === null) {
                             $seen['sql'][$hash] = true;
-                            $misses['sql'][] = [$hash, $sql, $file, $line === null ? null : (int) $line];
+                            $misses['sql'][] = $this->clampDictRow(
+                                'nightowl_dict_sql',
+                                $sqlLimits,
+                                [null, 'sql', 'file', null],
+                                [$hash, $sql, $file, $line === null ? null : (int) $line],
+                            );
                         }
                         break;
 
@@ -1639,7 +1744,12 @@ final class RecordWriter
                         $r['_v2_route_hash'] = $hash;
                         if (! isset($seen['route'][$hash]) && $this->dict->routeId($hash) === null) {
                             $seen['route'][$hash] = true;
-                            $misses['route'][] = [$hash, $method, $domain, $path, $name, $action, $methods];
+                            $misses['route'][] = $this->clampDictRow(
+                                'nightowl_dict_route',
+                                $routeLimits,
+                                [null, 'method', 'domain', 'path', 'name', 'action', 'methods'],
+                                [$hash, $method, $domain, $path, $name, $action, $methods],
+                            );
                         }
                         break;
 
@@ -1704,6 +1814,8 @@ final class RecordWriter
             return null;
         }
 
+        $value = $this->clampDictString($value);
+
         $id = $this->dict->stringId($kind, $value);
         if ($id !== null) {
             return $id;
@@ -1717,6 +1829,22 @@ final class RecordWriter
             return null;
         }
     }
+
+    /**
+     * Hard ceiling for nightowl_dict_string.value, applied even when the column
+     * is wider. It is half of a UNIQUE btree, whose tuples have a hard ~2704-byte
+     * limit, so an operator who follows clampToColumn's generic "widen it to
+     * text" advice on THIS column would turn a 22001 into a 54000 — the same
+     * wedge under a different code. 512 is the width 000066 chose and 000073
+     * deliberately keeps: it holds closed-set labels, not application strings.
+     */
+    private const DICT_STRING_MAX = 512;
+
+    /**
+     * min(column width, DICT_STRING_MAX), refreshed once per batch. Defaults to
+     * the ceiling so a v2Sid that somehow ran before a collect still clamps.
+     */
+    private int $dictStringMax = self::DICT_STRING_MAX;
 
     /** @var array<string, true> once-per-process log throttle, keyed by column */
     private static array $dictLinkLossLogged = [];

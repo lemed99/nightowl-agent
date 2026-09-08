@@ -5,6 +5,65 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.4.2] - 2026-09-08
+
+### Fixed
+
+- **An over-long route path, controller action, query file or label no longer
+  wedges the drain (SQLSTATE 22001).** The storage-v2 dictionaries were the one
+  write path that never met the width clamp every other table gets:
+  `DictionaryCache::warm` builds its own INSERTs, so any value longer than its
+  `varchar` — `nightowl_dict_route.path`/`.action` (512),
+  `nightowl_dict_sql.file` (512), `nightowl_dict_string.value` (512),
+  `nightowl_dict_route.domain`/`.name`/`.methods` (255) — was rejected with
+  `value too long for type character varying`.
+
+  That rejection was terminal, not occasional. The warm runs BEFORE the batch
+  transaction, poison-payload quarantine is off by default, and the batch is
+  re-claimed intact every loop, so one long value stopped a tenant's telemetry
+  until an operator widened the column by hand. Reported by a customer whose
+  drain had been retrying the same batch (BrokerCentral, 2026-09-08).
+
+  `RecordWriter` now clamps dictionary rows the same way it clamps every other
+  write, so no schema can wedge the drain — including a tenant that has not yet
+  run `nightowl:migrate` for the change below. The hash-keyed dictionaries hash
+  the UNTRUNCATED value, so two routes differing only past the width stay two
+  distinct rows rather than collapsing onto one. `dict_string` is keyed by the
+  value itself, so its clamp is applied both when collecting and in `v2Sid` —
+  clamping only one of the two would have moved the wedge from the warm into
+  the batch write.
+
+- **A dictionary failure now reports itself.** Sitting outside `doWrite`'s try
+  meant the warm never reached the catch that stamps `lastWriteError`, so the
+  drain worker saw a null error and filed it as a LOCAL SQLite problem: no
+  SQLSTATE, no table, and no `DRAIN_WRITE_FAILING` on the health report. A
+  drain wedged on the dictionaries was invisible to monitoring — including
+  ours. The warm now names the table it died on
+  (`DictionaryCache::warmingTable`) and the failure is classified like any
+  other write rejection, which also gives quarantine's per-table
+  systematic-poison breaker a name to count against.
+
+  Only when the database actually rejected something, though: a warm that dies
+  on a PHP-level fault carries no SQLSTATE, and stamping that would suppress
+  the accurate `DRAIN_STOPPED` in favour of `DRAIN_WRITE_FAILING` —
+  "PostgreSQL is reachable but rejecting writes" — pointing the operator at a
+  database that did nothing wrong.
+
+### Changed
+
+- **Migration 000073 widens `nightowl_dict_route.path`, `.action` and
+  `nightowl_dict_sql.file` from `varchar(512)` to `text`,** so a long route or
+  file path is stored WHOLE rather than merely not wedging. `varchar(n)` →
+  `text` is binary-coercible: no table rewrite, no index rebuild, a brief
+  `ACCESS EXCLUSIVE` lock on tables holding hundreds of rows.
+
+  `nightowl_dict_string.value` is deliberately left at 512 — it is half of the
+  `(kind, value)` UNIQUE constraint, and a btree tuple has a hard ~2704-byte
+  ceiling, so `text` there would only trade 22001 for 54000. It holds
+  closed-set labels (environment, server, queue, channel, job class), not
+  application strings, and the clamp caps it at 512 even if the column is
+  widened by hand.
+
 ## [2.4.1] - 2026-09-05
 
 Supersedes the 2.4.0 tag, which was withdrawn shortly after publication; this

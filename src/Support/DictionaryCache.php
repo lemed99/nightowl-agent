@@ -79,6 +79,17 @@ final class DictionaryCache
     /** @var array<int, array{0: string, 1: string, 2: int}> [map, key, id] staged inside the batch txn */
     private array $pending = [];
 
+    /**
+     * Physical table warm() is currently writing, or null when it is not inside
+     * one. The warm runs OUTSIDE the batch transaction, so a failure here never
+     * reaches doWrite()'s catch where currentWriteTarget is stamped — without
+     * this the drain worker saw a null lastWriteError and filed the failure as a
+     * local SQLite error, so a dict wedge carried neither SQLSTATE nor table into
+     * the health report (no DRAIN_WRITE_FAILING) and, with quarantine on, could
+     * not name a table for the systematic-poison breaker.
+     */
+    private ?string $warmingTable = null;
+
     // ---------------------------------------------------------------- lookups
 
     public function stringId(string $kind, string $value): ?int
@@ -116,6 +127,12 @@ final class DictionaryCache
      */
     public function warm(PDO $pdo, array $misses): void
     {
+        // Cleared here rather than in a finally, so a throw leaves the failing
+        // table readable by the caller's classifier. Reset BEFORE the assertion
+        // below: that one belongs to no table, and a previous warm's failure
+        // must not be attributed to it.
+        $this->warmingTable = null;
+
         if ($pdo->inTransaction()) {
             // The invariant above would break silently; fail loudly in tests,
             // visibly in the field.
@@ -123,6 +140,7 @@ final class DictionaryCache
         }
 
         if (($rows = $misses['string'] ?? []) !== []) {
+            $this->warmingTable = 'nightowl_dict_string';
             $this->warmTable(
                 $pdo, $rows,
                 'INSERT INTO nightowl_dict_string (kind, value) VALUES %s ON CONFLICT (kind, value) DO NOTHING',
@@ -135,6 +153,7 @@ final class DictionaryCache
         }
 
         if (($rows = $misses['sql'] ?? []) !== []) {
+            $this->warmingTable = 'nightowl_dict_sql';
             $this->warmTable(
                 $pdo, $rows,
                 'INSERT INTO nightowl_dict_sql (hash, sql, file, line) VALUES %s ON CONFLICT (hash) DO NOTHING',
@@ -148,6 +167,7 @@ final class DictionaryCache
         }
 
         if (($rows = $misses['route'] ?? []) !== []) {
+            $this->warmingTable = 'nightowl_dict_route';
             $this->warmTable(
                 $pdo, $rows,
                 'INSERT INTO nightowl_dict_route (hash, method, domain, path, name, action, methods) VALUES %s ON CONFLICT (hash) DO NOTHING',
@@ -161,6 +181,7 @@ final class DictionaryCache
         }
 
         if (($rows = $misses['trace'] ?? []) !== []) {
+            $this->warmingTable = 'nightowl_dict_trace';
             // Traces are the one GC'd dictionary (nightowl:gc-dict-traces), so
             // their warm differs from the other three in two ways:
             //
@@ -193,6 +214,8 @@ final class DictionaryCache
                 hashPlaceholder: "decode(?, 'hex')",
             );
         }
+
+        $this->warmingTable = null;
     }
 
     // ------------------------------------------------- in-txn fallback (rare)
@@ -242,6 +265,12 @@ final class DictionaryCache
     {
         $this->pending = [];
         $this->trim();
+    }
+
+    /** Table warm() died on, for the caller's failure classification. Null outside a warm. */
+    public function warmingTable(): ?string
+    {
+        return $this->warmingTable;
     }
 
     // ------------------------------------------------------------- internals

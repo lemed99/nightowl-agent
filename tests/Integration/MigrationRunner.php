@@ -57,13 +57,25 @@ final class MigrationRunner
         // with its own static state. Probe the NEWEST migration's observable
         // effect — probing an early artifact would skip every migration added
         // since the test DB was first provisioned. Update this probe whenever
-        // a migration is added (high-water 000072 searchable log context; 000071 rollup tier autovacuum floor; 000070 linear ddsketch aggregate;
+        // a migration is added (high-water 000073 widened dict text columns;
+        // 000072 searchable log context; 000071 rollup tier autovacuum floor; 000070 linear ddsketch aggregate;
         // 000069 v2 id-sequence re-fence is artifact-less and rides
         // REPLAY_ALWAYS instead of a clause; before that 000068
         // dict_trace.created_at, 000066 dictionaries + 000067 raw v2 family,
         // 000063 concurrency rollup, 000064 mail/notification composites,
         // 000065 cache key_pattern).
         if (Schema::connection('nightowl')->hasTable('nightowl_dict_string')
+            && Schema::connection('nightowl')->getConnection()->selectOne(
+                // 000073 changes a column TYPE, so the probe is the type itself —
+                // hasColumn() was already true before it ran.
+                "SELECT EXISTS (
+                     SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = current_schema()
+                        AND table_name = 'nightowl_dict_route'
+                        AND column_name = 'path'
+                        AND data_type = 'text'
+                 ) AS present"
+            )->present
             && Schema::connection('nightowl')->hasColumn('nightowl_logs_v2', 'context')
             && Schema::connection('nightowl')->hasColumn('nightowl_dict_trace', 'created_at')
             && Schema::connection('nightowl')->hasTable('nightowl_requests_v2')
