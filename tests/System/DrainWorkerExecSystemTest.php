@@ -141,8 +141,13 @@ class DrainWorkerExecSystemTest extends TestCase
 
         \$spawner = function (int \$workerId, int \$totalWorkers, string \$sqlitePath) use (\$marker) {
             // Fresh interpreter that proves it ran, then idles so the parent's
-            // SIGCHLD restart logic doesn't fire during the test window.
-            \$code = 'file_put_contents(' . var_export(\$marker, true) . ', getmypid()); usleep(30000000);';
+            // SIGCHLD restart logic doesn't fire during the test window. The
+            // marker is written to a sibling and renamed into place: a plain
+            // file_put_contents creates the file before writing the pid, and
+            // the test's poll returns on is_file() — on a loaded runner it read
+            // an empty marker (CI, 2026-09-09).
+            \$tmp = var_export(\$marker . '.tmp', true);
+            \$code = 'file_put_contents(' . \$tmp . ', getmypid()); rename(' . \$tmp . ', ' . var_export(\$marker, true) . '); usleep(30000000);';
             pcntl_exec(PHP_BINARY, ['-r', \$code]);
             // Only reached if exec failed.
             file_put_contents(\$marker . '.execfail', (string) (error_get_last()['message'] ?? 'unknown'));
