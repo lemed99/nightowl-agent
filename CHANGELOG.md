@@ -5,6 +5,196 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.4.3] - 2026-09-09
+
+### Fixed
+
+- **2.4.2's width clamp was inert on a search_path-scoped tenant, and the drain
+  still stopped dead there.** `columnLimits` probed `information_schema` with
+  `table_schema = 'public'` while the drain's own connection issues no
+  `SET search_path` and writes wherever the role resolves the name — so on a
+  scoped tenant the probe described a different table, or none, and nothing on
+  that connection was clamped: not the dictionaries, not the COPYs, not the
+  rollups. The probe now resolves each table the way an unqualified INSERT does
+  (`pg_table_is_visible`), in one statement covering every `nightowl_*` table.
+
+  Between 2.4.2 and this release a candidate fix used `current_schema()`, which
+  is wrong the other way: PostgreSQL's default search_path is `"$user", public`,
+  and when a schema named after the login role exists — a common layout —
+  `current_schema()` returns that empty schema while the tables resolve in
+  `public`. That candidate regressed the default layout into the same wedge, and
+  was caught in review before release, by running the identical write against a
+  2.4.2 snapshot. Note that the Laravel-side `nightowl` connection (migrate,
+  `TableCatalog`, both GC commands) is pinned to `public` by the service
+  provider, and so are the drain's own rollup probes (`rollupEnabled()` and the
+  rollup column checks). The width probe now resolves the way the drain's
+  INSERTs do, which is what this fix is about; it does not make the package
+  schema-relative. A tenant whose tables live ONLY in a non-public schema gets
+  raw telemetry and nothing else — every rollup is silently skipped there, and
+  `nightowl:migrate`, `nightowl:install` and both GC commands act on `public`.
+  That layout is not supported; the package's contract is `public`, and the
+  fix here is for the common layouts (a role-named schema ahead of `public`,
+  or a mixed layout) where 2.4.2 and a withdrawn candidate each broke.
+
+- **A column widened under a running agent kept being clamped to its old width.**
+  The width cache was held for the process lifetime on the premise that "a
+  migration restarts the agent". It does not: `nightowl:migrate` is a standalone
+  command, and both `NIGHTOWL_AUTO_MIGRATE=false` and `NIGHTOWL_RUN_MIGRATIONS=
+  true` run it against a live drain. Widths are re-probed on a 60-second TTL.
+
+- **Dictionary rows clipped before the migration now repair themselves — in the
+  daemon that clipped them.** The hash-keyed dictionaries hash the UNTRUNCATED
+  value, so once a clipped row existed the same route re-hashed to it and
+  `ON CONFLICT DO NOTHING` left the clipped text forever, including for every
+  route first seen in the window between `composer update` and
+  `nightowl:migrate`. The warm now replaces a stored value with a LONGER one for
+  the same hash (never a shorter one, so a worker still on the old width cannot
+  clobber a repaired row); ids never change. And because that repair only runs
+  for a value the in-memory cache does not hold, the TTL re-probe clears the
+  affected dictionary's cache when its widths change — without that the daemon
+  that wrote the clipped row was exactly the daemon that could never repair it.
+
+  This makes the two hottest dictionaries `ON CONFLICT DO UPDATE`, which needs
+  the `UPDATE` privilege on `nightowl_dict_route` and `nightowl_dict_sql` —
+  checked before any row is touched, so it fails even when no row conflicts. A drain role granted only
+  `SELECT, INSERT` on those two tables — which the "append-only by contract"
+  wording invited — worked on 2.4.2 and stops on 2.4.3 with `42501`. The raw
+  telemetry tables and `nightowl_dict_string` still need no `UPDATE`; the
+  rollup, issues, users and settings upserts and `nightowl_dict_trace` already
+  required it. Column-level grants suffice:
+  `GRANT UPDATE (method, domain, path, name, action, methods) ON nightowl_dict_route`
+  and `GRANT UPDATE (file) ON nightowl_dict_sql`.
+
+- **The clamp's advice could make things worse.** 2.4.2 told an operator to widen
+  every clipped column to `text`, with no warning for the 162 varchar columns
+  that sit in an index — including the cache rollups' primary key — where a
+  btree entry is capped at ~2,704 bytes, so `text` trades a 22001 for a 54000
+  inside the batch transaction, taking the raw COPY with it. The advice is now
+  decided by the column's actual index membership, read from the catalog in
+  the same probe; `nightowl_dict_string.value` keeps its own message (its cap is
+  ours, not the column's). It never says "run `nightowl:migrate`": only four
+  columns have a widening migration (000073's three and 000074's one).
+
+- **v1 `nightowl_requests.route_action` is widened to `text` (migration
+  000074).** It was `varchar(255)` while the v2 dictionary's `action` became
+  `text` in 000073, so a tenant still on v1 storage clipped actions
+  mid-class-name where a v2 tenant stored them whole — and an ignore pattern
+  copied from a v1 dashboard could not match the value being tested.
+
+- **Livewire requests no longer grow `nightowl_dict_route` a row per page
+  state.** `laravel/nightwatch` builds the route action by appending one class
+  name per hydrated component with no dedupe (`CapturesState::
+  captureRequestRouteAction`, 1.26.1). A request hydrating 78 copies of one
+  component reports that class name 78 times — 2,884 bytes for 35 bytes of
+  information — and `nightowl_dict_route` is hashed over that value and never
+  pruned, so 78 and 79 copies each minted a permanent row.
+
+  The drain now collapses the list to its **sorted distinct** members before
+  hashing. Sorted, because order-sensitivity alone minted a row per hydration
+  rotation (measured: 25 rotations of one page → 25 rows). Deduped rather than
+  counted, because a count is the part that keeps changing. Not truncated — an
+  earlier candidate capped the list at 20 and merged genuinely different pages
+  that shared a layout prefix, since on the shared update route the action is
+  the only field that tells pages apart.
+
+  What this bounds: variation in HOW MANY of each component. What it does not
+  bound: variation in WHICH components — every distinct set is its own row, and
+  a page of k components whose subsets all occur can in principle produce 2^k−1
+  rows (measured: 10 components → 1,023 rows). That is interaction-driven, not
+  page-shape-driven. A tenant in that regime wants `NIGHTOWL_IGNORE_ROUTES`.
+
+- **`nightowl:prune` no longer parks an unbounded `ACCESS EXCLUSIVE` request
+  in front of a raw table's readers.** Dropping an expired daily partition
+  locks the parent; with no bound, a prune that ran while
+  `nightowl:gc-dict-routes` held its `SHARE` lock queued behind it and, once
+  queued, blocked every dashboard read of that table for the rest of the GC
+  run. Each DROP now waits at most 3 s, as a ceiling under a tighter
+  `lock_timeout` the session already has, inside one transaction so it is safe
+  behind a transaction-mode pooler; the first refusal leaves the whole table
+  for the next run — its siblings would refuse the same way, and the
+  row-DELETE would otherwise have chewed through the very rows the DROP was
+  going to unlink for free. A holder on a single child (`VACUUM FULL`,
+  `pg_repack`) is handled the same way instead of aborting the prune.
+
+### Added
+
+- **`NIGHTOWL_IGNORE_ROUTES`** — comma-separated patterns; a matching request is
+  dropped at drain time together with the records of its own execution. Matched
+  against path, name and action; `*` is the only wildcard (`?` is literal); a
+  leading slash is optional. Prefer the route NAME for Livewire: Livewire 3
+  registers `livewire/update` named `default.livewire.update`, Livewire 4
+  prefixes the path with a hash of `APP_KEY` (`livewire-09e76b9c/update`,
+  deterministic per install) and names it `default-livewire.update` —
+  `*livewire.update` matches both. Matching runs after the collapse above, so a
+  pattern copied out of the dashboard matches what the dashboard showed.
+
+  Scoped by **execution**, not by trace. Nightwatch propagates a request's trace
+  into the jobs it dispatches, and the queue worker emits the attempt and
+  everything it records — its queries, mail, outgoing calls — in a later drain
+  batch under the same trace but a different execution id. An earlier candidate
+  scoped by trace dropped those when they happened to share a batch with the
+  request and kept them when they did not; whether a job's detail page had
+  content was decided by batching. Three record types are never dropped: an
+  exception (kept on purpose — you ignored a noisy route, not its errors; its
+  "view request" link leads to a request that was never recorded), the
+  `queued-job` dispatch row (it belongs to the request's execution; dropping it
+  while the attempt survived read "QUEUED 0 / PROCESSED 4,102"), and the
+  `job-attempt`.
+
+  This is a drop, not a sample. An ignored request is absent from the request
+  count, from thresholds, and from the error rate — **in whichever direction
+  that route's own health sits**. Ignore a busy endpoint that always succeeds
+  and the error rate rises (its successes leave the denominator). Ignore one
+  that is failing and the error rate falls and hides it. So the agent counts
+  what it drops and reports it beside the rate (`app_vitals.requests_ignored`,
+  cumulative like the other vitals; absent from agents before 2.4.3, where 0
+  means "cannot say"; the sync driver has no health reporting at all, so it
+  never sends it). Best effort across batches: Nightwatch ships a request's
+  children in a separate payload once its 500-record buffer fills, and a child
+  that lands in an EARLIER batch than its request — or on another worker —
+  survives as an orphan, since ignored ids are not remembered across batches.
+  Patterns are validated when read: an entry with invalid
+  UTF-8 would make the matcher's `preg_match` warn on every record, which the
+  daemon promotes to an exception that wedges the drain — such entries are
+  dropped with a log line instead.
+
+- **`nightowl:gc-dict-routes`** — reclaims `nightowl_dict_route` rows no
+  `nightowl_requests_v2` row references, for the bloat a pre-2.4.3 agent
+  accumulated. `--dry-run` reports the count and size.
+
+  **The agent must be stopped, everywhere it runs.** A drain worker caches route
+  ids for its process lifetime and may write the referencing row minutes later,
+  so no re-check inside the delete can protect a cached id; a stopped agent has
+  no cache, and that is the protection. The command refuses while a health port
+  answers, a drain worker's metrics file is fresh, or the ingest buffer was
+  written within the last 10 minutes — and a normal shutdown leaves the buffer
+  fresh, so expect it to refuse for up to 10 minutes after stopping; the
+  refusal says how long. The probes cannot see `--driver=sync` agents or agents
+  on other hosts; the confirmation says so. `--force` skips the confirmation
+  only. For an agent the probes miss, the run takes `SHARE` on the request
+  table for its duration: a writer mid-batch makes the lock wait (not granted
+  within 30s → refuse), and a writer arriving during the run stalls rather than
+  races.
+
+  One transaction; the scan materialises once into a temp table dropped at
+  commit; the delete pages over that table's own ids, so the statement count is
+  proportional to the rows removed. 570,000 orphans reclaim in seconds with PHP
+  memory flat at ~10 MB; the rows themselves are 68 MB to 1.6 GB on a real
+  Livewire tenant, depending on how long the actions were.
+  Orphans interleave with live rows, so plain `VACUUM` frees the space for
+  reuse but does not shrink the file — the command says to run `VACUUM FULL`
+  or pg_repack. Exit 3 means the operator
+  declined.
+
+### Upgrade notes
+
+- The API must be deployed before agents upgrade: a 2.4.3 agent reporting to an
+  API that has not run its `app_vitals` migration gets `42703`, and the whole
+  health report — instance, diagnoses, vitals — rolls back.
+- Run `nightowl:migrate` (000073 and 000074) and restart the agent. A daemon
+  started before the migration picks up the new widths within a minute and
+  repairs a clipped row the next time that route or query appears.
+
 ## [2.4.2] - 2026-09-08
 
 ### Fixed
@@ -25,8 +215,10 @@ in the git tags.
   drain had been retrying the same batch (BrokerCentral, 2026-09-08).
 
   `RecordWriter` now clamps dictionary rows the same way it clamps every other
-  write, so no schema can wedge the drain — including a tenant that has not yet
-  run `nightowl:migrate` for the change below. The hash-keyed dictionaries hash
+  write — including a tenant that has not yet run `nightowl:migrate` for the
+  change below. (Correction in 2.4.3: this held only where the tables are in
+  `public`; the probe was pinned to that schema, so a search_path-scoped tenant
+  was not clamped at all.) The hash-keyed dictionaries hash
   the UNTRUNCATED value, so two routes differing only past the width stay two
   distinct rows rather than collapsing onto one. `dict_string` is keyed by the
   value itself, so its clamp is applied both when collecting and in `v2Sid` —

@@ -1976,9 +1976,67 @@ final class RawPartitions
             return false;
         }
 
-        $conn->exec("DROP TABLE {$historic}");
+        // The same bounded DROP as the daily children: a holder on the parent
+        // means "not this run", never a queued ACCESS EXCLUSIVE in front of its
+        // readers.
+        return self::dropChildBounded($conn, $historic, count: false) !== null;
+    }
 
-        return true;
+    /**
+     * Drop one fully-expired daily child for nightowl:prune, returning the rows
+     * it held — or null when a lock holder was in the way, which the caller
+     * treats as "leave this table for the next run".
+     */
+    public static function dropExpiredChild(PDO $conn, string $child): ?int
+    {
+        return self::dropChildBounded($conn, $child, count: true);
+    }
+
+    /**
+     * DROP TABLE on a child takes ACCESS EXCLUSIVE on the PARENT. Unbounded, that
+     * request queues behind any long holder (nightowl:gc-dict-routes holds SHARE
+     * on nightowl_requests_v2 for its whole run) and, once queued, blocks every
+     * reader of the parent behind it — the API's request reads stall for the
+     * holder's duration. So the wait is bounded, and bounded by withLockTimeout
+     * rather than a bare SET: an operator who lowered NIGHTOWL_DB_LOCK_TIMEOUT_MS
+     * below 3 s did it because 3 s is already an outage on their table, and an
+     * assignment RAISED it (a withdrawn candidate did exactly that).
+     *
+     * One transaction, SET LOCAL: through a transaction-mode pooler the timeout,
+     * the count and the DROP land on the same backend, and a failure reverts the
+     * setting with the transaction — no session RESET to leak, no backend left
+     * at 3 s for whichever client gets it next. The row count sits inside the
+     * guard too: a VACUUM FULL, pg_repack or TRUNCATE holding the CHILD blocks a
+     * count exactly as it blocks the DROP, and outside the guard that 55P03
+     * aborted the whole prune instead of skipping the table.
+     */
+    private static function dropChildBounded(PDO $conn, string $child, bool $count): ?int
+    {
+        $conn->beginTransaction();
+
+        try {
+            $rows = self::withLockTimeout($conn, self::MAINTENANCE_LOCK_TIMEOUT_MS, static function () use ($conn, $child, $count): int {
+                $rows = $count ? (int) $conn->query("SELECT count(*) FROM {$child}")->fetchColumn() : 0;
+                $conn->exec("DROP TABLE {$child}");
+
+                return $rows;
+            });
+            $conn->commit();
+
+            return $rows;
+        } catch (\PDOException $e) {
+            try {
+                $conn->rollBack();
+            } catch (\Throwable) {
+                // A dead handle: nothing to roll back.
+            }
+
+            if (($e->errorInfo[0] ?? '') === '55P03') {
+                return null;
+            }
+
+            throw $e;
+        }
     }
 
     /**

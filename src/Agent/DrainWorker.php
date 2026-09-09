@@ -36,6 +36,10 @@ final class DrainWorker
 
     private int $cumExceptions = 0;
 
+    // Requests dropped by NIGHTOWL_IGNORE_ROUTES since worker start. Cumulative,
+    // like the vitals above, because it is read alongside them to explain them.
+    private int $cumIgnoredRequests = 0;
+
     // Open-issues gauge (current, not cumulative) for the fleet overview's
     // per-app "issues" count. Refreshed at most once per minute — see run().
     private int $openIssues = 0;
@@ -284,6 +288,9 @@ final class DrainWorker
             // Searchable log context — stores a log's context uncompressed so
             // the dashboard's log search can match inside it. Top-level key.
             logContextSearchable: (bool) config('nightowl.log_context_searchable', false),
+            // Framework chatter the tenant does not want stored at all (Livewire's
+            // update endpoint being the case it was added for). Top-level key.
+            ignoredRoutes: \NightOwl\Support\IgnoredRoutes::parse(config('nightowl.ignore_routes', [])),
         );
 
         $workerLabel = $this->totalWorkers > 1
@@ -976,6 +983,7 @@ final class DrainWorker
         $this->cumRequests += $writer->lastRequestCount;
         $this->cum5xx += $writer->last5xxCount;
         $this->cumExceptions += $writer->lastExceptionCount;
+        $this->cumIgnoredRequests += $writer->lastIgnoredRequestCount;
     }
 
     /**
@@ -1051,6 +1059,7 @@ final class DrainWorker
             'app_requests_total' => $this->cumRequests,
             'app_requests_5xx' => $this->cum5xx,
             'app_exceptions_total' => $this->cumExceptions,
+            'app_requests_ignored' => $this->cumIgnoredRequests,
             'app_open_issues' => $this->openIssues,
             'pg_latency_ms' => round($this->pgLatencyEwma, 2),
             'wal_size_bytes' => $this->walSizeBytes,

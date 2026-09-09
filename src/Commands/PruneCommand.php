@@ -79,9 +79,25 @@ class PruneCommand extends Command
             // row-DELETE below clean only the boundary/historic/default
             // partitions. Unpartitioned tables take the DELETE path unchanged.
             if (RawPartitions::isPartitioned($conn->getPdo(), $table)) {
-                foreach (RawPartitions::expiredChildren($conn->getPdo(), $table, $cutoff) as $child) {
-                    $rows = (int) $conn->table($child)->count();
-                    $conn->statement("DROP TABLE {$child}");
+                // Each DROP waits a bounded time for the parent (see
+                // RawPartitions::dropExpiredChild). The FIRST refusal settles the
+                // whole table for this run: the holder that refused it
+                // (nightowl:gc-dict-routes' SHARE, a VACUUM FULL on a child) would
+                // refuse every sibling too, each retry parking another bounded
+                // ACCESS EXCLUSIVE wait in front of the parent's readers — and the
+                // row-DELETE below would then chew through the very rows the DROP
+                // exists to unlink for free, on a table whose ROW EXCLUSIVE would
+                // wait behind the same holder. Oldest first, so the warning names
+                // the partition that has waited longest.
+                $children = RawPartitions::expiredChildren($conn->getPdo(), $table, $cutoff);
+                sort($children);
+                foreach ($children as $child) {
+                    $rows = RawPartitions::dropExpiredChild($conn->getPdo(), $child);
+                    if ($rows === null) {
+                        $this->warn("  {$table}: locked by another session (at partition {$child}) — this table is left for the next run");
+
+                        continue 2;
+                    }
                     $totalDeleted += $rows;
                     $this->line("  {$table}: dropped partition {$child} ({$rows} records)");
                 }

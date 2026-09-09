@@ -20,6 +20,7 @@ use NightOwl\Commands\BackfillRollupsCommand;
 use NightOwl\Commands\ClearCommand;
 use NightOwl\Commands\DrainWorkerCommand;
 use NightOwl\Commands\DropV1HistogramsCommand;
+use NightOwl\Commands\GcDictRoutesCommand;
 use NightOwl\Commands\GcDictTracesCommand;
 use NightOwl\Commands\InstallCommand;
 use NightOwl\Commands\MigrateCommand;
@@ -286,6 +287,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 BackfillLogContextCommand::class,
                 RepairCacheRollupKeysCommand::class,
                 ClearCommand::class,
+                GcDictRoutesCommand::class,
                 GcDictTracesCommand::class,
                 TestAlertCommand::class,
             ];

@@ -852,8 +852,9 @@ class MetricsCollectorTest extends TestCase
         $basePath = $tmpDir . '/nightowl_metrics_vitals_' . uniqid();
 
         $workers = [
-            ['rows_drained' => 5000, 'app_requests_total' => 1000, 'app_requests_5xx' => 12, 'app_exceptions_total' => 4, 'app_open_issues' => 7, 'updated_at' => microtime(true)],
-            ['rows_drained' => 4000, 'app_requests_total' => 800, 'app_requests_5xx' => 3, 'app_exceptions_total' => 1, 'app_open_issues' => 0, 'updated_at' => microtime(true)],
+            ['rows_drained' => 5000, 'app_requests_total' => 1000, 'app_requests_5xx' => 12, 'app_exceptions_total' => 4, 'app_open_issues' => 7, 'app_requests_ignored' => 300, 'updated_at' => microtime(true)],
+            ['rows_drained' => 4000, 'app_requests_total' => 800, 'app_requests_5xx' => 3, 'app_exceptions_total' => 1, 'app_open_issues' => 0, 'app_requests_ignored' => 200, 'updated_at' => microtime(true)],
+            // A worker on a pre-2.4.3 build omits the key entirely: it must read as 0, not break the sum.
             ['rows_drained' => 6000, 'app_requests_total' => 1200, 'app_requests_5xx' => 5, 'app_exceptions_total' => 0, 'app_open_issues' => 7, 'updated_at' => microtime(true)],
         ];
 
@@ -873,6 +874,8 @@ class MetricsCollectorTest extends TestCase
             // Open issues is a per-tenant gauge — MAX across workers, not summed
             // (a worker that hasn't counted yet reports 0).
             $this->assertSame(7, $status['app_vitals']['open_issues']);
+            // Ignored requests are cumulative per worker, so summed like the others.
+            $this->assertSame(500, $status['app_vitals']['requests_ignored']); // 300 + 200 + (absent → 0): a SUM, not MAX
         } finally {
             for ($i = 0; $i < 3; $i++) {
                 @unlink("{$basePath}.drain-metrics-{$i}.json");
@@ -890,6 +893,7 @@ class MetricsCollectorTest extends TestCase
         $this->assertSame(0, $status['app_vitals']['requests_5xx']);
         $this->assertSame(0, $status['app_vitals']['exceptions_total']);
         $this->assertSame(0, $status['app_vitals']['open_issues']);
+        $this->assertSame(0, $status['app_vitals']['requests_ignored']);
     }
 
     public function testReadDrainMetricsSingleWorkerFallback(): void

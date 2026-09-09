@@ -25,8 +25,9 @@ return new class extends Migration
      * migration is what keeps a long path STORED WHOLE rather than truncated.
      *
      * varchar(n) → text is binary-coercible, so Postgres rewrites neither the
-     * table nor any index. It takes a brief ACCESS EXCLUSIVE lock on tables that
-     * hold hundreds of rows, not millions.
+     * table nor any index. It takes a brief ACCESS EXCLUSIVE lock. (The dict
+     * tables were sized for hundreds of rows; a Livewire tenant on a pre-2.4.3
+     * agent can hold hundreds of thousands — still a metadata-only change.)
      *
      * nightowl_dict_string.value is deliberately NOT widened: it is half of the
      * (kind, value) UNIQUE constraint, and a btree tuple has a hard ~2704-byte

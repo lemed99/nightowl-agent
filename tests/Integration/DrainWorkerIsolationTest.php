@@ -9,6 +9,7 @@ use NightOwl\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use ReflectionMethod;
+use ReflectionProperty;
 
 /**
  * Integration tests for Phase-2 poison-row isolation — requires live PostgreSQL.
@@ -133,6 +134,47 @@ class DrainWorkerIsolationTest extends TestCase
     private function requestCount(): int
     {
         return (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_requests')->fetchColumn();
+    }
+
+    /**
+     * The ignored-request count crosses from RecordWriter into DrainWorker only
+     * on a COMMITTED batch (onDrainSuccess), and from there into the metrics file
+     * the health payload is built from. Both hops were untested: a mutation audit
+     * deleted the accumulation and 97 tests stayed green.
+     */
+    public function test_ignored_requests_accumulate_into_the_drain_metrics(): void
+    {
+        $this->appendRequest('11111111-aaaa-4aaa-8aaa-000000000001', ['route_path' => 'livewire-09e76b9c/update', 'route_name' => 'default-livewire.update']);
+        $this->appendRequest('11111111-aaaa-4aaa-8aaa-000000000002', ['route_path' => 'livewire-09e76b9c/update', 'route_name' => 'default-livewire.update']);
+        $this->appendRequest('11111111-aaaa-4aaa-8aaa-000000000003', ['route_path' => 'api/search', 'route_name' => 'search']);
+
+        $worker = $this->worker(quarantine: false);
+        $writer = new RecordWriter(
+            self::$host, self::$port, self::$database, self::$username, self::$password,
+            storageV2Config: false,
+            ignoredRoutes: ['*livewire.update'],
+        );
+
+        $this->assertTrue($this->drainOnce($worker, $writer));
+        $this->assertSame(1, $this->requestCount(), 'only the non-ignored request lands');
+
+        $cum = new ReflectionProperty($worker, 'cumIgnoredRequests');
+        $this->assertSame(2, $cum->getValue($worker), 'DrainWorker accumulates what the writer dropped');
+
+        // Second batch: cumulative, not per-batch, like the sibling vitals.
+        $this->appendRequest('11111111-aaaa-4aaa-8aaa-000000000004', ['route_path' => 'livewire-09e76b9c/update', 'route_name' => 'default-livewire.update']);
+        $this->assertTrue($this->drainOnce($worker, $writer));
+        $this->assertSame(3, $cum->getValue($worker));
+
+        // And it reaches the file MetricsCollector reads.
+        $write = new ReflectionMethod($worker, 'writeDrainMetrics');
+        $write->setAccessible(true);
+        $write->invoke($worker);
+        $metrics = json_decode((string) file_get_contents($this->bufferPath.'.drain-metrics.json'), true);
+        $this->assertSame(3, $metrics['app_requests_ignored'] ?? null);
+        // 1 recorded request across both batches (batch two carried only an ignored one).
+        $this->assertSame(1, $metrics['app_requests_total'] ?? null, 'recorded requests counted separately');
+        @unlink($this->bufferPath.'.drain-metrics.json');
     }
 
     public function test_poison_payload_is_quarantined_and_good_rows_drain(): void

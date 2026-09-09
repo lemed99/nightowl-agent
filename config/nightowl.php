@@ -123,6 +123,52 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Ignored Routes
+    |--------------------------------------------------------------------------
+    |
+    | Comma-separated patterns. A request whose route path, route name or route
+    | action matches any of them is dropped at drain time, together with the
+    | records of ITS OWN execution — the queries, logs, cache events, mail,
+    | notifications and outgoing requests it made. A request without those is a
+    | detail page with holes; those without their request are dead links.
+    |
+    | Three things are never dropped by an ignore rule: an exception (you ignored
+    | a noisy route, not its errors — the "view request" link on that exception
+    | will lead nowhere, deterministically), a queued job the request dispatched,
+    | and that job's later attempt with everything the worker recorded while
+    | running it. Jobs are matched by execution, not by trace, precisely so a
+    | job's own queries and mail cannot vanish depending on drain batching.
+    |
+    | The case this exists for is framework chatter that costs storage and tells
+    | you nothing: Livewire's update endpoint fires on nearly every interaction
+    | and reports every component in the request as the route action.
+    |
+    |     NIGHTOWL_IGNORE_ROUTES="*livewire.update,horizon/*,_debugbar/*"
+    |
+    | `*` is the only wildcard and it spans `/`; `?` is a literal. A leading
+    | slash is optional on either side. Prefer the route NAME for Livewire:
+    | Livewire 3 registers `livewire/update` named `default.livewire.update`,
+    | Livewire 4 prefixes the path with a hash of your APP_KEY
+    | (`livewire-09e76b9c/update`) and names it `default-livewire.update` —
+    | `*livewire.update` matches both, `livewire/*` matches only v3.
+    |
+    | This is a drop, not a sample. Nothing about an ignored request reaches
+    | PostgreSQL, so it is absent from your request count, your threshold alerts
+    | AND your error rate — in whichever direction the ignored route's own health
+    | sits. Ignore a busy endpoint that always succeeds and your error rate goes
+    | UP (its successes leave the denominator); ignore one that is failing and
+    | your error rate goes DOWN and hides it. The agent counts what it drops and
+    | reports the count beside the rate so you can tell. TOP-LEVEL key
+    | (shallow-merge rule). Patterns with invalid UTF-8 or non-string entries are
+    | dropped with a log line rather than allowed to break the matcher.
+    |
+    */
+    'ignore_routes' => class_exists(\NightOwl\Support\IgnoredRoutes::class)
+        ? \NightOwl\Support\IgnoredRoutes::parse(env('NIGHTOWL_IGNORE_ROUTES', ''))
+        : [],
+
+    /*
+    |--------------------------------------------------------------------------
     | Storage Format v2
     |--------------------------------------------------------------------------
     |

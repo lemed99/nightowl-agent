@@ -74,6 +74,9 @@ MigrationRunner::migrate($dbHost, $dbPort, $dbName, $dbUser, $dbPass);
         'storage_v2' => getenv('NIGHTOWL_STORAGE_V2') === false
             ? true
             : filter_var(getenv('NIGHTOWL_STORAGE_V2'), FILTER_VALIDATE_BOOLEAN),
+        // Same parser the package's config uses — a hand-rolled copy here would
+        // let a System test pass against a parser the customer never runs.
+        'ignore_routes' => NightOwl\Support\IgnoredRoutes::parse(getenv('NIGHTOWL_IGNORE_ROUTES') ?: ''),
     ],
 ]));
 fwrite(STDOUT, "Tables ready.\n");

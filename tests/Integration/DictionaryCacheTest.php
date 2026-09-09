@@ -12,6 +12,22 @@ use RuntimeException;
  * concurrent-worker convergence claims are exactly the ones that cannot be
  * proven by unit tests. Requires NIGHTOWL_TEST_DB_* (skips otherwise).
  */
+/** Captures execute() parameters so a test can assert what a warm actually bound. */
+final class RecordingStatement extends \PDOStatement
+{
+    /** @var array<int, array|null> */
+    public static array $executed = [];
+
+    protected function __construct() {}
+
+    public function execute(?array $params = null): bool
+    {
+        self::$executed[] = $params;
+
+        return parent::execute($params);
+    }
+}
+
 class DictionaryCacheTest extends TestCase
 {
     private static ?PDO $pdo = null;
@@ -231,6 +247,109 @@ class DictionaryCacheTest extends TestCase
         $this->assertNull($cache->warmingTable());
     }
 
+    /**
+     * The repair replaces a stored value only with a LONGER one for the same hash.
+     * Both directions are pinned: a mutation audit found reverting both statements
+     * to DO NOTHING passed every test in this file.
+     */
+    public function test_a_longer_value_repairs_a_clipped_row_and_a_shorter_one_does_not(): void
+    {
+        $cache = new DictionaryCache;
+        $hash = str_repeat('ab', 16);
+
+        // A worker on the old width stored the clipped value.
+        $cache->warm(self::$pdo, ['route' => [[$hash, 'GET', null, str_repeat('p', 512), 'r', 'A@b', '["GET"]']]]);
+        $id = $cache->routeId($hash);
+        // Precondition only (text column, nothing clamps here): the clipped value is stored as given.
+        $this->assertSame(512, (int) self::$pdo->query('SELECT length(path) FROM nightowl_dict_route')->fetchColumn());
+
+        // The full value arrives (a different process, or this one after forget()).
+        // `action` is the column this repair exists for (the Livewire list), so
+        // it is repaired alongside `path` here, not path alone.
+        $long = [$hash, 'GET', null, str_repeat('p', 900), 'r', str_repeat('A', 700).'@b', '["GET"]'];
+        (new DictionaryCache)->warm(self::$pdo, ['route' => [$long]]);
+        $row = self::$pdo->query('SELECT id, length(path) AS p, length(action) AS a FROM nightowl_dict_route')->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame(900, (int) $row['p'], 'longer path wins');
+        $this->assertSame(702, (int) $row['a'], 'longer action wins');
+        $this->assertSame($id, (int) $row['id'], 'id never changes');
+        $this->assertSame(1, (int) self::$pdo->query('SELECT count(*) FROM nightowl_dict_route')->fetchColumn());
+
+        // A worker still on the stale width sends the clipped values again.
+        (new DictionaryCache)->warm(self::$pdo, ['route' => [[$hash, 'GET', null, str_repeat('p', 512), 'r', 'A@b', '["GET"]']]]);
+        $row = self::$pdo->query('SELECT length(path) AS p, length(action) AS a FROM nightowl_dict_route')->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame([900, 702], [(int) $row['p'], (int) $row['a']], 'shorter never clobbers');
+
+        // Same two directions for dict_sql.file.
+        $sqlHash = str_repeat('cd', 16);
+        (new DictionaryCache)->warm(self::$pdo, ['sql' => [[$sqlHash, 'select 1', str_repeat('f', 512), 1]]]);
+        (new DictionaryCache)->warm(self::$pdo, ['sql' => [[$sqlHash, 'select 1', str_repeat('f', 650), 1]]]);
+        $this->assertSame(650, (int) self::$pdo->query('SELECT length(file) FROM nightowl_dict_sql')->fetchColumn());
+        (new DictionaryCache)->warm(self::$pdo, ['sql' => [[$sqlHash, 'select 1', str_repeat('f', 512), 1]]]);
+        $this->assertSame(650, (int) self::$pdo->query('SELECT length(file) FROM nightowl_dict_sql')->fetchColumn(), 'sql shorter never clobbers');
+    }
+
+    /** forget() empties exactly one map, so its values miss (and re-warm) again. */
+    public function test_forget_empties_one_map(): void
+    {
+        $cache = new DictionaryCache;
+        $cache->warm(self::$pdo, [
+            'string' => [['environment', 'production']],
+            'route' => [[str_repeat('ef', 16), 'GET', null, '/x', 'x', 'A@b', '["GET"]']],
+        ]);
+        $this->assertNotNull($cache->routeId(str_repeat('ef', 16)));
+
+        $cache->forget('routes');
+
+        $this->assertNull($cache->routeId(str_repeat('ef', 16)));
+        $this->assertNotNull($cache->stringId('environment', 'production'), 'other maps untouched');
+
+        $this->expectException(\InvalidArgumentException::class);
+        $cache->forget('nope');
+    }
+
+    /**
+     * dict_string warms are sorted like the other three: two workers inserting an
+     * overlapping label set in different orders deadlock under ON CONFLICT — DO
+     * NOTHING included. Pinned the same way the trim test pins the hashed dicts:
+     * warm order is LRU insertion order, so the coldest entry is the lowest key.
+     */
+    /**
+     * Every warm sorts its rows before the multi-row INSERT — the deadlock
+     * avoidance for two workers touching an overlapping set. The property lives
+     * in the INSERT's bound parameter order, and ONLY there: the LRU is filled
+     * from the SELECT-back's row order, so reading the LRU (as an earlier
+     * version of this test did) observed heap order and passed by coincidence.
+     * A recording statement class captures what was actually bound.
+     */
+    public function test_every_warm_binds_its_rows_in_sorted_order(): void
+    {
+        $recorder = self::connect();
+        $recorder->setAttribute(PDO::ATTR_STATEMENT_CLASS, [RecordingStatement::class]);
+
+        $hashes = [str_repeat('ff', 16), str_repeat('00', 16), str_repeat('88', 16)];
+        $warms = [
+            // name, rows, params per row, key extractor over one row's params
+            ['route', array_map(fn ($h) => [$h, 'GET', null, '/'.$h[0], 'n', 'A@b', '["GET"]'], $hashes), 7, fn (array $p) => $p[0]],
+            ['sql', array_map(fn ($h) => [$h, 'select '.$h[0], null, 1], $hashes), 4, fn (array $p) => $p[0]],
+            ['trace', array_map(fn ($h) => [$h, '\\x'.bin2hex(gzdeflate('t'.$h, 6))], $hashes), 2, fn (array $p) => $p[0]],
+            ['string', [['queue', 'zeta'], ['queue', 'alpha'], ['queue', 'mid']], 2, fn (array $p) => $p[0]."\0".$p[1]],
+        ];
+
+        foreach ($warms as [$name, $rows, $width, $key]) {
+            RecordingStatement::$executed = [];
+            (new DictionaryCache)->warm($recorder, [$name => $rows]);
+
+            // The first statement per table is the INSERT; the SELECT-back follows.
+            $insertParams = RecordingStatement::$executed[0] ?? null;
+            $this->assertIsArray($insertParams, "{$name}: INSERT was recorded");
+            $keys = array_map($key, array_chunk($insertParams, $width));
+            $sorted = $keys;
+            sort($sorted, SORT_STRING);
+            $this->assertSame($sorted, $keys, "{$name}: rows must be bound in sorted order");
+            $this->assertCount(3, $keys);
+        }
+    }
+
     public function test_in_txn_resolution_is_staged_until_promoted(): void
     {
         $cache = new DictionaryCache;
@@ -341,9 +460,14 @@ class DictionaryCacheTest extends TestCase
                 $cache->discardPending();
             }
 
-            // Insertion order is warm order, so the earliest entries are coldest.
-            $this->assertNull($cache->sqlId($hashes[0]), "{$outcome}: over-cap tail should be trimmed");
-            $this->assertNotNull($cache->sqlId($hashes[4599]), "{$outcome}: hottest entry must survive");
+            // LRU insertion order is the SELECT-back's row order, which is not
+            // contractual — so pin the cap, not which specific hash was coldest.
+            $survivors = 0;
+            foreach ($hashes as $hash) {
+                $survivors += $cache->sqlId($hash) === null ? 0 : 1;
+            }
+
+            $this->assertSame(4096, $survivors, "{$outcome}: the map must be trimmed to exactly its cap");
             $this->assertSame(4600, (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_dict_sql')->fetchColumn());
         }
     }

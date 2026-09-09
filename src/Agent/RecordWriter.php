@@ -6,12 +6,14 @@ use NightOwl\Support\CacheKeyTemplate;
 use NightOwl\Support\ConcurrencyRollup;
 use NightOwl\Support\DDSketchHistogram;
 use NightOwl\Support\DictionaryCache;
+use NightOwl\Support\IgnoredRoutes;
 use NightOwl\Support\StorageV2;
 use NightOwl\Support\QueryHistogram;
 use NightOwl\Support\RawPartitions;
 use NightOwl\Support\RollupSpec;
 use NightOwl\Support\RollupSpecs;
 use NightOwl\Support\RollupTiers;
+use NightOwl\Support\RouteAction;
 use PDO;
 
 final class RecordWriter
@@ -49,7 +51,29 @@ final class RecordWriter
     private array $rollupColumnsChecked = [];
 
     /** @var array<string, array<string, int>> Cached per table: column name => varchar character limit. */
-    private array $columnLimits = [];
+    /** Refreshed as a whole; @var array<string, array<string, int>> table => column => width */
+    private array $columnLimitsAll = [];
+
+    /** microtime of the last SUCCESSFUL width probe; 0.0 = never. */
+    private float $columnLimitsAt = 0.0;
+
+    /** Columns that sit in an index; @var array<string, array<string, true>> table => column => true */
+    private array $indexedColumns = [];
+
+    /** Clamped dictionary table → the DictionaryCache map it feeds. */
+    private const DICT_TABLE_MAPS = [
+        'nightowl_dict_string' => 'strings',
+        'nightowl_dict_sql' => 'sql',
+        'nightowl_dict_route' => 'routes',
+    ];
+
+    /**
+     * Staleness bound on column widths. A migration can widen a column under a
+     * live daemon, so this is the window in which the drain keeps clamping to the
+     * old width — and, the dictionaries being append-only, keeps writing rows that
+     * can never be un-truncated.
+     */
+    private const COLUMN_LIMITS_TTL_SECONDS = 60.0;
 
     /** @var array<string, true> Table.column pairs already warned about, so a repeat offender can't storm the log. */
     private array $clampWarned = [];
@@ -171,6 +195,8 @@ final class RecordWriter
         private bool $cacheKeyTemplateEnabled = true,
         private bool $storageV2Config = true,
         private bool $logContextSearchable = false,
+        /** @var array<int, string> glob patterns; see config nightowl.ignore_routes */
+        private array $ignoredRoutes = [],
     ) {
         $this->notifier = $notifier ?? new AlertNotifier;
         $this->dict = new DictionaryCache;
@@ -381,6 +407,9 @@ final class RecordWriter
             // false makes the drain write v1 even when the v2 tables exist.
             storageV2Config: (bool) config('nightowl.storage_v2', true),
             logContextSearchable: (bool) config('nightowl.log_context_searchable', false),
+            // Framework chatter the tenant does not want stored at all (Livewire's
+            // update endpoint being the case it was added for). Top-level key.
+            ignoredRoutes: IgnoredRoutes::parse(config('nightowl.ignore_routes', [])),
         );
     }
 
@@ -653,6 +682,23 @@ final class RecordWriter
         $this->currentWriteTarget = null;
         $this->pendingWrittenTables = [];
 
+        // Normalize first, for two reasons. The dict hash is taken over this value,
+        // and the hash is what carries the cardinality — collapsing any later fixes
+        // the size and leaves dict_route growing a row per page state. And
+        // rejectIgnoredRoutes matches on it: filtering before collapsing meant
+        // NIGHTOWL_IGNORE_ROUTES was compared against the raw 2,884-byte repeated
+        // list while the dashboard displayed the collapsed one, so a pattern copied
+        // out of the UI silently matched nothing.
+        foreach ($records as $i => $record) {
+            if (($record['t'] ?? null) === 'request'
+                && isset($record['route_action'])
+                && is_string($record['route_action'])) {
+                $records[$i]['route_action'] = RouteAction::normalize($record['route_action']);
+            }
+        }
+
+        $records = $this->rejectIgnoredRoutes($records);
+
         $grouped = [];
         foreach ($records as $record) {
             $type = $record['t'] ?? null;
@@ -683,6 +729,23 @@ final class RecordWriter
         // and if PostgreSQL is still down the reconnect raises a connection error,
         // which is the classification the retry/backoff path wants anyway.
         $this->releaseStrandedConnection();
+
+        // Refresh column widths HERE, outside any transaction, once per batch.
+        // columnLimits() is also called from inside the batch transaction (COPY,
+        // upserts, rollups) and must serve the cache there: a TTL boundary
+        // falling mid-batch used to re-probe in-txn, see a dictionary width
+        // change, and clear that dictionary's LRU AFTER the warm and BEFORE the
+        // write's lookups — every sql_id/route_id in the batch stored NULL.
+        // A dead handle fails here and the failure PROPAGATES: write()'s
+        // reconnect-and-retry is the one place connection failures are
+        // classified, and the retry's refresh probes on the fresh handle.
+        // Swallowing it here instead (a withdrawn candidate) cost two extra
+        // connect attempts per batch during an outage — the probe's and then
+        // pdo()'s below, each repeated by the retry — and on a v1 tenant left
+        // the batch with an EMPTY width map (no other out-of-transaction call
+        // re-probes there), so the first over-long value after a PostgreSQL
+        // restart raised the 22001 this whole mechanism exists to prevent.
+        $this->refreshColumnLimits();
 
         $pdo = $this->pdo();
 
@@ -1126,48 +1189,168 @@ final class RecordWriter
      * Character limits of $table's length-constrained columns, keyed by column name.
      *
      * Introspected from the live target rather than hardcoded from the migrations:
-     * the tenant owns their database, so a column they widened themselves (the
-     * documented varchar(n) → text unstick for a poison row) must not still be
-     * clamped to 255 by us. `text` columns have a NULL character_maximum_length and
-     * are absent from the map — i.e. never clamped.
+     * the tenant owns their database, so a column they widened themselves must not
+     * still be clamped to 255 by us. `text` columns carry no typmod and are absent
+     * from the map — i.e. never clamped.
      *
-     * A SUCCESSFUL probe is cached for the process lifetime, mirroring
-     * rollupColumnsChecked: a column's width only changes under a migration, which
-     * restarts the agent. A cached empty map therefore means "this table genuinely
-     * has no length-constrained columns" and never "the probe failed".
+     * RESOLUTION. The drain connection issues no SET search_path, so an
+     * unqualified INSERT lands wherever the role's search_path resolves the name.
+     * The probe has to describe THAT table, and two earlier attempts did not:
+     *
+     *  - 2.4.2 pinned `table_schema = 'public'`. Wrong for a tenant whose tables
+     *    live in a scoped schema: it described a different table, or none.
+     *  - 2.4.3-rc used `current_schema()`. Wrong for the far more common layout
+     *    PostgreSQL's DEFAULT search_path ("$user", public) anticipates: a schema
+     *    named after the login role. current_schema() returns the FIRST EXISTING
+     *    schema on the path — that empty role schema — while to_regclass resolves
+     *    the table in public. Zero columns came back, nothing on the connection was
+     *    clamped, and the first over-long value wedged the drain: the exact failure
+     *    the release was meant to close, regressed for the default layout.
+     *
+     * `pg_table_is_visible(oid)` is the resolver an unqualified name actually uses:
+     * true only for the relation that name reaches on the current search_path,
+     * per table, so a mixed layout (some tables scoped, some in public) is right
+     * too. relkind 'p' is needed: the raw tables are partitioned parents.
+     *
+     * The same statement records whether each column sits in an index, because
+     * that is the property that makes "widen it to text" advice harmful: a btree
+     * entry is capped at ~2704 bytes, so a very long value would then fail with
+     * 54000 instead of 22001. Scoping that warning by column NAME (an earlier
+     * version singled out dict_string.value) missed every other indexed varchar,
+     * including the cache rollups' PK members.
+     *
+     * TTL. A width DOES change under a running daemon — nightowl:migrate is a
+     * standalone command, and NIGHTOWL_AUTO_MIGRATE=false / RUN_MIGRATIONS=true
+     * both run it against a live drain — so the map is re-probed every 60s. When
+     * a dictionary column's width changes, that dictionary's LRU is cleared: the
+     * repair in DictionaryCache::warm only runs for LRU MISSES, so without this a
+     * row the daemon clipped before the migration stayed clipped until the process
+     * restarted (the LRU holds 4096 routes and most tenants never evict). One
+     * statement covers every nightowl_* table, so the refresh is one round trip a
+     * minute regardless of how many tables the batch touches.
      *
      * @return array<string, int>
      */
     private function columnLimits(string $table): array
     {
-        if (array_key_exists($table, $this->columnLimits)) {
-            return $this->columnLimits[$table];
+        // Inside the batch transaction: serve the cache, never re-probe. The
+        // per-batch refresh in doWrite() runs before BEGIN, so the cache is at
+        // most one TTL stale here; a re-probe in-txn could clear a dictionary's
+        // LRU between the warm and the write (NULL links for the whole batch),
+        // and a failed one would leave the transaction aborted (25P02 on the
+        // next statement, attributed to the wrong table).
+        $inTxn = $this->pdo !== null && $this->pdo->inTransaction();
+        if (! $inTxn) {
+            $this->refreshColumnLimits();
         }
 
-        try {
-            $stmt = $this->pdo()->prepare(
-                'SELECT column_name, character_maximum_length FROM information_schema.columns
-                 WHERE table_schema = \'public\' AND table_name = ? AND character_maximum_length IS NOT NULL'
-            );
-            $stmt->execute([$table]);
-            $limits = [];
-            foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
-                $limits[(string) $row['column_name']] = (int) $row['character_maximum_length'];
+        // A table absent from the map has no length-constrained columns (all text),
+        // which is a real answer, not a missing one.
+        return $this->columnLimitsAll[$table] ?? [];
+    }
+
+    /** Re-probe when the TTL has elapsed. Only ever called outside a transaction. */
+    private function refreshColumnLimits(): void
+    {
+        $now = microtime(true);
+        $stale = $this->columnLimitsAt === 0.0
+            || ($now - $this->columnLimitsAt) > self::COLUMN_LIMITS_TTL_SECONDS;
+
+        if ($stale) {
+            try {
+                $pdo = $this->pdo();
+                // Its own phase: a stall in this round trip must not be reported
+                // under whatever phase the previous batch ended in.
+                $this->heartbeat?->enter('pg:width-probe');
+                $rows = $pdo->query(
+                    "SELECT c.relname AS table_name, a.attname AS column_name,
+                            a.atttypmod - 4 AS max_len,
+                            EXISTS (
+                                SELECT 1 FROM pg_index i
+                                WHERE i.indrelid = c.oid AND a.attnum = ANY (i.indkey)
+                            ) AS indexed
+                     FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                     WHERE c.relkind IN ('r', 'p')
+                       AND c.relname LIKE 'nightowl@_%' ESCAPE '@'
+                       AND pg_table_is_visible(c.oid)
+                       AND a.atttypid IN ('varchar'::regtype, 'bpchar'::regtype)
+                       AND a.atttypmod > 0
+                     ORDER BY c.relname, a.attnum"
+                )->fetchAll(\PDO::FETCH_ASSOC);
+
+                $map = [];
+                $indexed = [];
+                foreach ($rows as $row) {
+                    $t = (string) $row['table_name'];
+                    $c = (string) $row['column_name'];
+                    $map[$t][$c] = (int) $row['max_len'];
+                    if ($row['indexed']) {
+                        $indexed[$t][$c] = true;
+                    }
+                }
+                $this->forgetDictionariesWhoseWidthChanged($this->columnLimitsAll, $map);
+
+                $this->columnLimitsAll = $map;
+                $this->indexedColumns = $indexed;
+                $this->columnLimitsAt = $now;
+            } catch (\Throwable $e) {
+                // Probe failed — keep whatever the last good probe said and do NOT
+                // stamp the clock, so the next batch retries. Never cache a failure
+                // into "this table has no limits": that would silently switch
+                // clamping off for the rest of the process and hand the next
+                // over-long value a 22001 that head-of-line-blocks the drain.
+                // Before any successful probe this is an empty map, i.e. clamp
+                // nothing — the pre-clamping behaviour, not a regression.
+                //
+                // A CONNECTION failure is not swallowed: it is rethrown for
+                // write()'s reconnect-and-retry, which is what classifies it,
+                // drops the dead handle and runs the batch again — where this
+                // refresh probes on the fresh connection. Swallowed, pdo_pgsql
+                // reported the dead handle as mid-transaction (the warm's
+                // assertion fired instead of a reconnect), the outage cost twice
+                // the connect attempts per batch, and a v1 batch ran unclamped.
+                if ($this->isConnectionError($e)) {
+                    throw $e;
+                }
             }
-        } catch (\Throwable) {
-            // Probe failed — clamp nothing rather than guessing a width and
-            // silently mangling good data. A genuine overflow still surfaces as
-            // SQLSTATE 22001, which is the pre-clamping behaviour, not a regression.
-            //
-            // Never cached. This probe rides the drain connection, so a PG restart or
-            // a network blip fails it; caching that would leave clamping off for the
-            // rest of the process and hand the next over-long value a 22001 that
-            // head-of-line-blocks the drain. Fails open UNCACHED, the same contract as
-            // the api's TenantTableProbe::exists().
-            return [];
+        }
+    }
+
+    /**
+     * Drop the LRU of any dictionary whose clamp widths just changed.
+     *
+     * Not on the first probe (nothing cached yet), and only for the three
+     * dictionaries that are clamped: a width that grew, shrank or vanished means
+     * rows this daemon already warmed may be clipped to the old width, and the
+     * repair in DictionaryCache::warm can only reach a hash that MISSES the LRU.
+     * Clearing forces at most one cap's worth of re-warms (4096 routes / 4096
+     * sql / 16384 strings), once, within a TTL of the migration.
+     *
+     * @param  array<string, array<string, int>>  $before
+     * @param  array<string, array<string, int>>  $after
+     */
+    private function forgetDictionariesWhoseWidthChanged(array $before, array $after): void
+    {
+        if ($before === []) {
+            return;
         }
 
-        return $this->columnLimits[$table] = $limits;
+        foreach (self::DICT_TABLE_MAPS as $table => $map) {
+            // Strict array comparison is key-order-sensitive and the probe's row
+            // order is the planner's (its ORDER BY makes that deterministic, but
+            // the comparison must not depend on it): the same widths in another
+            // order are the same widths, not a reason to throw a dictionary away.
+            $was = $before[$table] ?? [];
+            $is = $after[$table] ?? [];
+            ksort($was);
+            ksort($is);
+            if ($was !== $is) {
+                $this->dict->forget($map);
+                error_log("[NightOwl Agent] {$table} column widths changed — re-warming its dictionary so clipped rows can be repaired");
+            }
+        }
     }
 
     /**
@@ -1194,14 +1377,67 @@ final class RecordWriter
             $this->clampWarned[$key] = true;
             // Length only — never the value, which is customer data (the same
             // reason lastWriteError withholds the raw libpq message).
-            error_log(sprintf(
-                '[NightOwl Agent] %s exceeds its varchar(%d) width — truncating to fit. '.
-                'Widen it (ALTER TABLE %s ALTER COLUMN %s TYPE text) to store the full value.',
-                $key, $max, $table, $column
-            ));
+            //
+            // The advice depends on the column: see clampAdvice().
+            error_log($this->clampAdvice($table, $column, $max));
         }
 
         return mb_substr($value, 0, $max, 'UTF-8');
+    }
+
+    /**
+     * What an operator should do about a column the drain just had to clip.
+     *
+     * Three cases, decided by PROPERTIES rather than by column name:
+     *
+     *  - nightowl_dict_string.value: the cap is ours (DICT_STRING_MAX), not the
+     *    column's, and nothing to widen — it holds closed-set labels.
+     *  - A column that sits in an index: widening lifts the varchar cap but a
+     *    btree entry is limited to ~2704 bytes, so a very long value would then
+     *    fail with 54000 instead of 22001 — inside the batch transaction, taking
+     *    the raw COPY with it. Say so. (An earlier version singled out
+     *    dict_string.value by name and missed the cache rollups' PK members.)
+     *  - Anything else: widen it. Never "run nightowl:migrate" — only four
+     *    columns have a widening migration (000073, 000074), so for most it
+     *    would be advice that changes nothing. (2.4.2 advised widening every column, indexed ones
+     *    included, with no warning at all.)
+     *
+     * Known blind spot: an EXPRESSION index (lower(col)) references no attnum, so
+     * its column reads as unindexed here and gets the plain advice although the
+     * btree cap still applies to the expression's output. NightOwl ships no
+     * expression indexes; a customer-added one is theirs to know about.
+     */
+    private function clampAdvice(string $table, string $column, int $max): string
+    {
+        $key = $table.'.'.$column;
+
+        if ($table === 'nightowl_dict_string' && $column === 'value') {
+            return sprintf(
+                '[NightOwl Agent] %s exceeds its %d-character width — truncating to fit. This one is '
+                .'deliberate and there is nothing to widen: the column is half of a UNIQUE index, so it is '
+                .'capped at %d whatever its type. It holds short labels (environment, server, queue, channel, '
+                .'job class); a value this long means one of those is being generated rather than chosen '
+                .'from a fixed set.',
+                $key, $max, self::DICT_STRING_MAX
+            );
+        }
+
+        if (isset($this->indexedColumns[$table][$column])) {
+            return sprintf(
+                '[NightOwl Agent] %s exceeds its varchar(%d) width — truncating to fit. This column is part '
+                .'of an index, so widening it (ALTER TABLE %s ALTER COLUMN %s TYPE text) lifts the cap but a '
+                .'btree entry is limited to about 2,700 bytes: a value longer than that would then fail with '
+                .'a different error (54000) instead of being trimmed. Widen it only if values stay well under '
+                .'that.',
+                $key, $max, $table, $column
+            );
+        }
+
+        return sprintf(
+            '[NightOwl Agent] %s exceeds its varchar(%d) width — truncating to fit. Widen it '
+            .'(ALTER TABLE %s ALTER COLUMN %s TYPE text) to store the full value.',
+            $key, $max, $table, $column
+        );
     }
 
     /**
@@ -1246,10 +1482,10 @@ final class RecordWriter
      * two distinct dictionary rows rather than colliding onto one.
      *
      * $limits is resolved ONCE per batch by the caller, never per row:
-     * columnLimits() deliberately does not cache a FAILED probe (see its catch),
-     * so calling it per row would fire an information_schema query per dictionary
-     * miss for as long as Postgres is unwell — the cost this whole path exists to
-     * keep bounded.
+     * columnLimits() re-probes on a TTL and does not stamp its clock on failure,
+     * so calling it per row would fire a catalog query per dictionary miss for as
+     * long as Postgres is unwell — the cost this whole path exists to keep
+     * bounded.
      *
      * @param  array<string, int>  $limits
      * @param  array<int, string|null>  $columns
@@ -1287,7 +1523,7 @@ final class RecordWriter
     {
         // Reads the width resolved once per batch by collectDictMisses, which
         // always runs before any v2Sid: this is called for EVERY dictionary-encoded
-        // label of every row, and columnLimits() does not cache a failed probe.
+        // label of every row, and columnLimits() re-probes on a TTL.
         return (string) $this->clampToColumn(
             'nightowl_dict_string', 'value', $value, $this->dictStringMax
         );
@@ -1311,9 +1547,9 @@ final class RecordWriter
         // is a far smaller loss than losing the pipeline. Same rationale as
         // eventEpoch()'s range guard on poison timestamps.
         //
-        // Kept inside the heartbeat window: columnLimits() is a (once-per-table)
-        // round trip on the drain connection, so a stall there must count against
-        // the same wedge detector as the COPY itself.
+        // columnLimits() never round-trips here: inside the batch transaction it
+        // serves the cache doWrite() refreshed before BEGIN, under its own
+        // heartbeat phase (pg:width-probe).
         $limits = $this->columnLimits($table);
         $limited = [];
         foreach ($columns as $i => $column) {
@@ -1655,13 +1891,112 @@ final class RecordWriter
      *
      * @param  array<string, array<int, array>>  $grouped  mutated in place (stashes)
      */
+    /**
+     * Record types an ignored route never takes with it — see rejectIgnoredRoutes().
+     *
+     * @var array<string, true>
+     */
+    private const IGNORE_ALWAYS_KEEPS = [
+        'exception' => true,
+        'queued-job' => true,
+        'job-attempt' => true,
+    ];
+
+    /**
+     * Drop records belonging to an ignored route.
+     *
+     * Scoped by EXECUTION, not by trace. A request's own children — its queries,
+     * logs, cache events, mail, notifications, outgoing requests — carry the
+     * request's id as their `execution_id` (nightwatch stamps every sensor from
+     * the same state, and a request's id IS its trace_id). A job the request
+     * dispatched carries the same `trace_id` (nightwatch propagates it into the
+     * job payload) but the queue worker gives the attempt, and every record it
+     * emits, a DIFFERENT execution id. So `execution_id` separates "the ignored
+     * request's query" from "a query inside a job it dispatched"; `trace_id`
+     * cannot, and an earlier trace-scoped version dropped a job's queries, mail
+     * and outgoing calls when they happened to share a drain batch with the
+     * request and kept them when they did not — whether a job's detail page had
+     * content was decided by batching.
+     *
+     * Three record types are never dropped by scope, whatever their execution:
+     *
+     *  - `queued-job`: the dispatch row is one of the request's own records (its
+     *    execution_id is the request's) while the later `job-attempt` is not.
+     *    Dropping the dispatch and keeping the attempt is an orphan attempt and a
+     *    jobs list reading "QUEUED 0 / PROCESSED 4,102".
+     *  - `job-attempt`: kept for symmetry; it carries no execution_id anyway.
+     *  - `exception`: an exception thrown during the ignored request itself has
+     *    the request's execution id and would go with it. Kept on purpose — an
+     *    operator ignored a noisy route, not its errors — at the cost of a "view
+     *    request" link that leads to a request that was never recorded. That
+     *    link is now deterministic rather than batch-dependent.
+     *
+     * A record with no usable `execution_id` is kept: falling back to trace_id
+     * would re-import the job problem. Best effort across batches by
+     * construction — a child that lands in an earlier batch than its request
+     * survives, because ignored ids are not remembered across batches (that would
+     * be an unbounded set to keep, for a feature whose point is to store less).
+     *
+     * @param  array<int, array<string, mixed>>  $records
+     * @return array<int, array<string, mixed>>
+     */
+    private function rejectIgnoredRoutes(array $records): array
+    {
+        $this->lastIgnoredRequestCount = 0;
+
+        if ($this->ignoredRoutes === []) {
+            return $records;
+        }
+
+        // Pass 1: which requests match, and which executions they own. Matching
+        // is remembered by index so pass 2 never re-runs Str::is on a request.
+        $dropIndex = [];
+        $ignoredExecutions = [];
+        foreach ($records as $i => $record) {
+            if (($record['t'] ?? null) !== 'request' || ! IgnoredRoutes::matches($this->ignoredRoutes, $record)) {
+                continue;
+            }
+            $dropIndex[$i] = true;
+            $this->lastIgnoredRequestCount++;
+            // A request's execution id is its trace id (nightwatch's RequestSensor
+            // emits only trace_id; children stamp that same value as execution_id).
+            $execution = $record['trace_id'] ?? null;
+            if (is_string($execution) && $execution !== '') {
+                $ignoredExecutions[$execution] = true;
+            }
+        }
+
+        if ($dropIndex === []) {
+            return $records;
+        }
+
+        // Pass 2.
+        $kept = [];
+        foreach ($records as $i => $record) {
+            if (isset($dropIndex[$i])) {
+                continue;
+            }
+            $type = (string) ($record['t'] ?? '');
+            $execution = $record['execution_id'] ?? null;
+            if ($ignoredExecutions !== []
+                && is_string($execution)
+                && isset($ignoredExecutions[$execution])
+                && ! isset(self::IGNORE_ALWAYS_KEEPS[$type])) {
+                continue;
+            }
+            $kept[] = $record;
+        }
+
+        return $kept;
+    }
+
     private function collectDictMisses(array &$grouped): array
     {
         $misses = ['string' => [], 'sql' => [], 'route' => [], 'trace' => []];
         $seen = ['string' => [], 'sql' => [], 'route' => [], 'trace' => []];
 
-        // One probe per dictionary per batch (cached for the process once it
-        // succeeds), not one per value — see clampDictRow.
+        // Widths resolved once here per batch (a cached map, re-probed on a TTL),
+        // not once per value — see clampDictRow.
         $this->dictStringMax = min(
             $this->columnLimits('nightowl_dict_string')['value'] ?? PHP_INT_MAX,
             self::DICT_STRING_MAX
@@ -1845,6 +2180,20 @@ final class RecordWriter
      * the ceiling so a v2Sid that somehow ran before a collect still clamps.
      */
     private int $dictStringMax = self::DICT_STRING_MAX;
+
+    /**
+     * Requests the ignore rules dropped in the last batch.
+     *
+     * Reported, not merely discarded. An ignored request is absent from
+     * requests_total, from the 5xx rate and from every threshold — so filtering a
+     * high-volume healthy endpoint moves a tenant's success rate DOWN (the
+     * successes leave the denominator, the failures do not) and pushes the app up
+     * the agency portfolio's worst-first sort. Nothing about the stored data can
+     * explain that, because the explanation is the rows that were never written.
+     * This counter is the explanation, and it rides the same path as the app
+     * vitals it perturbs.
+     */
+    public int $lastIgnoredRequestCount = 0;
 
     /** @var array<string, true> once-per-process log throttle, keyed by column */
     private static array $dictLinkLossLogged = [];

@@ -195,6 +195,9 @@ final class MetricsCollector
     // drain workers. Shipped to the platform, which computes window deltas.
     private int $appRequestsTotal = 0;
 
+    /** Requests the ignore rules dropped — reported so the vitals above can be read honestly. */
+    private int $appRequestsIgnored = 0;
+
     private int $app5xxTotal = 0;
 
     private int $appExceptionsTotal = 0;
@@ -463,6 +466,7 @@ final class MetricsCollector
         $oldestUpdate = PHP_FLOAT_MAX;
         $anyFound = false;
         $appRequests = 0;
+        $appIgnored = 0;
         $app5xx = 0;
         $appExceptions = 0;
         $appOpenIssues = 0;
@@ -507,6 +511,7 @@ final class MetricsCollector
             $appRequests += (int) ($data['app_requests_total'] ?? 0);
             $app5xx += (int) ($data['app_requests_5xx'] ?? 0);
             $appExceptions += (int) ($data['app_exceptions_total'] ?? 0);
+            $appIgnored += (int) ($data['app_requests_ignored'] ?? 0);
             // Gauge, not cumulative: every worker queries the same tenant DB and
             // reports the same count, so take MAX (a worker that hasn't counted
             // yet reports 0) rather than summing across workers.
@@ -611,6 +616,7 @@ final class MetricsCollector
         $this->lastQuarantineSqlstate = $mostRecentQuarSqlstate;
         $this->lastQuarantineTable = $mostRecentQuarTable;
         $this->appRequestsTotal = $appRequests;
+        $this->appRequestsIgnored = $appIgnored;
         $this->app5xxTotal = $app5xx;
         $this->appExceptionsTotal = $appExceptions;
         $this->appOpenIssues = $appOpenIssues;
@@ -1205,6 +1211,9 @@ final class MetricsCollector
             ],
             'app_vitals' => [
                 'requests_total' => $this->appRequestsTotal,
+                // Not part of requests_total — these were never recorded at all.
+                // Present so a reader can tell "quiet app" from "filtered app".
+                'requests_ignored' => $this->appRequestsIgnored,
                 'requests_5xx' => $this->app5xxTotal,
                 'exceptions_total' => $this->appExceptionsTotal,
                 'open_issues' => $this->appOpenIssues,
@@ -1286,7 +1295,10 @@ final class MetricsCollector
             ],
             '42501' => [
                 'The database role cannot write to the NightOwl tables.',
-                'Grant INSERT on the nightowl_* tables to the role the agent uses (NIGHTOWL_DB_USERNAME).',
+                'Grant the agent role INSERT, SELECT and UPDATE on the nightowl_* tables. Since 2.4.3 the '
+                    .'route and SQL dictionaries need UPDATE too (column-level is enough: '
+                    .'GRANT UPDATE (method, domain, path, name, action, methods) ON nightowl_dict_route; '
+                    .'GRANT UPDATE (file) ON nightowl_dict_sql).',
             ],
             '28P01', '28000' => [
                 'The database rejected the agent credentials.',

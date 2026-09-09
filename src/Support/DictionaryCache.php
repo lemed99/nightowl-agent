@@ -37,11 +37,20 @@ use RuntimeException;
  * contributes, across all four maps. It is transient, not a leak: the trim at
  * the batch's outcome frees it and nothing accumulates into the next batch.
  *
- * Concurrent workers: INSERT ... ON CONFLICT DO NOTHING makes worker B's
- * speculative insert wait on worker A's in-flight tuple; after A commits,
- * B's insert no-ops and B's follow-up SELECT (fresh READ COMMITTED snapshot)
- * returns A's id — both workers converge with no advisory lock. Ids never
- * renumber: the dictionaries are append-only by contract.
+ * Concurrent workers: the INSERT ... ON CONFLICT makes worker B's speculative
+ * insert wait on worker A's in-flight tuple; after A commits, B's follow-up
+ * SELECT (fresh READ COMMITTED snapshot) returns A's id — both workers converge
+ * with no advisory lock. Ids never renumber: that is the append-only property
+ * the LRU depends on. VALUES are not append-only any more: the two hash-keyed
+ * dicts REPAIR a stored value with a longer one for the same hash (a row
+ * clipped by the width clamp before a migration widened its column), and
+ * dict_trace touches created_at. Those three warms therefore take row locks on
+ * conflicting tuples — PostgreSQL locks before evaluating a DO UPDATE's WHERE —
+ * and dict_string's DO NOTHING still waits on an in-flight conflicting insert,
+ * which is why all four warms sort their rows before the multi-row INSERT: two
+ * workers touching an overlapping set in different orders deadlock. That is
+ * true of DO NOTHING as well (speculative-insertion waits are deadlock-
+ * detected), which an earlier note here got wrong.
  */
 final class DictionaryCache
 {
@@ -141,6 +150,7 @@ final class DictionaryCache
 
         if (($rows = $misses['string'] ?? []) !== []) {
             $this->warmingTable = 'nightowl_dict_string';
+            usort($rows, fn (array $a, array $b): int => strcmp($a[0]."\0".$a[1], $b[0]."\0".$b[1]));
             $this->warmTable(
                 $pdo, $rows,
                 'INSERT INTO nightowl_dict_string (kind, value) VALUES %s ON CONFLICT (kind, value) DO NOTHING',
@@ -154,9 +164,14 @@ final class DictionaryCache
 
         if (($rows = $misses['sql'] ?? []) !== []) {
             $this->warmingTable = 'nightowl_dict_sql';
+            usort($rows, fn (array $a, array $b): int => strcmp($a[0], $b[0]));
             $this->warmTable(
                 $pdo, $rows,
-                'INSERT INTO nightowl_dict_sql (hash, sql, file, line) VALUES %s ON CONFLICT (hash) DO NOTHING',
+                // `file` is the only clampable column here: `sql` is text and
+                // identical for a given hash, so a clause on it could never fire.
+                'INSERT INTO nightowl_dict_sql (hash, sql, file, line) VALUES %s
+                 ON CONFLICT (hash) DO UPDATE SET file = EXCLUDED.file
+                 WHERE length(EXCLUDED.file) > length(nightowl_dict_sql.file)',
                 "(decode(?, 'hex'), ?, ?, ?)",
                 fn (array $r): array => [$r[0], $r[1], $r[2], $r[3]],
                 "SELECT id, encode(hash, 'hex') AS hash FROM nightowl_dict_sql WHERE hash IN (%s)",
@@ -168,9 +183,27 @@ final class DictionaryCache
 
         if (($rows = $misses['route'] ?? []) !== []) {
             $this->warmingTable = 'nightowl_dict_route';
+            usort($rows, fn (array $a, array $b): int => strcmp($a[0], $b[0]));
             $this->warmTable(
                 $pdo, $rows,
-                'INSERT INTO nightowl_dict_route (hash, method, domain, path, name, action, methods) VALUES %s ON CONFLICT (hash) DO NOTHING',
+                // Every column the clamp can clip (RecordWriter::clampDictRow):
+                // method, domain, path, name, action, methods. Each is replaced only
+                // by a LONGER value for the same hash, so a worker still on a stale
+                // width can never clobber a repaired row.
+                'INSERT INTO nightowl_dict_route (hash, method, domain, path, name, action, methods) VALUES %s
+                 ON CONFLICT (hash) DO UPDATE SET
+                     method  = CASE WHEN length(EXCLUDED.method)  > length(nightowl_dict_route.method)  THEN EXCLUDED.method  ELSE nightowl_dict_route.method  END,
+                     domain  = CASE WHEN length(EXCLUDED.domain)  > length(nightowl_dict_route.domain)  THEN EXCLUDED.domain  ELSE nightowl_dict_route.domain  END,
+                     path    = CASE WHEN length(EXCLUDED.path)    > length(nightowl_dict_route.path)    THEN EXCLUDED.path    ELSE nightowl_dict_route.path    END,
+                     name    = CASE WHEN length(EXCLUDED.name)    > length(nightowl_dict_route.name)    THEN EXCLUDED.name    ELSE nightowl_dict_route.name    END,
+                     action  = CASE WHEN length(EXCLUDED.action)  > length(nightowl_dict_route.action)  THEN EXCLUDED.action  ELSE nightowl_dict_route.action  END,
+                     methods = CASE WHEN length(EXCLUDED.methods) > length(nightowl_dict_route.methods) THEN EXCLUDED.methods ELSE nightowl_dict_route.methods END
+                 WHERE length(EXCLUDED.method)  > length(nightowl_dict_route.method)
+                    OR length(EXCLUDED.domain)  > length(nightowl_dict_route.domain)
+                    OR length(EXCLUDED.path)    > length(nightowl_dict_route.path)
+                    OR length(EXCLUDED.name)    > length(nightowl_dict_route.name)
+                    OR length(EXCLUDED.action)  > length(nightowl_dict_route.action)
+                    OR length(EXCLUDED.methods) > length(nightowl_dict_route.methods)',
                 "(decode(?, 'hex'), ?, ?, ?, ?, ?, ?)",
                 fn (array $r): array => $r,
                 "SELECT id, encode(hash, 'hex') AS hash FROM nightowl_dict_route WHERE hash IN (%s)",
@@ -196,9 +229,9 @@ final class DictionaryCache
             //     the SELECT-back returns the fresh id, so the exception write
             //     never lands a dangling trace_ref.
             //
-            //  2. Rows sorted by hash before the multi-row INSERT. DO UPDATE
-            //     takes a row lock per conflicting tuple (DO NOTHING mostly
-            //     did not), so two workers touching an overlapping trace set in
+            //  2. Rows sorted by hash before the multi-row INSERT. ON CONFLICT
+            //     waits on a conflicting in-flight tuple (DO NOTHING included),
+            //     so two workers touching an overlapping trace set in
             //     different orders could deadlock; a global hash order makes
             //     every worker lock in the same sequence. Autocommit warm, so a
             //     single statement is a single txn — sorting within it suffices.
@@ -265,6 +298,23 @@ final class DictionaryCache
     {
         $this->pending = [];
         $this->trim();
+    }
+
+    /**
+     * Drop one map so every value in it becomes a miss again.
+     *
+     * Called by RecordWriter when a dictionary column's width changes under the
+     * running daemon: the repair in warm() only reaches a hash that MISSES the
+     * LRU, so a row this process clipped before the migration would otherwise
+     * stay clipped for the life of the process. Costs one cap's worth of
+     * re-warms, once.
+     */
+    public function forget(string $map): void
+    {
+        if (! array_key_exists($map, self::CAPS)) {
+            throw new \InvalidArgumentException("Unknown dictionary map: {$map}");
+        }
+        $this->{$map} = [];
     }
 
     /** Table warm() died on, for the caller's failure classification. Null outside a warm. */

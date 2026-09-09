@@ -27,6 +27,24 @@ use PHPUnit\Framework\TestCase;
  *
  * Then: NIGHTOWL_TEST_DB_PORT=5433 vendor/bin/phpunit tests/Integration/RecordWriterTest.php
  */
+/** A live handle whose FIRST query() raises a server-side, non-connection error (57014). */
+final class FailsFirstQueryPdo extends PDO
+{
+    public int $failed = 0;
+
+    public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs): \PDOStatement|false
+    {
+        if ($this->failed === 0) {
+            $this->failed++;
+            $e = new \PDOException('SQLSTATE[57014]: Query canceled: 7 ERROR:  canceling statement due to statement timeout');
+            $e->errorInfo = ['57014', 7, 'canceling statement due to statement timeout'];
+            throw $e;
+        }
+
+        return parent::query($query, $fetchMode, ...$fetchModeArgs);
+    }
+}
+
 class RecordWriterTest extends TestCase
 {
     private static ?PDO $pdo = null;
@@ -144,17 +162,17 @@ class RecordWriterTest extends TestCase
     {
         $record = $this->sim->makeRequest([
             'trace_id' => 'req-clamp-001',
-            'route_action' => str_repeat('A', 300),
+            'route_name' => str_repeat('A', 300),
         ]);
 
         $this->writer->write([$record]);
 
-        $row = self::$pdo->query("SELECT route_action FROM nightowl_requests WHERE trace_id = 'req-clamp-001'")
+        $row = self::$pdo->query("SELECT route_name FROM nightowl_requests WHERE trace_id = 'req-clamp-001'")
             ->fetch(PDO::FETCH_ASSOC);
 
         $this->assertNotFalse($row, 'the over-long row must be written, not rejected');
-        $this->assertSame(255, strlen($row['route_action']));
-        $this->assertSame(str_repeat('A', 255), $row['route_action']);
+        $this->assertSame(255, strlen($row['route_name']));
+        $this->assertSame(str_repeat('A', 255), $row['route_name']);
     }
 
     /**
@@ -165,7 +183,7 @@ class RecordWriterTest extends TestCase
     {
         $records = [
             $this->sim->makeRequest(['trace_id' => 'req-batch-ok-1']),
-            $this->sim->makeRequest(['trace_id' => 'req-batch-poison', 'route_action' => str_repeat('B', 512)]),
+            $this->sim->makeRequest(['trace_id' => 'req-batch-poison', 'route_name' => str_repeat('B', 512)]),
             $this->sim->makeRequest(['trace_id' => 'req-batch-ok-2']),
         ];
 
@@ -187,17 +205,17 @@ class RecordWriterTest extends TestCase
     {
         $record = $this->sim->makeRequest([
             'trace_id' => 'req-clamp-utf8',
-            'route_action' => str_repeat('é', 300),
+            'route_name' => str_repeat('é', 300),
         ]);
 
         $this->writer->write([$record]);
 
-        $row = self::$pdo->query("SELECT route_action FROM nightowl_requests WHERE trace_id = 'req-clamp-utf8'")
+        $row = self::$pdo->query("SELECT route_name FROM nightowl_requests WHERE trace_id = 'req-clamp-utf8'")
             ->fetch(PDO::FETCH_ASSOC);
 
         $this->assertNotFalse($row);
-        $this->assertSame(255, mb_strlen($row['route_action'], 'UTF-8'));
-        $this->assertSame(str_repeat('é', 255), $row['route_action']);
+        $this->assertSame(255, mb_strlen($row['route_name'], 'UTF-8'));
+        $this->assertSame(str_repeat('é', 255), $row['route_name']);
     }
 
     /** text columns are unconstrained — clamping them would destroy data for no reason. */
@@ -238,54 +256,354 @@ class RecordWriterTest extends TestCase
      * process, and the next over-long value then raises 22001 and (quarantine off)
      * head-of-line-blocks the whole drain — the exact wedge clamping exists to stop.
      */
-    public function test_clamping_survives_a_transient_column_limit_probe_failure(): void
+    /**
+     * A writer whose backend was reaped BEFORE its first batch (a PostgreSQL
+     * restart between batches) must still clamp: the dead-handle probe failure
+     * has to reach write()'s reconnect-and-retry so the retry probes on the
+     * fresh handle. A withdrawn candidate swallowed it and reconnected in
+     * doWrite() — on a v1 tenant nothing re-probed after that, the batch ran
+     * with an empty width map, and this 300-char value raised 22001.
+     */
+    public function test_a_writer_whose_backend_was_reaped_before_its_first_batch_still_clamps(): void
     {
         $dsn = sprintf('pgsql:host=%s;port=%d;dbname=%s', self::$host, self::$port, self::$database);
         $reaped = new PDO($dsn, self::$username, self::$password);
         $reaped->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        // A handle whose backend the server has reaped: every statement on it throws,
-        // exactly as a PG restart between batches leaves the drain's connection.
         $pid = (int) $reaped->query('SELECT pg_backend_pid()')->fetchColumn();
         self::$pdo->query("SELECT pg_terminate_backend({$pid})");
-
-        $pdoProp = new \ReflectionProperty($this->writer, 'pdo');
-        $pdoProp->setValue($this->writer, $reaped);
-
-        $columnLimits = new \ReflectionMethod($this->writer, 'columnLimits');
-        $this->assertSame(
-            [],
-            $columnLimits->invoke($this->writer, 'nightowl_requests'),
-            'a failed probe must clamp nothing rather than guess a width',
-        );
-
-        // The connection recovers, as it does after any blip.
-        $pdoProp->setValue($this->writer, null);
+        (new \ReflectionProperty($this->writer, 'pdo'))->setValue($this->writer, $reaped);
 
         $this->writer->write([$this->sim->makeRequest([
-            'trace_id' => 'req-clamp-after-blip',
-            'route_action' => str_repeat('D', 300),
+            'trace_id' => 'req-clamp-after-reap',
+            'route_name' => str_repeat('D', 300),
         ])]);
 
-        $row = self::$pdo->query("SELECT route_action FROM nightowl_requests WHERE trace_id = 'req-clamp-after-blip'")
+        $row = self::$pdo->query("SELECT route_name FROM nightowl_requests WHERE trace_id = 'req-clamp-after-reap'")
             ->fetch(PDO::FETCH_ASSOC);
-
-        $this->assertNotFalse($row, 'the probe must re-run after the blip, not serve a cached failure');
-        $this->assertSame(255, strlen($row['route_action']));
+        $this->assertNotFalse($row, 'the batch must land on the reconnected handle');
+        $this->assertSame(255, strlen($row['route_name']), 'and be clamped: the retry must probe on the fresh handle');
+        $this->assertNull($this->writer->lastWriteError, 'a reconnect is not a write error');
     }
 
-    /** A probe that genuinely finds no length-constrained columns is still cached. */
-    public function test_successful_column_limit_probe_is_cached(): void
+    /**
+     * A NON-connection probe failure (a statement_timeout, say) is swallowed:
+     * clamp nothing this batch, keep the clock unstamped so the next call
+     * re-probes, and never cache the failure as "no limits".
+     */
+    public function test_a_transient_probe_failure_clamps_nothing_and_is_retried(): void
+    {
+        $dsn = sprintf('pgsql:host=%s;port=%d;dbname=%s', self::$host, self::$port, self::$database);
+        $flaky = new FailsFirstQueryPdo($dsn, self::$username, self::$password);
+        $flaky->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        (new \ReflectionProperty($this->writer, 'pdo'))->setValue($this->writer, $flaky);
+
+        $columnLimits = new \ReflectionMethod($this->writer, 'columnLimits');
+        $at = new \ReflectionProperty($this->writer, 'columnLimitsAt');
+
+        $this->assertSame([], $columnLimits->invoke($this->writer, 'nightowl_requests'), 'a failed probe clamps nothing rather than guessing a width');
+        $this->assertSame(0.0, $at->getValue($this->writer), 'the failure is not stamped as a probe');
+        $this->assertSame(1, $flaky->failed, 'the injected failure was the probe');
+
+        $this->assertSame(255, $columnLimits->invoke($this->writer, 'nightowl_requests')['route_name'] ?? null, 'the very next call re-probes');
+        $this->assertGreaterThan(0.0, $at->getValue($this->writer));
+    }
+
+    /**
+     * One probe answers for every table, and a table with no length-constrained
+     * columns is a real answer rather than a missing one.
+     */
+    public function test_one_probe_answers_for_every_table(): void
     {
         $columnLimits = new \ReflectionMethod($this->writer, 'columnLimits');
-        $cache = new \ReflectionProperty($this->writer, 'columnLimits');
+        $all = new \ReflectionProperty($this->writer, 'columnLimitsAll');
+        $at = new \ReflectionProperty($this->writer, 'columnLimitsAt');
 
-        $this->assertArrayHasKey('route_action', $columnLimits->invoke($this->writer, 'nightowl_requests'));
-        $this->assertArrayHasKey('nightowl_requests', $cache->getValue($this->writer));
+        $this->assertArrayHasKey('route_name', $columnLimits->invoke($this->writer, 'nightowl_requests'));
 
-        // No varchar columns at all — an empty map, cached, not a failure.
+        // The single statement covered the other tables too — no second probe.
+        $map = $all->getValue($this->writer);
+        $this->assertArrayHasKey('nightowl_dict_route', $map);
+        $this->assertArrayHasKey('nightowl_issues', $map);
+        $stamped = $at->getValue($this->writer);
+        $this->assertGreaterThan(0.0, $stamped);
+
+        // A table with no length-constrained columns, and one that does not exist,
+        // both answer "nothing to clamp" without re-probing.
         $this->assertSame([], $columnLimits->invoke($this->writer, 'nightowl_no_such_table'));
-        $this->assertArrayHasKey('nightowl_no_such_table', $cache->getValue($this->writer));
+        $this->assertSame($stamped, $at->getValue($this->writer), 'the clock must not move for a cache hit');
+    }
+
+    /**
+     * A width can change under a RUNNING agent: nightowl:migrate is a standalone
+     * command, and NIGHTOWL_AUTO_MIGRATE=false / NIGHTOWL_RUN_MIGRATIONS=true both
+     * run it against a live drain. The cache is re-probed on a TTL.
+     *
+     * The clock is aged by 61s, NOT reset to the 0.0 "never probed" sentinel: a
+     * mutation audit showed the previous version of this test passed with the TTL
+     * comparison deleted outright, because 0.0 takes the first-probe branch.
+     */
+    public function test_a_width_widened_under_a_live_writer_is_picked_up_after_the_ttl(): void
+    {
+        $columnLimits = new \ReflectionMethod($this->writer, 'columnLimits');
+        $at = new \ReflectionProperty($this->writer, 'columnLimitsAt');
+
+        $this->assertArrayNotHasKey('path', $columnLimits->invoke($this->writer, 'nightowl_dict_route'), 'fixture starts widened by 000073');
+
+        // Order-independent: an earlier test may leave >512-char paths behind.
+        self::$pdo->exec('DELETE FROM nightowl_requests_v2');
+        self::$pdo->exec('DELETE FROM nightowl_dict_route');
+        self::$pdo->exec('ALTER TABLE nightowl_dict_route ALTER COLUMN path TYPE varchar(512) USING left(path, 512)');
+
+        try {
+            // Inside the TTL: still the cached answer.
+            $this->assertArrayNotHasKey('path', $columnLimits->invoke($this->writer, 'nightowl_dict_route'));
+
+            // Past the TTL: re-probed.
+            $at->setValue($this->writer, microtime(true) - 61.0);
+            $this->assertSame(512, $columnLimits->invoke($this->writer, 'nightowl_dict_route')['path'] ?? null);
+        } finally {
+            self::$pdo->exec('ALTER TABLE nightowl_dict_route ALTER COLUMN path TYPE text');
+        }
+    }
+
+    /**
+     * Inside the batch transaction the width cache is SERVED, never refreshed —
+     * even when the TTL has elapsed. A re-probe in-txn could see a dictionary
+     * width change and clear that dictionary's LRU after the warm and before the
+     * write's lookups, storing NULL links for the whole batch; and a failed
+     * in-txn probe leaves the transaction aborted. Mutation: drop the
+     * `inTransaction()` gate and this fails on the clock assertion.
+     */
+    public function test_width_cache_is_never_refreshed_inside_a_transaction(): void
+    {
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $columnLimits = new \ReflectionMethod($writer, 'columnLimits');
+        $at = new \ReflectionProperty($writer, 'columnLimitsAt');
+        $pdo = (new \ReflectionMethod($writer, 'pdo'))->invoke($writer);
+
+        // Prime the cache outside a transaction.
+        $this->assertNotEmpty($columnLimits->invoke($writer, 'nightowl_dict_route'));
+        $stamped = $at->getValue($writer);
+        $this->assertGreaterThan(0.0, $stamped);
+
+        // Age it past the TTL, then ask from INSIDE a transaction.
+        $at->setValue($writer, microtime(true) - 61.0);
+        $pdo->beginTransaction();
+        try {
+            $limits = $columnLimits->invoke($writer, 'nightowl_dict_route');
+            $this->assertNotEmpty($limits, 'the cache is served in-txn');
+            $this->assertLessThan(microtime(true) - 60.0, $at->getValue($writer), 'no re-probe inside a transaction: the aged clock is untouched');
+        } finally {
+            $pdo->rollBack();
+        }
+
+        // Outside again: the same stale clock now refreshes.
+        $columnLimits->invoke($writer, 'nightowl_dict_route');
+        $this->assertGreaterThan(microtime(true) - 5.0, $at->getValue($writer), 'refreshed once out of the transaction');
+    }
+
+    /**
+     * The layout 2.4.3-rc regressed. PostgreSQL's default search_path is
+     * "$user", public; when a schema named after the login role exists,
+     * current_schema() returns it while to_regclass resolves the tables in
+     * public. A probe keyed on current_schema() found zero columns, clamped
+     * nothing, and the first over-long value wedged the drain — proven against a
+     * v2.4.2 snapshot, where the identical write succeeded.
+     */
+    public function test_probe_describes_the_table_the_drain_writes_to_when_a_role_schema_exists(): void
+    {
+        $role = self::$username;
+        self::$pdo->exec("CREATE SCHEMA IF NOT EXISTS \"{$role}\"");
+
+        try {
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
+            $columnLimits = new \ReflectionMethod($writer, 'columnLimits');
+
+            $limits = $columnLimits->invoke($writer, 'nightowl_dict_route');
+            $this->assertSame(255, $limits['name'] ?? null, 'the probe must find public\'s widths with the role schema present');
+
+            // And the write path: a 300-char route name is clamped, not rejected.
+            self::$pdo->exec('DELETE FROM nightowl_requests');
+            $writer->write([$this->sim->makeRequest(['route_name' => str_repeat('n', 300)])]);
+            $this->assertSame(255, (int) self::$pdo->query('SELECT length(route_name) FROM nightowl_requests')->fetchColumn());
+        } finally {
+            self::$pdo->exec("DROP SCHEMA IF EXISTS \"{$role}\"");
+        }
+    }
+
+    /**
+     * The layout 2.4.2 got wrong: tables in a scoped schema that the role's
+     * search_path puts ahead of public. The probe must follow the same
+     * resolution an unqualified INSERT uses.
+     */
+    public function test_probe_follows_a_scoped_search_path(): void
+    {
+        self::$pdo->exec('DROP SCHEMA IF EXISTS scoped_probe CASCADE');
+        self::$pdo->exec('CREATE SCHEMA scoped_probe');
+        self::$pdo->exec('CREATE TABLE scoped_probe.nightowl_dict_route (id bigserial primary key, hash bytea unique,
+            method varchar(16), domain varchar(255), path varchar(64), name varchar(32), action varchar(512), methods varchar(255))');
+        // On the writer's OWN connection — ALTER ROLE ... SET search_path is
+        // server-global and would leak into every other suite using this role.
+        try {
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            (new \ReflectionMethod($writer, 'pdo'))->invoke($writer)->exec('SET search_path TO scoped_probe, public');
+            $limits = (new \ReflectionMethod($writer, 'columnLimits'))->invoke($writer, 'nightowl_dict_route');
+
+            $this->assertSame(64, $limits['path'] ?? null, 'the scoped table, not public\'s, is what the drain would write');
+            $this->assertSame(32, $limits['name'] ?? null);
+        } finally {
+            self::$pdo->exec('DROP SCHEMA IF EXISTS scoped_probe CASCADE');
+        }
+    }
+
+    /**
+     * A row the daemon clipped before a migration widened its column must heal in
+     * THAT daemon, not only after a restart. The repair in DictionaryCache::warm
+     * runs only for LRU misses, and the clipped row\'s hash is in the LRU — so the
+     * TTL re-probe has to clear the dictionary when a width changes. Without that
+     * (mutation: remove forgetDictionariesWhoseWidthChanged) this stays at 512.
+     */
+    public function test_a_clipped_dictionary_row_heals_in_the_same_process_once_the_column_widens(): void
+    {
+        self::$pdo->exec('DELETE FROM nightowl_requests_v2');
+        self::$pdo->exec('DELETE FROM nightowl_dict_route');
+        self::$pdo->exec('ALTER TABLE nightowl_dict_route ALTER COLUMN path TYPE varchar(512)');
+
+        $long = '/admin/'.str_repeat('segment/', 120).'edge';
+        $req = fn () => $this->sim->makeRequest(['method' => 'POST', 'route_methods' => ['POST'], 'route_path' => $long, 'route_name' => 'r', 'route_action' => 'A@b']);
+
+        try {
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer->write([$req()]);
+            $this->assertSame(512, (int) self::$pdo->query('SELECT length(path) FROM nightowl_dict_route')->fetchColumn());
+
+            self::$pdo->exec('ALTER TABLE nightowl_dict_route ALTER COLUMN path TYPE text');
+            (new \ReflectionProperty($writer, 'columnLimitsAt'))->setValue($writer, microtime(true) - 61.0);
+
+            $writer->write([$req()]);
+
+            $this->assertSame(strlen($long), (int) self::$pdo->query('SELECT length(path) FROM nightowl_dict_route')->fetchColumn());
+            $this->assertSame(1, (int) self::$pdo->query('SELECT count(*) FROM nightowl_dict_route')->fetchColumn(), 'healed in place — same row, no duplicate');
+        } finally {
+            self::$pdo->exec('ALTER TABLE nightowl_dict_route ALTER COLUMN path TYPE text');
+        }
+    }
+
+    /** The width-change LRU clear is per dictionary: dict_sql heals in-process too, not just dict_route. */
+    public function test_a_clipped_sql_file_heals_in_the_same_process_once_the_column_widens(): void
+    {
+        self::$pdo->exec('DELETE FROM nightowl_queries_v2');
+        self::$pdo->exec('DELETE FROM nightowl_dict_sql');
+        self::$pdo->exec('ALTER TABLE nightowl_dict_sql ALTER COLUMN file TYPE varchar(512) USING left(file, 512)');
+        $file = '/var/www/'.str_repeat('vendor/nested/', 45).'Builder.php';
+        $q = fn () => $this->sim->makeQuery(['sql' => 'select 1', 'file' => $file, 'line' => 7]);
+
+        try {
+            $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+            $writer->write([$q()]);
+            $this->assertSame(512, (int) self::$pdo->query('SELECT length(file) FROM nightowl_dict_sql')->fetchColumn());
+
+            self::$pdo->exec('ALTER TABLE nightowl_dict_sql ALTER COLUMN file TYPE text');
+            (new \ReflectionProperty($writer, 'columnLimitsAt'))->setValue($writer, microtime(true) - 61.0);
+            $writer->write([$q()]);
+
+            $this->assertSame(strlen($file), (int) self::$pdo->query('SELECT length(file) FROM nightowl_dict_sql')->fetchColumn());
+            $this->assertSame(1, (int) self::$pdo->query('SELECT count(*) FROM nightowl_dict_sql')->fetchColumn());
+        } finally {
+            self::$pdo->exec('ALTER TABLE nightowl_dict_sql ALTER COLUMN file TYPE text');
+        }
+    }
+
+    /**
+     * The width-change detector must ignore key ORDER: the probe's row order is
+     * the planner's, and a strict array comparison is order-sensitive, so a
+     * plan change could clear a dictionary's LRU with no width change at all.
+     * Mutation: drop the ksort in forgetDictionariesWhoseWidthChanged and the
+     * maps below compare unequal.
+     */
+    public function test_width_change_detector_ignores_column_order(): void
+    {
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password);
+        $dict = (new \ReflectionProperty($writer, 'dict'))->getValue($writer);
+        $hash = str_repeat('ab', 16);
+        $dict->warm((new \ReflectionMethod($writer, 'pdo'))->invoke($writer), ['route' => [[$hash, 'GET', null, '/x', 'x', 'A@b', '["GET"]']]]);
+        $this->assertNotNull($dict->routeId($hash));
+
+        $detect = new \ReflectionMethod($writer, 'forgetDictionariesWhoseWidthChanged');
+        $before = ['nightowl_dict_route' => ['name' => 255, 'domain' => 255, 'methods' => 255, 'method' => 16]];
+        $after = ['nightowl_dict_route' => ['method' => 16, 'methods' => 255, 'domain' => 255, 'name' => 255]];
+
+        $detect->invoke($writer, $before, $after);
+        $this->assertNotNull($dict->routeId($hash), 'same widths in a different order must not clear the LRU');
+
+        $after['nightowl_dict_route']['name'] = 512;
+        $detect->invoke($writer, $before, $after);
+        $this->assertNull($dict->routeId($hash), 'a real width change must');
+    }
+
+    /**
+     * Migration 000074 is what makes this pass. Invoked DIRECTLY: on a warm test
+     * database the runner's fast path never replays the chain, so the column is
+     * already text and a no-op up() would be invisible (a mutation audit showed
+     * exactly that). Narrow the column, run up(), then write.
+     */
+    public function test_v1_route_action_is_stored_whole_after_000074(): void
+    {
+        self::$pdo->exec('DELETE FROM nightowl_requests');
+        self::$pdo->exec('ALTER TABLE nightowl_requests ALTER COLUMN route_action TYPE varchar(255) USING left(route_action, 255)');
+        $migration = require __DIR__.'/../../database/migrations/2024_01_01_000074_widen_v1_route_action.php';
+        $migration->up();
+        $this->assertSame('text', self::$pdo->query("SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'nightowl_requests' AND column_name = 'route_action'")->fetchColumn());
+
+        // A single long controller action — NOT a comma-joined list, which
+        // RouteAction::normalize would collapse before it reached the column.
+        $action = 'App\\Http\\Controllers\\'.str_repeat('Very', 65).'LongController@index';
+        $this->assertGreaterThan(255, strlen($action));
+        $this->assertStringNotContainsString(', ', $action);
+
+        $this->writer->write([$this->sim->makeRequest(['route_action' => $action])]);
+
+        $this->assertSame(strlen($action), (int) self::$pdo->query('SELECT length(route_action) FROM nightowl_requests')->fetchColumn());
+    }
+
+    /**
+     * The advice is decided by properties, not names: an indexed column gets the
+     * btree warning, an unindexed one gets the plain ALTER, and nothing says "run
+     * nightowl:migrate" — only three columns have a widening migration and an
+     * earlier version told every column to run it.
+     */
+    public function test_clamp_advice_is_property_based(): void
+    {
+        $advice = new \ReflectionMethod($this->writer, 'clampAdvice');
+        $indexed = new \ReflectionProperty($this->writer, 'indexedColumns');
+        $indexed->setValue($this->writer, ['nightowl_cache_rollups' => ['key' => true]]);
+
+        $plain = $advice->invoke($this->writer, 'nightowl_requests', 'route_name', 255);
+        $btree = $advice->invoke($this->writer, 'nightowl_cache_rollups', 'key', 255);
+        $label = $advice->invoke($this->writer, 'nightowl_dict_string', 'value', 512);
+
+        $this->assertStringContainsString('ALTER TABLE nightowl_requests ALTER COLUMN route_name TYPE text', $plain);
+        $this->assertStringNotContainsString('part of an index', $plain);
+
+        $this->assertStringContainsString('part of an index', $btree);
+        $this->assertStringContainsString('54000', $btree);
+
+        $this->assertStringContainsString('nothing to widen', $label);
+
+        foreach ([$plain, $btree, $label] as $msg) {
+            $this->assertStringNotContainsString('nightowl:migrate', $msg, 'never advise a migration that may not exist for this column');
+        }
+    }
+
+    /** The live probe marks index membership from the catalog, not from a name list. */
+    public function test_probe_records_which_columns_are_indexed(): void
+    {
+        (new \ReflectionMethod($this->writer, 'columnLimits'))->invoke($this->writer, 'nightowl_cache_rollups');
+        $indexed = (new \ReflectionProperty($this->writer, 'indexedColumns'))->getValue($this->writer);
+
+        $this->assertTrue($indexed['nightowl_cache_rollups']['key'] ?? false, 'a PK member is indexed');
+        $this->assertTrue($indexed['nightowl_dict_string']['value'] ?? false, 'a UNIQUE member is indexed');
+        $this->assertArrayNotHasKey('route_name', $indexed['nightowl_requests'] ?? [], 'an unindexed varchar is not');
     }
 
     /**

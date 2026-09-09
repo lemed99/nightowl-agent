@@ -319,6 +319,332 @@ class RecordWriterV2Test extends TestCase
         }
     }
 
+    /**
+     * The Livewire case end to end. Nightwatch appends one class name per
+     * hydrated component with no dedupe (CapturesState::captureRequestRouteAction),
+     * so a page of 78 identical components reports a 2,884-byte action whose
+     * content changes with the page's state. dict_route is hashed over that value
+     * and is append-only — never pruned, never GC'd — so without normalization
+     * every state of one page mints a permanent row.
+     */
+    public function test_livewire_component_lists_collapse_to_one_dict_route_row(): void
+    {
+        $card = 'App\\Livewire\\Proposals\\QuestionCard';
+        $bar = 'App\\Livewire\\Proposals\\QuestionProgressBar';
+
+        // The route tuple is hashed whole, so everything but the action is pinned —
+        // the simulator randomizes method/route_methods per call, and a Livewire
+        // update endpoint is always POST anyway.
+        $req = function (int $cards, bool $withBar) use ($card, $bar): array {
+            $parts = array_fill(0, $cards, $card);
+            if ($withBar) {
+                array_unshift($parts, $bar);
+            }
+
+            return $this->sim->makeRequest([
+                'method' => 'POST',
+                'route_methods' => ['POST'],
+                'route_path' => '/livewire/update',
+                'route_name' => 'livewire.update',
+                'route_action' => implode(', ', $parts),
+            ]);
+        };
+
+        // Four states of the SAME page, as a user interacts with it.
+        $this->writer->write([$req(78, false), $req(79, false), $req(101, false)]);
+        $this->writer->write([$req(64, false)]); // a second batch, so the LRU path is covered too
+
+        $rows = self::$pdo->query("
+            SELECT action, length(action) AS len
+            FROM nightowl_dict_route WHERE path = '/livewire/update'
+        ")->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->assertCount(1, $rows, 'every state of one Livewire page must share ONE dictionary row');
+        $this->assertSame($card, $rows[0]['action']);
+
+        // A genuinely different component set is still its own row.
+        $this->writer->write([$req(12, true)]);
+        $this->assertSame(
+            2,
+            (int) self::$pdo->query("SELECT COUNT(*) FROM nightowl_dict_route WHERE path = '/livewire/update'")->fetchColumn(),
+            'a different set of components is a different route action'
+        );
+
+        // All four requests still resolve to a route (no lost links).
+        $this->assertSame(
+            0,
+            (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_requests_v2 WHERE route_id IS NULL')->fetchColumn()
+        );
+    }
+
+    /** v1 storage gets the same collapsed value, not a clamped repetition. */
+    public function test_the_v1_route_action_column_stores_the_collapsed_value(): void
+    {
+        $card = 'App\\Livewire\\Proposals\\QuestionCard';
+        $writer = new RecordWriter(
+            self::$host, self::$port, self::$database, self::$username, self::$password,
+            storageV2Config: false,
+        );
+
+        $writer->write([$this->sim->makeRequest([
+            'route_action' => implode(', ', array_fill(0, 78, $card)),
+        ])]);
+
+        $this->assertSame(
+            $card,
+            self::$pdo->query('SELECT route_action FROM nightowl_requests')->fetchColumn()
+        );
+    }
+
+    /**
+     * An ignored route takes the records of its OWN execution with it. A request
+     * row without its queries is a detail page with holes; a query without its
+     * request is a row whose link goes nowhere.
+     */
+    public function test_an_ignored_route_drops_its_own_execution(): void
+    {
+        $ignoredTrace = '22222222-2222-4222-8222-222222222222';
+        $keptTrace = '33333333-3333-4333-8333-333333333333';
+
+        $writer = new RecordWriter(
+            self::$host, self::$port, self::$database, self::$username, self::$password,
+            ignoredRoutes: ['*livewire.update'],
+        );
+
+        $writer->write([
+            // Ignored: the request and everything sharing its trace.
+            $this->sim->makeRequest([
+                'trace_id' => $ignoredTrace,
+                'route_path' => 'livewire-09e76b9c/update',
+                'route_name' => 'default-livewire.update',
+            ]),
+            $this->sim->makeQuery(['trace_id' => $ignoredTrace, 'execution_id' => $ignoredTrace]),
+            $this->sim->makeLog(['trace_id' => $ignoredTrace, 'execution_id' => $ignoredTrace]),
+            // Kept: an ordinary request and its query.
+            $this->sim->makeRequest([
+                'trace_id' => $keptTrace,
+                'route_path' => 'api/search',
+                'route_name' => 'search',
+            ]),
+            $this->sim->makeQuery(['trace_id' => $keptTrace]),
+        ]);
+
+        $requests = self::$pdo->query('SELECT COUNT(*) FROM nightowl_requests_v2')->fetchColumn();
+        $queries = self::$pdo->query('SELECT COUNT(*) FROM nightowl_queries_v2')->fetchColumn();
+        $logs = self::$pdo->query('SELECT COUNT(*) FROM nightowl_logs_v2')->fetchColumn();
+
+        $this->assertSame(1, (int) $requests, 'only the non-ignored request survives');
+        $this->assertSame(1, (int) $queries, "the ignored route's query goes with it");
+        $this->assertSame(0, (int) $logs);
+
+        // Nothing about the ignored route reaches the dictionary either — no
+        // route row means no chart point, no rollup, nothing in the dashboard.
+        $this->assertSame(
+            0,
+            (int) self::$pdo->query("SELECT COUNT(*) FROM nightowl_dict_route WHERE name = 'default-livewire.update'")->fetchColumn()
+        );
+        $this->assertSame(
+            1,
+            (int) self::$pdo->query("SELECT COUNT(*) FROM nightowl_dict_route WHERE name = 'search'")->fetchColumn()
+        );
+    }
+
+    /**
+     * An ignored route must never take an exception or a job with it.
+     *
+     * Nightwatch propagates the request's trace into the jobs it dispatches, and the
+     * queue worker emits the attempt minutes later in a DIFFERENT drain batch. So
+     * trace-scoped dropping used to be decided by batching: the `queued-job`
+     * dispatch row (which rides the request's own digest) was dropped while the
+     * `job-attempt` was kept — an orphan attempt and a jobs list reading QUEUED 0 —
+     * and an exception thrown inside the job was stored or silently discarded
+     * depending on whether the two payloads landed together. Whether an operator
+     * got paged was decided by drain batching.
+     */
+    public function test_an_ignored_route_never_drops_exceptions_or_jobs(): void
+    {
+        $trace = '77777777-7777-4777-8777-777777777777';
+        $attempt = '77777777-7777-4777-8777-777777777778';
+
+        $writer = new RecordWriter(
+            self::$host, self::$port, self::$database, self::$username, self::$password,
+            ignoredRoutes: ['*livewire.update'],
+        );
+
+        // Everything in ONE batch — the case that used to discard the exception.
+        $writer->write([
+            $this->sim->makeRequest([
+                'trace_id' => $trace,
+                'route_path' => 'livewire-09e76b9c/update',
+                'route_name' => 'default-livewire.update',
+            ]),
+            $this->sim->makeQuery(['trace_id' => $trace, 'execution_id' => $trace]),
+            $this->sim->makeLog(['trace_id' => $trace, 'execution_id' => $trace]),
+            $this->sim->makeJob(['trace_id' => $trace, 'execution_id' => $trace]),
+            $this->sim->makeException(['trace_id' => $trace, 'execution_id' => $trace]),
+            // The job's attempt and everything it recorded while running: same
+            // trace (propagated), DIFFERENT execution. Co-batched on purpose —
+            // this is the case the trace-scoped version dropped.
+            $this->sim->makeJobAttempt(['trace_id' => $trace]),
+            $this->sim->makeQuery(['trace_id' => $trace, 'execution_id' => $attempt]),
+            $this->sim->makeMail(['trace_id' => $trace, 'execution_id' => $attempt]),
+        ]);
+
+        $count = fn (string $t): int => (int) self::$pdo->query("SELECT COUNT(*) FROM {$t}")->fetchColumn();
+
+        $this->assertSame(0, $count('nightowl_requests_v2'), 'the ignored request itself goes');
+        $this->assertSame(1, $count('nightowl_queries_v2'), "the request's query goes; the JOB's query stays");
+        $this->assertSame(0, $count('nightowl_logs_v2'));
+        $this->assertSame(1, $count('nightowl_mail_v2'), "mail sent by the job stays");
+        $this->assertSame(1, $count('nightowl_exceptions_v2'), 'an exception is never dropped by an ignore rule');
+        $this->assertSame(2, $count('nightowl_jobs_v2'), 'dispatch row AND attempt survive');
+        $this->assertGreaterThan(0, $count('nightowl_issues'), 'and it still raises an issue');
+    }
+
+    /**
+     * Patterns are matched against the value the dashboard SHOWS, not the raw
+     * repeated list — filtering used to run before the collapse, so an action
+     * pattern copied out of the UI silently matched nothing.
+     */
+    public function test_an_action_pattern_matches_the_collapsed_value(): void
+    {
+        $card = 'App\\Livewire\\Proposals\\QuestionCard';
+
+        $writer = new RecordWriter(
+            self::$host, self::$port, self::$database, self::$username, self::$password,
+            ignoredRoutes: [$card],
+        );
+
+        $writer->write([$this->sim->makeRequest([
+            'route_path' => 'livewire-09e76b9c/update',
+            'route_name' => 'default-livewire.update',
+            'route_action' => implode(', ', array_fill(0, 78, $card)),
+        ])]);
+
+        $this->assertSame(
+            0,
+            (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_requests_v2')->fetchColumn(),
+            'the exact action string a user reads off the dashboard must work as a pattern'
+        );
+    }
+
+    /**
+     * The count that lets a reader tell "quiet app" from "filtered app".
+     *
+     * An ignored request is in none of the vitals — not requests_total, not the 5xx
+     * rate, not a threshold. So filtering a high-volume healthy endpoint takes its
+     * successes out of the denominator and leaves the failures in, and the tenant's
+     * error rate rises with nothing wrong. This counter is the only thing that can
+     * explain that, because the explanation is rows that were never written.
+     */
+    public function test_ignored_requests_are_counted_for_the_health_report(): void
+    {
+        $writer = new RecordWriter(
+            self::$host, self::$port, self::$database, self::$username, self::$password,
+            ignoredRoutes: ['*livewire.update'],
+        );
+
+        $ignored = fn (string $trace): array => $this->sim->makeRequest([
+            'trace_id' => $trace,
+            'route_path' => 'livewire-09e76b9c/update',
+            'route_name' => 'default-livewire.update',
+        ]);
+
+        $writer->write([
+            $ignored('88888888-8888-4888-8888-888888888881'),
+            $ignored('88888888-8888-4888-8888-888888888882'),
+            $this->sim->makeRequest(['route_path' => 'api/search', 'route_name' => 'search']),
+        ]);
+
+        $this->assertSame(2, $writer->lastIgnoredRequestCount);
+        $this->assertSame(1, $writer->lastRequestCount, 'the vitals count only what was recorded');
+
+        // Per batch, not cumulative — a later clean batch must reset it, or the
+        // drain worker would add the same requests to its total on every loop.
+        $writer->write([$this->sim->makeRequest(['route_path' => 'api/other', 'route_name' => 'other'])]);
+        $this->assertSame(0, $writer->lastIgnoredRequestCount);
+    }
+
+    /**
+     * The decisive property: the SAME records produce the SAME database whether
+     * the job half lands in the request\'s batch or a later one. Under trace
+     * scoping the job\'s query and mail were dropped in the first case and kept
+     * in the second.
+     */
+    public function test_job_children_survive_regardless_of_batching(): void
+    {
+        $trace = '78787878-7878-4878-8878-787878787878';
+        $attempt = '78787878-7878-4878-8878-787878787879';
+        $records = fn () => [
+            $this->sim->makeRequest(['trace_id' => $trace, 'route_path' => 'livewire-09e76b9c/update', 'route_name' => 'default-livewire.update']),
+            $this->sim->makeQuery(['trace_id' => $trace, 'execution_id' => $trace]),
+            $this->sim->makeJob(['trace_id' => $trace, 'execution_id' => $trace]),
+        ];
+        $jobHalf = fn () => [
+            $this->sim->makeJobAttempt(['trace_id' => $trace]),
+            $this->sim->makeQuery(['trace_id' => $trace, 'execution_id' => $attempt]),
+            $this->sim->makeMail(['trace_id' => $trace, 'execution_id' => $attempt]),
+        ];
+        $snapshot = fn (): array => [
+            'queries' => (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_queries_v2')->fetchColumn(),
+            'mail' => (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_mail_v2')->fetchColumn(),
+            'jobs' => (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_jobs_v2')->fetchColumn(),
+        ];
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, ignoredRoutes: ['*livewire.update']);
+
+        $writer->write([...$records(), ...$jobHalf()]);         // co-batched
+        $coBatched = $snapshot();
+
+        foreach (['nightowl_queries_v2', 'nightowl_mail_v2', 'nightowl_jobs_v2', 'nightowl_requests_v2'] as $t) {
+            self::$pdo->exec("DELETE FROM {$t}");
+        }
+        $writer->write($records());
+        $writer->write($jobHalf());                              // job arrives later
+        $split = $snapshot();
+
+        $this->assertSame($coBatched, $split, 'batching must not decide what a job\'s detail page contains');
+        $this->assertSame(['queries' => 1, 'mail' => 1, 'jobs' => 2], $split);
+    }
+
+    /** A record with no usable execution id is kept — trace fallback would re-import the job problem. */
+    public function test_a_child_without_an_execution_id_is_kept(): void
+    {
+        $trace = '79797979-7979-4979-8979-797979797979';
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, ignoredRoutes: ['*livewire.update']);
+
+        $writer->write([
+            $this->sim->makeRequest(['trace_id' => $trace, 'route_path' => 'livewire-09e76b9c/update', 'route_name' => 'default-livewire.update']),
+            $this->sim->makeQuery(['trace_id' => $trace, 'execution_id' => null]),
+        ]);
+
+        $this->assertSame(1, (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_queries_v2')->fetchColumn());
+    }
+
+    /** A matching request with no trace_id still goes; it just cannot take children with it. */
+    public function test_a_matching_request_without_a_trace_is_still_dropped(): void
+    {
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, ignoredRoutes: ['*livewire.update']);
+        $r = $this->sim->makeRequest(['route_path' => 'livewire-09e76b9c/update', 'route_name' => 'default-livewire.update']);
+        unset($r['trace_id']);
+
+        $writer->write([$r]);
+
+        $this->assertSame(0, (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_requests_v2')->fetchColumn());
+        $this->assertSame(1, $writer->lastIgnoredRequestCount);
+    }
+
+    /** With no patterns configured nothing is filtered — the default path. */
+    public function test_no_ignore_patterns_keeps_everything(): void
+    {
+        $this->writer->write([
+            $this->sim->makeRequest(['route_path' => 'livewire-09e76b9c/update', 'route_name' => 'default-livewire.update']),
+            $this->sim->makeQuery(),
+        ]);
+
+        $this->assertSame(1, (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_requests_v2')->fetchColumn());
+        $this->assertSame(1, (int) self::$pdo->query('SELECT COUNT(*) FROM nightowl_queries_v2')->fetchColumn());
+    }
+
     // ------------------------------------------- COPY vs INSERT byte identity
 
     public function test_copy_and_insert_fallback_store_identical_bytes(): void
