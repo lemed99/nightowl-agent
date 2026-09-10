@@ -2,6 +2,7 @@
 
 namespace NightOwl\Tests\Integration;
 
+use Carbon\Carbon;
 use Illuminate\Config\Repository;
 use Illuminate\Console\Application as ConsoleApplication;
 use Illuminate\Console\OutputStyle;
@@ -579,6 +580,38 @@ final class RollupBackfillDrainContentionTest extends TestCase
     }
 
     /** Minute rollups spanning $days back, $groups distinct query groups, every 3rd minute. */
+    /**
+     * A tier pass started inside the first second of a minute must still fold
+     * that minute's row in. The chunk bound is rendered at second resolution
+     * and applied as `bucket_start < end`; with `end = now` a pass at HH:MM:00.4
+     * ended at 'HH:MM:00' and excluded the row AT HH:MM:00 — the tier came up
+     * one minute row short, about one run in sixty, which is how the previous
+     * test flaked in CI. Pinned with the clock frozen inside that second.
+     */
+    public function test_the_tier_pass_includes_the_current_minute_even_in_its_first_second(): void
+    {
+        $minute = gmdate('Y-m-d H:i:00');
+        self::$pdo->exec("
+            INSERT INTO ".self::MINUTE_TABLE."
+                (group_hash, bucket_start, environment, connection, call_count, total_duration,
+                 min_duration, max_duration, sql_query, hist_05)
+            VALUES ('seed_now', '{$minute}', 'production', 'pgsql', 5, 2500, 300, 900, 'SELECT * FROM seeded', 5)
+        ");
+
+        Carbon::setTestNow(Carbon::parse($minute.'.400000', 'UTC'));
+        try {
+            $this->backfillTiersOnly();
+        } finally {
+            Carbon::setTestNow();
+        }
+
+        $this->assertSame(
+            5,
+            (int) self::$pdo->query('SELECT COALESCE(SUM(call_count), 0) FROM '.self::TIER_TABLE)->fetchColumn(),
+            'the row at the current minute must be in the hourly tier',
+        );
+    }
+
     private function seedMinuteRollups(int $days, int $groups): void
     {
         for ($d = 0; $d < $days; $d++) {

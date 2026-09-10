@@ -265,7 +265,14 @@ class BackfillRollupsCommand extends Command
             }
 
             $since = $this->parseUtc((string) $sinceOption);
-            $until = $this->nowUtc();
+            // Ceiled to the next minute, not "now": the chunk bound is rendered
+            // at second resolution and applied as `bucket_start < end`, so a
+            // pass started inside the first second of a minute ended at
+            // HH:MM:00 and left that minute's own row out of the tier (one row
+            // short, ~1 run in 60 — caught as an intermittent in CI). The
+            // in-progress bucket is deliberately covered either way; see
+            // RollupBackfillDrainContentionTest.
+            $until = $this->nowUtc()->startOfMinute()->addMinute();
             $unit = RollupTiers::TRUNC_UNIT[$tier];
 
             $this->info("Backfilling {$tierTable} from {$sourceTable}...");
