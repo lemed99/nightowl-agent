@@ -8,11 +8,22 @@ on:
 
 jobs:
   unit:
-    name: Unit Tests
+    name: Unit Tests (${{ matrix.deps }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
         php: ['8.2', '8.3', '8.4']
+        deps: ['locked']
+        # The lock is one point inside `laravel/nightwatch: ^1.26`; customers
+        # resolve anywhere in it. 1.29.0 added a required constructor argument
+        # to Ingest that the locked 1.26 never exercised, so the first
+        # `composer update` past it died in package:discover while CI was
+        # green (BrokerCentral, 2026-09-10). One leg installs the LOWEST
+        # versions the constraint admits so both ends stay tested; the lock
+        # tracks the newest.
+        include:
+          - php: '8.2'
+            deps: 'lowest'
 
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +37,11 @@ jobs:
 
       - name: Install dependencies
         run: composer install --no-interaction --prefer-dist
+        if: matrix.deps == 'locked'
+
+      - name: Install lowest dependencies
+        run: composer update --no-interaction --prefer-dist --prefer-lowest --prefer-stable
+        if: matrix.deps == 'lowest'
 
       - name: Run unit tests
         run: vendor/bin/phpunit --testsuite Unit

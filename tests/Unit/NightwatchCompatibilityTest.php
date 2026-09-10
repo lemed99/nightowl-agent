@@ -2,12 +2,15 @@
 
 namespace NightOwl\Tests\Unit;
 
+use Illuminate\Events\Dispatcher;
 use Laravel\Nightwatch\Contracts\Ingest as IngestContract;
 use Laravel\Nightwatch\Core;
 use Laravel\Nightwatch\Facades\Nightwatch;
 use Laravel\Nightwatch\Ingest;
 use Laravel\Nightwatch\RecordsBuffer;
+use Laravel\Nightwatch\SocketStreamFactory;
 use NightOwl\Support\MultiIngest;
+use NightOwl\Support\NightwatchIngestArguments;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
 use ReflectionProperty;
@@ -31,6 +34,36 @@ final class NightwatchCompatibilityTest extends TestCase
                 "Laravel\\Nightwatch\\Ingest::__construct no longer accepts '{$expected}'. Provider wiring in NightOwlAgentServiceProvider needs updating."
             );
         }
+    }
+
+    /**
+     * The check above only proves the names we pass are ACCEPTED. It said
+     * nothing about a new REQUIRED parameter we do not pass — which is exactly
+     * how nightwatch 1.29's `events` reached a customer's `composer update` as
+     * an ArgumentCountError in package:discover while CI stayed green on the
+     * 1.26 lock. So: construct the installed Ingest with the provider's actual
+     * argument list, and name any required parameter that list leaves out.
+     */
+    public function test_the_providers_argument_list_constructs_the_installed_ingest(): void
+    {
+        $arguments = NightwatchIngestArguments::complete(Ingest::class, [
+            'transmitTo' => '127.0.0.1:2407',
+            'connectionTimeout' => 0.5,
+            'timeout' => 0.5,
+            'streamFactory' => new SocketStreamFactory,
+            'buffer' => new RecordsBuffer(length: 500),
+            'tokenHash' => 'abcdef0',
+        ], fn () => new Dispatcher);
+
+        $missing = [];
+        foreach ((new ReflectionClass(Ingest::class))->getConstructor()?->getParameters() ?? [] as $parameter) {
+            if (! $parameter->isOptional() && ! array_key_exists($parameter->getName(), $arguments)) {
+                $missing[] = $parameter->getName();
+            }
+        }
+        $this->assertSame([], $missing, 'Laravel\\Nightwatch\\Ingest::__construct requires parameter(s) the provider does not pass: '.implode(', ', $missing));
+
+        $this->assertInstanceOf(Ingest::class, new Ingest(...$arguments));
     }
 
     public function test_records_buffer_accepts_length_arg(): void
@@ -90,14 +123,14 @@ final class NightwatchCompatibilityTest extends TestCase
         // Simulate the boot-hook re-wrap: each "wrap" feeds the previous chain
         // back in alongside a freshly-constructed Nightwatch ingest pointing
         // at the same agent socket. Without flatten+dedupe this multiplies.
-        $makeNightowl = fn () => new Ingest(
-            transmitTo: '127.0.0.1:2407',
-            connectionTimeout: 0.5,
-            timeout: 0.5,
-            streamFactory: fn ($a, $t) => fopen('php://memory', 'r+'),
-            buffer: new RecordsBuffer(length: 500),
-            tokenHash: 'abc1234',
-        );
+        $makeNightowl = fn () => new Ingest(...NightwatchIngestArguments::complete(Ingest::class, [
+            'transmitTo' => '127.0.0.1:2407',
+            'connectionTimeout' => 0.5,
+            'timeout' => 0.5,
+            'streamFactory' => fn ($a, $t) => fopen('php://memory', 'r+'),
+            'buffer' => new RecordsBuffer(length: 500),
+            'tokenHash' => 'abc1234',
+        ], fn () => new Dispatcher));
 
         $chain = new MultiIngest($counter, $makeNightowl());
         $chain = new MultiIngest($chain, $makeNightowl());

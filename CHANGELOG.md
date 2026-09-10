@@ -5,6 +5,36 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.4.4] - 2026-09-10
+
+### Fixed
+
+- **`composer update` died in `package:discover` with
+  `Too few arguments to function Laravel\Nightwatch\Ingest::__construct(), 6
+  passed ... exactly 7 expected`.** laravel/nightwatch 1.29.0 (2026-08-25)
+  added a required `Dispatcher $events` to `Ingest` — before each transmit it
+  now fires `IngestingEvents`, and a listener returning `false` drops the
+  records (their per-app ingest limiter). Our constraint `^1.26` admitted 1.29
+  and 1.30 while the lock and CI stayed on 1.26.1, so the first customer to
+  resolve past it hit the error on upgrade (BrokerCentral, 2026-09-10). The
+  provider now completes its argument list against the installed constructor
+  (`NightwatchIngestArguments`): the dispatcher is passed when Nightwatch
+  declares it and omitted for 1.26–1.28, which reject the name.
+
+  Which dispatcher matters. Alone, NightOwl's ingest IS the application's
+  ingest, so it receives the application's dispatcher and the hook fires as
+  it would for Nightwatch. In `parallel_with_nightwatch` mode Nightwatch's own
+  ingest already fires it once per record set, so ours receives an empty
+  dispatcher — with the shared one every listener would run twice and a
+  limiter would count each event double.
+
+  Two things now keep this from recurring: `NightwatchCompatibilityTest`
+  constructs the installed `Ingest` with the provider's actual arguments and
+  names any required parameter the list leaves out (the old check only proved
+  the names we pass are accepted), and CI gained a lowest-versions leg so both
+  ends of the constraint are exercised while the lock tracks the newest
+  (1.30.0).
+
 ## [2.4.3] - 2026-09-09
 
 ### Fixed

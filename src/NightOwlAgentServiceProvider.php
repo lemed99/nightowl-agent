@@ -2,6 +2,8 @@
 
 namespace NightOwl;
 
+use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
+use Illuminate\Events\Dispatcher;
 use Illuminate\Support\ServiceProvider;
 use Laravel\Nightwatch\Core;
 use Laravel\Nightwatch\Ingest;
@@ -30,6 +32,7 @@ use NightOwl\Commands\RepairCacheRollupKeysCommand;
 use NightOwl\Commands\TestAlertCommand;
 use NightOwl\Support\InstalledVersionReader;
 use NightOwl\Support\MultiIngest;
+use NightOwl\Support\NightwatchIngestArguments;
 
 class NightOwlAgentServiceProvider extends ServiceProvider
 {
@@ -145,14 +148,28 @@ class NightOwlAgentServiceProvider extends ServiceProvider
             }
             $nightowlTimeout = (float) config('nightowl.agent.ingest_timeout', 0.5);
 
-            $nightowlIngest = new Ingest(
-                transmitTo: $nightowlTransmitTo,
-                connectionTimeout: $nightowlTimeout,
-                timeout: $nightowlTimeout,
-                streamFactory: new SocketStreamFactory,
-                buffer: new RecordsBuffer(length: 500),
-                tokenHash: $tokenHash,
-            );
+            $parallel = (bool) config('nightowl.parallel_with_nightwatch', false);
+
+            // Nightwatch >= 1.29 asks Ingest for an event dispatcher: before
+            // each transmit it fires IngestingEvents and drops the records if a
+            // listener returns false (their per-app ingest limiter). Alone, our
+            // ingest IS the application's ingest, so it gets the application's
+            // dispatcher and the hook fires exactly as it would for Nightwatch.
+            // In parallel mode Nightwatch's own Ingest already fires it once per
+            // record set; ours gets an empty dispatcher, or every listener would
+            // run twice and a limiter would count each event double. Older
+            // Nightwatch releases do not accept the argument at all — see
+            // NightwatchIngestArguments.
+            $nightowlIngest = new Ingest(...NightwatchIngestArguments::complete(Ingest::class, [
+                'transmitTo' => $nightowlTransmitTo,
+                'connectionTimeout' => $nightowlTimeout,
+                'timeout' => $nightowlTimeout,
+                'streamFactory' => new SocketStreamFactory,
+                'buffer' => new RecordsBuffer(length: 500),
+                'tokenHash' => $tokenHash,
+            ], fn () => $parallel
+                ? new Dispatcher($this->app)
+                : $this->app->make(DispatcherContract::class)));
 
             // Both modes go through MultiIngest — single-agent mode wraps a lone
             // ingest purely for its fail-open write path. A monitoring package
@@ -163,7 +180,7 @@ class NightOwlAgentServiceProvider extends ServiceProvider
             // calling Nightwatch::report(), a future hook, an older SDK) would
             // otherwise surface an unreachable-agent socket error inside an
             // unrelated customer request. (Reported by @TheDaveKent, #4.)
-            if (config('nightowl.parallel_with_nightwatch', false)) {
+            if ($parallel) {
                 $core->ingest = new MultiIngest($core->ingest, $nightowlIngest);
             } else {
                 $core->ingest = new MultiIngest($nightowlIngest);
