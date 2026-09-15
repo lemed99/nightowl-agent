@@ -3,7 +3,8 @@
 namespace NightOwl\Support;
 
 /**
- * Which rollup tables have stopped advancing while their peers kept going.
+ * Which rollup tables have stopped being written while their raw telemetry
+ * kept arriving.
  *
  * A frozen rollup is the quietest failure this agent has. Nothing errors on the
  * read side: the API's coverage gate sees a stale `max(bucket_start)`, decides
@@ -15,36 +16,42 @@ namespace NightOwl\Support;
  * recompute since aborted with 42P01, and the first anyone knew of it was four
  * production 504s on 14-day charts.)
  *
- * The rule is PEER-RELATIVE, not absolute, and that is the whole design. An
- * absolute "max_bucket must be within N minutes of now" needs to know whether
- * this app emits mail, runs scheduled tasks, or has had a single cache miss
- * today — it does not, and every wrong guess is a false critical on a healthy
- * tenant. Peers answer it for free: all rollups are written by the same drain
- * pass, so on a healthy tenant they advance together, and a table that has
- * fallen hours behind the others has a problem specific to itself. That is the
- * exact shape of every cause worth alerting on — an aborting recompute, a
- * dropped source table, a permission loss on one relation.
+ * The rule grades each rollup against ITS OWN RAW SOURCE. A rollup is written
+ * in the same drain transaction as the raw rows it summarises, and both sides
+ * carry the same event clock — RecordWriter stamps raw `created_at` with
+ * eventCreatedAt() and derives `bucket_start` with eventBucket(), both from
+ * eventEpoch(). So on a healthy tenant a rollup's newest bucket trails its
+ * source's newest row by less than one bucket, and a table further behind than
+ * that has missed rows that are sitting in raw. That is the shape of every
+ * cause worth alerting on — an aborting recompute, a dropped source table, a
+ * permission loss on one relation, a column the upsert needs gone missing.
  *
- * Comparison is WITHIN tier. Minute, hourly, and daily tables are legitimately
- * up to a minute, an hour, and a day apart from each other by construction, so
- * comparing across tiers would flag every daily table on every healthy tenant.
+ * It used to be PEER-relative: a table far behind the newest rollup in its tier
+ * was stale. That assumed every telemetry type arrives continuously, and a
+ * quiet app breaks it. An app doing under one request a second can run no
+ * command for hours and send no mail for an hour, so its command and mail
+ * rollups sat hours "behind" the request rollup with nothing wrong, and the
+ * health page raised a critical telling the customer to hunt for a maintenance
+ * error that did not exist (a low-traffic app on 2026-09-15: seven tables named,
+ * zero failed batches; Yomoney's three exception rollups before that). Only raw
+ * can tell "nothing to write" from "failing to write it".
  *
- * When EVERY rollup freezes together — a stopped or wedged drain — nothing is
- * behind its peers and this reports nothing. That is correct: DRAIN_STOPPED and
+ * When the drain stops, raw stops with the rollups and nothing trails its
+ * source, so this reports nothing. That is correct: DRAIN_STOPPED and
  * DRAIN_WEDGED already own that failure and say something far more useful.
  */
 final class RollupStaleness
 {
     /**
-     * How far behind its tier's leader a table may sit before it is stale.
+     * How far a rollup's newest bucket may trail its source's newest row before
+     * it is stale.
      *
-     * Generous multiples of each tier's own bucket width, because the leader is
-     * a live number: the drain writes minute buckets continuously but hourly
-     * and daily ones only roll over when their bucket does, so two tables in
-     * the same tier can be a full bucket apart with nothing wrong. These
-     * thresholds are 15 buckets (minute), 3 buckets (hourly), and 3 buckets
-     * (daily) — well outside normal skew, well inside the hours-to-days it took
-     * to notice the failures they are here to catch.
+     * A healthy table trails by under one bucket of its own width, because
+     * `bucket_start` is the START of the bucket holding the newest event — up to
+     * a minute, an hour, or a day. These are 15 buckets (minute), 3 buckets
+     * (hourly), and 3 buckets (daily): well outside that, and outside the tick
+     * the bespoke concurrency recompute runs on, well inside the hours-to-days
+     * it took to notice the failures they are here to catch.
      */
     private const TIER_TOLERANCE = [
         'daily' => 3 * 86400,
@@ -52,58 +59,112 @@ final class RollupStaleness
         'minute' => 900,
     ];
 
+    /** @var array<string, string>|null */
+    private static ?array $sources = null;
+
     /**
-     * @param  list<array<string, mixed>>  $tables  table-stats rows; each needs a
-     *                                              `name` and, for rollup tables, a `max_bucket` epoch (null when empty)
-     * @return array<string, int> table => seconds behind its tier's leader, worst first
+     * @param  list<array<string, mixed>>  $tables  table-stats rows; each needs a `name`, and a
+     *                                              `max_bucket` epoch (null when empty) — the newest `bucket_start` on
+     *                                              a rollup table, the newest `created_at` on a raw source table
+     * @return array<string, int> table => seconds its raw source runs ahead of it, worst first
      */
     public static function detect(array $tables): array
     {
-        /** @var array<string, array<string, int>> $byTier */
-        $byTier = [];
+        $rollups = [];
+        $ceilings = [];
 
         foreach ($tables as $row) {
             $name = $row['name'] ?? null;
-            if (! is_string($name) || ! str_ends_with($name, '_rollups')) {
-                continue;
-            }
-
-            // Absent means the bounds probe was skipped or failed for this table
-            // this sample; null means the table is EMPTY. Neither is staleness —
-            // an empty rollup is ROLLUP_BACKFILL_PENDING's business, and calling
-            // it stale here would fire on every tenant the hour a new rollup
-            // type ships, before its backfill has run.
             $max = $row['max_bucket'] ?? null;
-            if (! is_int($max)) {
+
+            // Absent means the probe was skipped or failed for this table this
+            // sample; null means the table is EMPTY. Neither is staleness — an
+            // empty rollup is ROLLUP_BACKFILL_PENDING's business, and an empty
+            // source has nothing for its rollup to be missing.
+            if (! is_string($name) || ! is_int($max)) {
                 continue;
             }
 
-            $byTier[self::tierOf($name)][$name] = $max;
+            if (str_ends_with($name, '_rollups')) {
+                $rollups[$name] = $max;
+            } else {
+                $ceilings[$name] = $max;
+            }
         }
 
+        $sources = self::sources();
         $stale = [];
 
-        foreach ($byTier as $tier => $peers) {
-            // One table in a tier has no peers, so it has nothing to be behind.
-            // Deliberately silent rather than guessing an absolute deadline.
-            if (count($peers) < 2) {
+        foreach ($rollups as $name => $max) {
+            // A rollup no spec names has no known source. Silent rather than
+            // guessing which raw table it summarises.
+            $source = $sources[self::baseOf($name)] ?? null;
+            if ($source === null) {
                 continue;
             }
 
-            $leader = max($peers);
-            $tolerance = self::TIER_TOLERANCE[$tier];
+            // Either family can hold the newest row: v1 before the storage-v2
+            // fence or with the kill switch off, the v2 twin otherwise.
+            $legs = array_filter(
+                [$ceilings[$source] ?? null, $ceilings[StorageV2::v2Name($source)] ?? null],
+                'is_int',
+            );
+            if ($legs === []) {
+                continue;
+            }
 
-            foreach ($peers as $name => $max) {
-                $behind = $leader - $max;
-                if ($behind > $tolerance) {
-                    $stale[$name] = $behind;
-                }
+            $behind = max($legs) - $max;
+            if ($behind > self::TIER_TOLERANCE[self::tierOf($name)]) {
+                $stale[$name] = $behind;
             }
         }
 
         arsort($stale);
 
         return $stale;
+    }
+
+    /**
+     * Every raw table, both storage families, whose ceiling detect() grades
+     * against — the list TableStatsCollector probes.
+     *
+     * @return list<string>
+     */
+    public static function sourceTables(): array
+    {
+        $tables = [];
+        foreach (array_unique(self::sources()) as $v1Table) {
+            $tables[] = $v1Table;
+            $tables[] = StorageV2::v2Name($v1Table);
+        }
+
+        return $tables;
+    }
+
+    /**
+     * Raw source (v1 name) per base rollup table. Built from RollupSpecs so a
+     * new spec is covered the moment it exists; the concurrency rollup sits
+     * outside RollupSpecs::all() and summarises requests, as MigrateCommand's
+     * completeness pass also records.
+     *
+     * @return array<string, string>
+     */
+    private static function sources(): array
+    {
+        if (self::$sources === null) {
+            self::$sources = [ConcurrencyRollup::TABLE => 'nightowl_requests'];
+            foreach (RollupSpecs::all() as $spec) {
+                self::$sources[$spec->table] = $spec->source;
+            }
+        }
+
+        return self::$sources;
+    }
+
+    /** nightowl_request_hourly_rollups → nightowl_request_rollups */
+    private static function baseOf(string $name): string
+    {
+        return str_replace(['_hourly_rollups', '_daily_rollups'], '_rollups', $name);
     }
 
     /**

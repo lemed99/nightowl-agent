@@ -43,9 +43,7 @@ class DrainWorkerTest extends TestCase
         );
 
         $whole = new \ReflectionMethod($worker, 'isWholeTargetFailure');
-        $whole->setAccessible(true);
         $transient = new \ReflectionMethod($worker, 'isTransientFailure');
-        $transient->setAccessible(true);
         $err = static fn (?string $sqlstate, bool $connection = false): array => [
             'sqlstate' => $sqlstate, 'table' => 'nightowl_requests', 'connection' => $connection,
         ];

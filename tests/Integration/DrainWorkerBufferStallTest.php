@@ -122,7 +122,6 @@ class DrainWorkerBufferStallTest extends TestCase
     private function drainOnce(DrainWorker $worker, RecordWriter $writer): bool
     {
         $m = new ReflectionMethod($worker, 'drainBatch');
-        $m->setAccessible(true);
 
         return (bool) $m->invoke($worker, $this->buffer, $writer);
     }
@@ -134,7 +133,6 @@ class DrainWorkerBufferStallTest extends TestCase
     private function setBufferWritable(bool $writable): void
     {
         $prop = new ReflectionProperty(SqliteBuffer::class, 'pdo');
-        $prop->setAccessible(true);
         /** @var PDO $pdo */
         $pdo = $prop->getValue($this->buffer);
         $pdo->exec('PRAGMA query_only = '.($writable ? 'OFF' : 'ON'));

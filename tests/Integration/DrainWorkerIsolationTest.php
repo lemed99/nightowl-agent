@@ -126,7 +126,6 @@ class DrainWorkerIsolationTest extends TestCase
     private function drainOnce(DrainWorker $worker, RecordWriter $writer): bool
     {
         $m = new ReflectionMethod($worker, 'drainBatch');
-        $m->setAccessible(true);
 
         return (bool) $m->invoke($worker, $this->buffer, $writer);
     }
@@ -168,7 +167,6 @@ class DrainWorkerIsolationTest extends TestCase
 
         // And it reaches the file MetricsCollector reads.
         $write = new ReflectionMethod($worker, 'writeDrainMetrics');
-        $write->setAccessible(true);
         $write->invoke($worker);
         $metrics = json_decode((string) file_get_contents($this->bufferPath.'.drain-metrics.json'), true);
         $this->assertSame(3, $metrics['app_requests_ignored'] ?? null);

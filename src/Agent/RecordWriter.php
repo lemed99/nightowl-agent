@@ -232,7 +232,14 @@ final class RecordWriter
             $options[PDO::ATTR_TIMEOUT] = max(1, $this->connectTimeout);
         }
 
-        $this->pdo = new PDO($this->dsn(), $this->username, $this->password, $options);
+        // PHP 8.4 added driver subclasses and 8.5 deprecates the pgsql* methods on
+        // plain PDO, so copyBatch() needs a Pdo\Pgsql to COPY without a notice.
+        // Swoole/OpenSwoole keep plain PDO: copyBatch() never COPYs under them (their
+        // coroutine hook busy-loops on it), and a different connection class under
+        // that hook is not something this path has ever been run against.
+        $this->pdo = class_exists(\Pdo\Pgsql::class) && ! extension_loaded('swoole') && ! extension_loaded('openswoole')
+            ? new \Pdo\Pgsql($this->dsn(), $this->username, $this->password, $options)
+            : new PDO($this->dsn(), $this->username, $this->password, $options);
 
         // NOTE: `SET synchronous_commit = off` used to run HERE, session-scoped.
         // A plain SET survives commit, so through a transaction-mode pooler it leaks
@@ -1623,7 +1630,12 @@ final class RecordWriter
         // When pgsqlCopyFromArray does return, it returns false rather than
         // throwing (even under ERRMODE_EXCEPTION) on some errors. Convert to
         // an exception so the drain loop rolls back and retries the batch.
-        $ok = $this->pdo()->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
+        // Pdo\Pgsql on PHP 8.4+ (see connect()); the legacy method otherwise, where
+        // it is the only one there is. Same arguments, same bool-or-throw contract.
+        $pdo = $this->pdo();
+        $ok = $pdo instanceof \Pdo\Pgsql
+            ? $pdo->copyFromArray($table.' ('.$colList.')', $tsvRows)
+            : $pdo->pgsqlCopyFromArray($table.' ('.$colList.')', $tsvRows);
 
         if ($ok !== true) {
             // Capture the error before discarding the connection — errorInfo()

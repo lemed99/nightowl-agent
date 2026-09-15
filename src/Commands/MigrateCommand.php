@@ -31,7 +31,8 @@ class MigrateCommand extends Command
      * missed by refusing to be twitchy.
      *
      * Fine-grained detection is not this check's job — the agent's ROLLUP_STALE
-     * diagnosis grades against tier peers within 15 minutes and reports. This
+     * diagnosis grades each rollup against its own raw source within 15 minutes
+     * on the minute tier, and reports. This
      * one repairs, and repair costs a raw scan, so it waits for certainty.
      */
     private const TAIL_FREEZE_TOLERANCE_SECONDS = 7200;

@@ -2,7 +2,9 @@
 
 namespace NightOwl\Tests\Integration;
 
+use NightOwl\Agent\RecordWriter;
 use NightOwl\Agent\TableStatsCollector;
+use NightOwl\Simulator\NightwatchSimulator;
 use PDO;
 use PHPUnit\Framework\TestCase;
 
@@ -135,6 +137,106 @@ final class TableStatsCollectorTest extends TestCase
             'raw tables have no bucket concept');
     }
 
+    public function test_a_quiet_type_drained_for_real_is_not_reported_stale(): void
+    {
+        // End to end through the real drain write path and the real stats pass.
+        // The 2026-09-15 false positive: an app that had not run a command for
+        // two hours while requests kept arriving had nightowl_command_rollups
+        // reported as "stopped being written".
+        foreach (['nightowl_commands', 'nightowl_commands_v2', 'nightowl_requests', 'nightowl_requests_v2'] as $t) {
+            self::$pdo->exec("DELETE FROM {$t}");
+        }
+        self::$pdo->exec('TRUNCATE nightowl_command_rollups, nightowl_request_rollups');
+
+        $now = time();
+        $sim = new NightwatchSimulator('test-token');
+        (new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password))->write([
+            $sim->makeCommand(['timestamp' => (float) ($now - 7200)]),
+            $sim->makeRequest(['timestamp' => (float) $now]),
+        ]);
+
+        // Not vacuous: both types landed, two hours apart, in raw and rollup —
+        // the exact shape the tier-peer rule called frozen.
+        $tables = $this->sample();
+        $this->assertSame(intdiv($now - 7200, 60) * 60, $tables['nightowl_command_rollups']['max_bucket']);
+        $this->assertSame(intdiv($now, 60) * 60, $tables['nightowl_request_rollups']['max_bucket']);
+        $this->assertSame($now - 7200, max($tables['nightowl_commands']['max_bucket'] ?? 0, $tables['nightowl_commands_v2']['max_bucket'] ?? 0));
+
+        // A token and an unreachable API: post() fails fast and never throws,
+        // so this is the verdict the drain worker would put in its metrics.
+        $stale = (new TableStatsCollector(
+            self::$host, self::$port, self::$database, self::$username, self::$password,
+            'prefer', 'http://127.0.0.1:1', 'test-token',
+        ))->collectAndReport($now);
+
+        $this->assertIsArray($stale);
+        $this->assertArrayNotHasKey('nightowl_command_rollups', $stale);
+    }
+
+    public function test_a_rollup_the_drain_stopped_writing_is_reported_stale(): void
+    {
+        // The failure the diagnosis exists for, produced by the real drain: a
+        // column the command rollup upsert needs has gone missing, so a fresh
+        // RecordWriter disables that rollup (rollupColumnsPresent) and keeps
+        // committing raw rows. The table freezes while its source keeps arriving.
+        foreach (['nightowl_commands', 'nightowl_commands_v2', 'nightowl_requests', 'nightowl_requests_v2'] as $t) {
+            self::$pdo->exec("DELETE FROM {$t}");
+        }
+        self::$pdo->exec('TRUNCATE nightowl_command_rollups, nightowl_request_rollups');
+
+        $now = time();
+        $sim = new NightwatchSimulator('test-token');
+        (new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password))->write([
+            $sim->makeCommand(['timestamp' => (float) ($now - 7200)]),
+        ]);
+
+        self::$pdo->exec('ALTER TABLE nightowl_command_rollups RENAME COLUMN call_count TO call_count_gone');
+        try {
+            (new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password))->write([
+                $sim->makeCommand(['timestamp' => (float) $now]),
+            ]);
+        } finally {
+            self::$pdo->exec('ALTER TABLE nightowl_command_rollups RENAME COLUMN call_count_gone TO call_count');
+        }
+
+        // Not vacuous: the rollup stopped at the first batch while raw took the second.
+        $tables = $this->sample();
+        $frozenAt = intdiv($now - 7200, 60) * 60;
+        $this->assertSame($frozenAt, $tables['nightowl_command_rollups']['max_bucket']);
+        $this->assertSame($now, max($tables['nightowl_commands']['max_bucket'] ?? 0, $tables['nightowl_commands_v2']['max_bucket'] ?? 0));
+
+        $stale = (new TableStatsCollector(
+            self::$host, self::$port, self::$database, self::$username, self::$password,
+            'prefer', 'http://127.0.0.1:1', 'test-token',
+        ))->collectAndReport($now);
+
+        $this->assertIsArray($stale);
+        $this->assertSame($now - $frozenAt, $stale['nightowl_command_rollups'] ?? null);
+    }
+
+    public function test_raw_rollup_sources_carry_their_ceiling(): void
+    {
+        // The other half of ROLLUP_STALE's comparison: without the source's
+        // newest created_at the detector has nothing to grade a rollup against.
+        self::$pdo->exec("INSERT INTO nightowl_request_concurrency_rollups (bucket_start, delta_sum, max_prefix)
+             VALUES (date_trunc('minute', now() - interval '5 minutes'), 0, 3)
+             ON CONFLICT (bucket_start) DO NOTHING");
+        $newest = (int) self::$pdo->query(
+            'SELECT EXTRACT(EPOCH FROM MAX(created_at))::bigint FROM nightowl_cache_events_v2'
+        )->fetchColumn() ?: null;
+
+        $tables = $this->sample();
+
+        foreach (['nightowl_requests', 'nightowl_requests_v2', 'nightowl_cache_events_v2'] as $source) {
+            $this->assertArrayHasKey($source, $tables);
+            $this->assertArrayHasKey('max_bucket', $tables[$source], "{$source} shipped without a ceiling");
+        }
+        $this->assertSame($newest, $tables['nightowl_cache_events_v2']['max_bucket']);
+
+        // Not a source of any rollup, so never probed.
+        $this->assertArrayNotHasKey('max_bucket', $tables['nightowl_logs_v2'] ?? []);
+    }
+
     public function test_diagnostic_sections_cover_the_full_surface(): void
     {
         $payload = $this->collector()->gather(self::$pdo, time());
@@ -235,9 +337,13 @@ final class TableStatsCollectorTest extends TestCase
             $this->assertArrayHasKey($k, $sections['activity'], "activity.{$k}");
         }
 
-        // Settings additions.
-        $this->assertArrayHasKey('shared_preload_libraries', $sections['settings']);
+        // Settings additions. shared_preload_libraries is readable only with
+        // pg_read_all_settings (or as superuser). A customer's app role usually
+        // has neither, and Postgres then leaves the row out of pg_settings
+        // entirely, so the sample carries it exactly when the role could see it.
         $this->assertArrayHasKey('jit', $sections['settings']);
+        $canReadAll = (bool) self::$pdo->query("SELECT pg_has_role(current_user, 'pg_read_all_settings', 'MEMBER')")->fetchColumn();
+        $this->assertSame($canReadAll, array_key_exists('shared_preload_libraries', $sections['settings']));
 
         // Per-table: toast IO + reloptions surface (rollup tables carry
         // fillfactor=70 from migration 000053, so reloptions must appear).

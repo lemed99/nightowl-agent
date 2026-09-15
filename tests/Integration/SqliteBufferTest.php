@@ -69,7 +69,6 @@ class SqliteBufferTest extends TestCase
         // Make the buffer's own connection reject writes — stands in for a read-only
         // file / wrong owner / full disk: SELECT still works, INSERT throws.
         $prop = new \ReflectionProperty(SqliteBuffer::class, 'pdo');
-        $prop->setAccessible(true);
         $prop->getValue($this->buffer)->exec('PRAGMA query_only = ON');
 
         $this->expectException(\RuntimeException::class);

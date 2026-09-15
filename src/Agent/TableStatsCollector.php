@@ -251,6 +251,32 @@ final class TableStatsCollector
         }
         unset($t);
 
+        // Raw source ceilings — what RollupStaleness grades each rollup against.
+        // Newest created_at, which on both storage families is the event clock
+        // bucket_start is derived from. Only the sources a rollup names, only
+        // the ones the catalog above shows present, and ONE statement: each leg
+        // is a backward walk of a created_at index, cheap alone, but twenty of
+        // them are twenty round trips to a distant Postgres. A failure costs the
+        // ceilings only, and without them the detector stays silent.
+        $sourceTables = array_values(array_filter(
+            RollupStaleness::sourceTables(),
+            static fn (string $name): bool => isset($tables[$name]),
+        ));
+        if ($sourceTables !== []) {
+            try {
+                $cols = [];
+                foreach ($sourceTables as $i => $name) {
+                    $cols[] = "(SELECT EXTRACT(EPOCH FROM MAX(created_at))::bigint FROM {$name}) AS c{$i}";
+                }
+                $ceilings = $pdo->query('SELECT '.implode(', ', $cols))->fetch(\PDO::FETCH_NUM);
+                foreach ($sourceTables as $i => $name) {
+                    $tables[$name]['max_bucket'] = $ceilings[$i] !== null ? (int) $ceilings[$i] : null;
+                }
+            } catch (\Throwable) {
+                // Timeout — every ceiling is absent this sample, the rest ships.
+            }
+        }
+
         // Per-index usage + size + validity — "is THIS index earning its
         // keep" is not answerable from the per-table aggregate. Children fold
         // into the logical parent index by the same suffix rule; INVALID

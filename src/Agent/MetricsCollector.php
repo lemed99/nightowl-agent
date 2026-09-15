@@ -218,8 +218,8 @@ final class MetricsCollector
     private array $rollupRepairDebt = [];
 
     /**
-     * Rollup tables that stopped advancing while their tier peers kept going
-     * (table => seconds behind the leader), merged across workers. Drives
+     * Rollup tables that stopped advancing while their raw source kept
+     * receiving rows (table => seconds the source runs ahead), merged across workers. Drives
      * ROLLUP_STALE. A gauge — it empties once the tables catch up.
      *
      * @var array<string,int>
@@ -803,7 +803,7 @@ final class MetricsCollector
         }
 
         // ROLLUP_STALE — one or more rollup tables stopped advancing while
-        // their tier peers kept going. Critical, and higher than the other two
+        // their raw source kept receiving rows. Critical, and higher than the other two
         // rollup diagnoses on purpose: those describe a KNOWN hole with a known
         // repair command, this one says a table is not being written at all and
         // nobody knows why. It is also the only failure here whose symptom is a
@@ -816,7 +816,7 @@ final class MetricsCollector
                 'code' => 'ROLLUP_STALE',
                 'level' => 'critical',
                 'message' => sprintf(
-                    '%d rollup table(s) have stopped being written while the rest kept current: %s.',
+                    '%d rollup table(s) have stopped being written while their raw telemetry kept arriving: %s.',
                     count($this->staleRollups),
                     $this->describeStaleRollups(),
                 ),

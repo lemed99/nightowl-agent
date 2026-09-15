@@ -5,6 +5,33 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.4.5] - 2026-09-15
+
+### Fixed
+
+- **`nightowl:backfill-rollups` could leave the hourly tier one row short.**
+  The tier pass bounded its last chunk at the current time, rendered to the
+  second and applied as `bucket_start < end`. A pass that started inside the
+  first second of a minute therefore ended at that minute's own start, and the
+  minute's row never reached the hourly table (about one run in sixty). The
+  last chunk now ends at the next minute.
+
+- **`ROLLUP_STALE` raised a critical on healthy low-traffic apps.** The check
+  compared each rollup table with the newest rollup table of the same tier, so
+  it assumed every kind of telemetry arrives all the time. An app that had not
+  run a command for two hours or sent mail for an hour saw those tables listed
+  as "stopped being written", with advice to look for a maintenance error that
+  did not exist. Each rollup is now compared with its own raw table instead:
+  it is stale only when raw rows newer than its latest bucket (by 15 minutes,
+  3 hours, or 3 days per tier) never reached it. Nothing to write is no longer
+  mistaken for failing to write. The hourly table-stats sample now carries each
+  raw source's newest row time for this comparison, in one extra statement.
+- **PHP 8.5 raised `Method PDO::pgsqlCopyFromArray() is deprecated` on every
+  COPY the drain ran.** On PHP 8.4 and later the drain connection is now a
+  `Pdo\Pgsql` and COPY goes through `copyFromArray()`. PHP 8.2 and 8.3 keep the
+  previous call, and so does any install with Swoole or OpenSwoole loaded,
+  where the drain writes with INSERT and never uses COPY.
+
 ## [2.4.4] - 2026-09-10
 
 ### Fixed
