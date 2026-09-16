@@ -5,6 +5,122 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.4.6] - 2026-09-16
+
+### Changed
+
+- **Job thresholds now see a whole batch at once.** `queued-job` and
+  `job-attempt` share one write slot (see below), so the `job` threshold check
+  runs once per batch over both, where it previously ran twice over half the
+  records each. A threshold close to the line can therefore trigger on a batch
+  that used to slip under it in both halves. This only affects apps that have
+  configured a `job` threshold — the check returns immediately when none is
+  set — and the count it compares was always meant to be the batch's.
+
+### Fixed
+
+- **Agents sharing one database deadlocked each other on rollup upserts.**
+  A batch wrote its record types in the order they happened to appear in it, and
+  that is the order it takes row locks across the rollup tables. A web host,
+  whose payloads open with a request, therefore locked
+  `nightowl_request_rollups` before `nightowl_query_rollups`, while a queue
+  host, whose payloads open with a query, locked them the other way round: two
+  such batches sharing a bucket each held the row the other was waiting for and
+  PostgreSQL killed one with a `40P01`. Record types are now written in a fixed
+  order every agent shares, and `queued-job` and `job-attempt` share one write
+  slot rather than reaching the job writer twice — a handler invoked from two
+  positions locks its tables at two positions, which inverted
+  `nightowl_jobs`, `nightowl_job_rollups`, `nightowl_user_job_rollups` and the
+  `job` rows of `nightowl_issues` between a host dispatching jobs and a host
+  running them. Every handler now writes once, so a batch's lock sequence is a
+  subsequence of one canonical sequence and two agents cannot take two shared
+  tables in opposite orders. The existing sort inside each rollup upsert fixed
+  the same hazard between rows of one table and could not see this one, which
+  is why deadlocks continued after 2.1.1 and named a different relation each
+  time.
+
+- **`nightowl_issues` was upserted in batch order, from both of its writers.**
+  The exception sync and the threshold-breach upsert each walked their groups in
+  the order the records arrived, so two hosts running the same code — which
+  means the same fingerprints and the same threshold breaches — could take the
+  same two issue rows in opposite orders and deadlock. The threshold upsert is
+  reachable from five write positions, which made it the likeliest of the three
+  unsorted upserts to bite. Both now sort their groups first.
+
+- **A drain deadlocking on every batch reported no problem at all.** Not
+  counting a transient abort as a failed batch (above) also removed it from
+  every diagnosis: `batches_failed` stayed 0, no write-rejection clock was
+  stamped, and `DRAIN_STOPPED` only fires above a 100-row backlog, so a
+  low-volume app that was committing nothing looked healthy. A new
+  `DRAIN_CONTENTION` diagnosis reports the deferred batches against the ones
+  that committed in the same window — critical when nothing is committing,
+  warning otherwise, and silent for the occasional deadlock against a busy peer.
+  A rolling upgrade is the case that produces it, since agents still writing in
+  the old record order deadlock against upgraded peers until the last one
+  restarts.
+  It needs at least five deferred batches in the window as well as the rate, so
+  a single deadlock on a host that commits only a few batches stays quiet.
+  Deferrals caused by `55xxx` lock conflicts are not contention and are reported
+  as failed batches whose SQLSTATE `DRAIN_WRITE_FAILING` names, on either drain
+  path.
+
+- **A deferred batch counted as a drained one.** With `NIGHTOWL_DRAIN_QUARANTINE`
+  on, the drain handles a transient abort internally and returns rather than
+  throwing, so a batch that committed nothing still incremented
+  `batches_drained` — the denominator of the new `DRAIN_ERRORS` rate. Both
+  paths now record contention instead.
+
+- **A restart could light `DRAIN_ERRORS` on a healthy agent.** Drain-metrics
+  files outlive the run that wrote them, so the first read after a restart can
+  land on the previous run's lifetime counters before the new worker has
+  written. Measured against a fresh zero baseline, that whole run read as one
+  window sample. Each worker's file is now judged on its own timestamp, and one
+  stamped before the process started is kept out of the window, so a restarted
+  worker whose file is still the old one cannot contaminate a peer's fresh
+  numbers.
+
+- **A long-lived agent could lose every health report to an integer overflow.**
+  `drain.batches_failed` and `drain.transient_failures` land in `unsignedInteger`
+  columns, which on PostgreSQL are plain signed 4-byte integers — the platform
+  has no unsigned types — so they top out at 2,147,483,647 rather than the
+  4.29 billion the type name suggests. One past that and the INSERT raises
+  `22003` and the report is dropped whole, which is the failure the
+  `pg_latency_ms` and `buffer_utilization_pct` ceilings already guard against.
+  Both counters are now clamped to that value before they are emitted; a
+  server-side rejection would have traded the lost report for a 422 and lost it
+  anyway. The wide counters (`ingest_total`, `drain_total`,
+  `memory_rss_bytes`) are `bigint` and stay unclamped, since those are the ones
+  a busy agent genuinely drives up.
+
+- **`nightowl_users` was upserted in batch order, so agents deadlocked on it
+  too.** The user upsert takes one row lock per `user_id` and walked the batch
+  in whatever order the records arrived, which is the hazard 2.1.1 fixed for
+  the rollup tables and this one upsert never received. Two agents seeing the
+  same two signed-in users in opposite orders each held the row the other
+  waited for. Users are now written in a byte order every agent agrees on.
+
+- **One deadlock left `DRAIN_ERRORS` showing until the agent restarted.** A
+  deadlock (`40P01`) or serialization failure (`40001`) is no longer counted as
+  a failed batch. Nothing is wrong with the rows or the database: PostgreSQL
+  picked a victim among writers that were all behaving, the batch is deferred,
+  and the next loop writes it. It no longer stamps the write-rejection clock
+  either, so it cannot raise `DRAIN_WRITE_FAILING` against a database that did
+  nothing wrong. Deadlocks are still logged, and counted separately as
+  `drain.transient_failures`. Lock conflicts (`55xxx`) are deliberately
+  excluded and still count: a full tenant disk and an orphaned
+  idle-in-transaction session both surface as a persistent `55P03`, and both
+  are diagnosed from the SQLSTATE that `DRAIN_WRITE_FAILING` carries.
+
+- **`DRAIN_ERRORS` measured the wrong thing twice over.** Its failure rate was
+  cumulative over the life of the process, so one failure at any point kept the
+  warning lit; and its denominator estimated batches by dividing rows drained
+  by 1000, which badly undercounts the batches of a low-volume host. One
+  deadlock against 5,521 lifetime rows scored 15.3% and tripped a 10%
+  threshold. The rate is now measured over the last 15 minutes, against the
+  batch count the drain worker actually reports. A drain failing now is
+  reported sooner, since a large lifetime volume no longer dilutes it, and a
+  drain that has recovered clears on its own.
+
 ## [2.4.5] - 2026-09-15
 
 ### Fixed

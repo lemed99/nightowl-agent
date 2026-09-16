@@ -85,6 +85,16 @@ final class MetricsCollector
 
     private const DRAIN_ERROR_RATE_PCT = 10;
 
+    private const DRAIN_CONTENTION_RATE_PCT = 10;
+
+    private const DRAIN_CONTENTION_MIN_EVENTS = 5;
+
+    /**
+     * How far back DRAIN_ERRORS looks. Long enough that a genuinely failing drain
+     * stays lit between samples, short enough that a one-off clears on its own.
+     */
+    private const DRAIN_ERROR_WINDOW_SECONDS = 900;
+
     private const LOOP_LAG_WARNING_MS = 50;
 
     private const LOOP_LAG_CRITICAL_MS = 200;
@@ -115,6 +125,26 @@ final class MetricsCollector
 
     private const MAX_BUFFER_UTILIZATION_PCT = 100_000.0; // 1000x capacity
 
+    // Same defence for the integer counters. `unsignedInteger` on PostgreSQL is a
+    // plain signed 4-byte integer — Postgres has no unsigned types and Laravel's
+    // grammar drops the modifier — so drain_batches_failed, drain_transient_failures,
+    // pending_rows and uptime_seconds all top out here, not at 4.29 billion. Past it
+    // the INSERT raises 22003 and the platform loses the whole report, which is the
+    // failure mode the decimal ceilings above exist to prevent; a `max:` rule on the
+    // API side would only trade that for a 422, losing the report just the same.
+    // Clamping keeps the report, and every one of these is a counter whose exact
+    // value at two billion tells nobody anything.
+    //
+    // Only the two failure counters are clamped. pending_rows and uptime_seconds
+    // share the ceiling but cannot approach it — two billion buffered rows is a
+    // multi-terabyte SQLite file, and two billion seconds is 68 years of uptime.
+    //
+    // The wide counters (ingest_total, drain_total, drain_batches_drained,
+    // memory_rss_bytes) are bigint columns and are deliberately NOT clamped — those
+    // count successes or volume, which a busy agent really does drive up, and
+    // clamping them would store a wrong number rather than a lost one.
+    private const MAX_PG_INT = 2_147_483_647;
+
     private const MEMORY_HIGH_PCT = 0.7;
 
     // System metrics thresholds
@@ -143,6 +173,36 @@ final class MetricsCollector
     private int $drainTotal = 0;
 
     private int $drainBatchesFailed = 0;
+
+    private int $drainBatchesDrained = 0;
+
+    private int $drainTransientFailures = 0;
+
+    private int $prevDrainBatchesFailed = 0;
+
+    private int $prevDrainBatchesDrained = 0;
+
+    private int $prevDrainTransient = 0;
+
+    /**
+     * When this process started. Drain-metrics files outlive the run that wrote
+     * them — nothing deletes them at boot — so on restart the collector's first
+     * read can land on the PREVIOUS run's lifetime counters while the new worker
+     * has yet to write. Against a baseline of zero that whole history looks like
+     * one sample's delta: a run that ended 5 failed / 10 drained would light
+     * DRAIN_ERRORS at 33% on a freshly restarted, perfectly healthy agent. A file
+     * stamped before this moment belongs to a dead run, and its counters are kept
+     * out of the window (each file judged on its own — see readDrainMetrics).
+     */
+    private float $startedAt = 0.0;
+
+    /**
+     * Recent batch outcomes: [sampled at, failed, drained, deferred-on-contention],
+     * each a delta since the previous sample, pruned to DRAIN_ERROR_WINDOW_SECONDS.
+     *
+     * @var list<array{0: float, 1: int, 2: int, 3: int}>
+     */
+    private array $drainBatchWindow = [];
 
     private float $drainPgLatencyMs = 0.0;
 
@@ -305,6 +365,7 @@ final class MetricsCollector
         private int $maxPendingRows = 100_000,
         private int $maxBufferMemory = 256 * 1024 * 1024,
     ) {
+        $this->startedAt = microtime(true);
         $this->ingestRing = array_fill(0, self::RING_SIZE, 0);
         $this->rejectRing = array_fill(0, self::RING_SIZE, 0);
         $this->drainRing = array_fill(0, self::RING_SIZE, 0);
@@ -461,6 +522,11 @@ final class MetricsCollector
     {
         $totalRows = 0;
         $totalFailed = 0;
+        $totalBatchesDrained = 0;
+        $totalTransient = 0;
+        $liveFailed = 0;
+        $liveDrained = 0;
+        $liveTransient = 0;
         $latencySum = 0.0;
         $latencyCount = 0;
         $oldestUpdate = PHP_FLOAT_MAX;
@@ -508,6 +574,21 @@ final class MetricsCollector
             $anyFound = true;
             $totalRows += (int) ($data['rows_drained'] ?? 0);
             $totalFailed += (int) ($data['batches_failed'] ?? 0);
+            $totalBatchesDrained += (int) ($data['batches_drained'] ?? 0);
+            $totalTransient += (int) ($data['transient_failures'] ?? 0);
+
+            // The window's counters come only from files THIS run wrote — see
+            // $startedAt. Judged per file, not by the newest file across workers:
+            // after a restart worker 0 can have written while worker 1's file is
+            // still the dead run's, and summing that into the baseline replays
+            // worker 1's whole previous run as one sample (found by review). The
+            // stale file still counts for the gauges above, which describe it
+            // honestly; it just has no business in a rate over recent activity.
+            if ((float) ($data['updated_at'] ?? 0.0) >= $this->startedAt) {
+                $liveFailed += (int) ($data['batches_failed'] ?? 0);
+                $liveDrained += (int) ($data['batches_drained'] ?? 0);
+                $liveTransient += (int) ($data['transient_failures'] ?? 0);
+            }
             $appRequests += (int) ($data['app_requests_total'] ?? 0);
             $app5xx += (int) ($data['app_requests_5xx'] ?? 0);
             $appExceptions += (int) ($data['app_exceptions_total'] ?? 0);
@@ -584,6 +665,16 @@ final class MetricsCollector
             }
         }
 
+        // Age the DRAIN_ERRORS window before anything can return early. If every
+        // drain-metrics file disappears — the worker died and its replacement has
+        // not written one yet — the samples must still expire, or the warning
+        // latches again in exactly the case this window exists to clear.
+        $sampledAt = microtime(true);
+        $cutoff = $sampledAt - self::DRAIN_ERROR_WINDOW_SECONDS;
+        while (isset($this->drainBatchWindow[0]) && $this->drainBatchWindow[0][0] < $cutoff) {
+            array_shift($this->drainBatchWindow);
+        }
+
         if (! $anyFound) {
             return;
         }
@@ -603,8 +694,35 @@ final class MetricsCollector
             }
         }
 
+        // DRAIN_ERRORS' window. Both counters are cumulative sums across workers,
+        // so what the window wants is the delta since the last sample.
+        //
+        // A sum that went DOWN means a worker died and its replacement restarted
+        // from zero. Do NOT treat the new sum as the delta: most of it is the
+        // SURVIVING workers' lifetime totals, and crediting those as successes
+        // that happened just now would suppress DRAIN_ERRORS for a full window
+        // starting the moment a worker crashed — precisely when the signal is
+        // wanted. Re-baseline and contribute nothing instead. The cost is
+        // undercounting one sample's real successes, which can only make the
+        // warning more eager, never blinder.
+        $restarted = $liveFailed < $this->prevDrainBatchesFailed
+            || $liveDrained < $this->prevDrainBatchesDrained
+            || $liveTransient < $this->prevDrainTransient;
+        $failedDelta = $restarted ? 0 : $liveFailed - $this->prevDrainBatchesFailed;
+        $drainedDelta = $restarted ? 0 : $liveDrained - $this->prevDrainBatchesDrained;
+        $transientDelta = $restarted ? 0 : $liveTransient - $this->prevDrainTransient;
+        $this->prevDrainBatchesFailed = $liveFailed;
+        $this->prevDrainBatchesDrained = $liveDrained;
+        $this->prevDrainTransient = $liveTransient;
+
+        if ($failedDelta > 0 || $drainedDelta > 0 || $transientDelta > 0) {
+            $this->drainBatchWindow[] = [$sampledAt, $failedDelta, $drainedDelta, $transientDelta];
+        }
+
         $this->drainTotal = $totalRows;
         $this->drainBatchesFailed = $totalFailed;
+        $this->drainBatchesDrained = $totalBatchesDrained;
+        $this->drainTransientFailures = $totalTransient;
         $this->drainPgLatencyMs = $latencyCount > 0 ? $latencySum / $latencyCount : 0.0;
         $this->drainMetricsUpdatedAt = $oldestUpdate < PHP_FLOAT_MAX ? $oldestUpdate : 0.0;
         $this->lastDrainErrorAt = $mostRecentErrAt;
@@ -911,17 +1029,36 @@ final class MetricsCollector
 
         // DRAIN_ERRORS — suppressed ONLY when DRAIN_STOPPED already fires for the same
         // root cause (a non-draining backlog), so we don't double-report. Deliberately
-        // un-gated from drainTotal>0 (a Phase-1 belt-and-suspenders): a FRESH app (no
+        // un-gated from drain volume (a Phase-1 belt-and-suspenders): a FRESH app (no
         // successful drain yet) hitting a connectivity failure with a small backlog
         // (pendingRows<=100, below DRAIN_STOPPED's guard) and no write-rejection signal
-        // would otherwise surface no diagnosis at all. NOTE: this does NOT cover the
-        // same stall on an ESTABLISHED, high-volume worker — failRate's denominator
-        // dilutes with lifetime drainTotal, so it stays under the threshold. Closing
-        // that needs a dedicated fresh-connection-failure signal in the IPC (tracked:
-        // DRAIN_ROBUSTNESS_IMPL_PLAN Phase 3, shared root cause with the writeFailing latch).
-        $totalBatches = $this->drainTotal > 0 ? ($this->drainTotal / 1000) : 0; // rough batch estimate
-        if ($this->drainBatchesFailed > 0 && ! $writeFailing && ! $drainStopped && ! $connUnreachable) {
-            $failRate = ($this->drainBatchesFailed / ($this->drainBatchesFailed + $totalBatches)) * 100;
+        // still shows up, as 1/(1+0) = 100%.
+        //
+        // Both terms are RECENT and both are real batch counts. Two separate defects
+        // lived in the lifetime-plus-estimate version this replaces (github#9):
+        //
+        //   - lifetime, so nothing ever cleared. One failure at any point in a
+        //     process's life kept the warning lit until restart.
+        //   - the denominator was drainTotal/1000, rows guessed into batches. A
+        //     low-volume host drains few rows per batch, so the guess undercounted
+        //     its batches by an order of magnitude and inflated the rate. The
+        //     reported case: 1 failure against 5,521 rows scored 15.3% and tripped
+        //     a 10% threshold that the true batch count would have left far below.
+        //
+        // Windowing also closes the gap the old comment left open — an ESTABLISHED
+        // high-volume worker whose drain stalls no longer has its failures diluted
+        // by a lifetime denominator, because the window holds only what happened
+        // since it stalled (tracked as DRAIN_ROBUSTNESS_IMPL_PLAN Phase 3).
+        $windowFailed = 0;
+        $windowDrained = 0;
+        $windowTransient = 0;
+        foreach ($this->drainBatchWindow as [, $failed, $drained, $transient]) {
+            $windowFailed += $failed;
+            $windowDrained += $drained;
+            $windowTransient += $transient;
+        }
+        if ($windowFailed > 0 && ! $writeFailing && ! $drainStopped && ! $connUnreachable) {
+            $failRate = ($windowFailed / ($windowFailed + $windowDrained)) * 100;
             if ($failRate > self::DRAIN_ERROR_RATE_PCT) {
                 $diagnoses[] = [
                     'code' => 'DRAIN_ERRORS',
@@ -929,6 +1066,43 @@ final class MetricsCollector
                     'message' => 'Drain worker experiencing batch failures.',
                     'recommendation' => 'Check drain worker logs for PostgreSQL connection or write errors.',
                     'value' => round($failRate, 1),
+                ];
+            }
+        }
+
+        // DRAIN_CONTENTION — batches Postgres keeps aborting as deadlocks or
+        // serialization failures. These are deliberately NOT counted as failed
+        // batches (see DrainWorker: one deadlock used to latch DRAIN_ERRORS for the
+        // life of the process), but "not a failure" must not mean "invisible". A
+        // host in a sustained lock-order inversion defers every batch, so
+        // batches_failed stays 0, no write clock is stamped, and DRAIN_STOPPED is
+        // gated on a backlog over 100 rows — a low-volume app would show a clean
+        // bill of health while draining nothing. That is the case this covers, and
+        // a rolling upgrade produces it: agents still writing in the old record
+        // order deadlock against upgraded peers until the last one is restarted.
+        //
+        // Rated against the batches that DID commit in the same window, so ordinary
+        // contention (a deadlock here and there against a busy peer) stays quiet.
+        // A floor as well as a rate. The rate alone is github#9 again on a quiet host:
+        // one that commits nine batches in fifteen minutes turns a single deadlock
+        // into 1/(1+9) = 10% (found by review). A drain genuinely stuck in an
+        // inversion retries every loop and clears the floor within a minute or so.
+        if ($windowTransient >= self::DRAIN_CONTENTION_MIN_EVENTS && ! $drainStopped && ! $connUnreachable) {
+            $contentionRate = ($windowTransient / ($windowTransient + $windowDrained)) * 100;
+            if ($contentionRate > self::DRAIN_CONTENTION_RATE_PCT) {
+                $diagnoses[] = [
+                    'code' => 'DRAIN_CONTENTION',
+                    'level' => $windowDrained === 0 ? 'critical' : 'warning',
+                    'message' => $windowDrained === 0
+                        ? 'Drain worker is deadlocking on every batch and committing nothing.'
+                        : 'Drain worker batches are being aborted by lock contention.',
+                    'recommendation' => 'PostgreSQL is aborting this agent against another writer on the same '
+                        .'database (SQLSTATE 40001/40P01). No telemetry is lost — the batch is retried — but '
+                        .'throughput suffers and a sustained inversion stalls the drain. Check the agent log for '
+                        ."'Transient conflict, batch deferred'. If other agents write this database, make sure "
+                        .'every one of them runs the same agent version: peers on different versions can take '
+                        .'row locks in different orders.',
+                    'value' => round($contentionRate, 1),
                 ];
             }
         }
@@ -1181,7 +1355,9 @@ final class MetricsCollector
             'drain' => [
                 'total' => $this->drainTotal,
                 'rate_1m' => round($this->ringAvg($this->drainRing), 2),
-                'batches_failed' => $this->drainBatchesFailed,
+                'batches_failed' => min($this->drainBatchesFailed, self::MAX_PG_INT),
+                'batches_drained' => $this->drainBatchesDrained,
+                'transient_failures' => min($this->drainTransientFailures, self::MAX_PG_INT),
                 'pg_latency_ms' => round(min($this->drainPgLatencyMs, self::MAX_PG_LATENCY_MS), 2),
                 'metrics_stale' => $this->drainMetricsUpdatedAt > 0
                     && (microtime(true) - $this->drainMetricsUpdatedAt) > self::DRAIN_METRICS_STALE_SECONDS,

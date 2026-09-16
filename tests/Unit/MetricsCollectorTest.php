@@ -177,6 +177,17 @@ class MetricsCollectorTest extends TestCase
         @unlink($base);
     }
 
+    /** Push every recorded sample past DRAIN_ERROR_WINDOW_SECONDS. */
+    private function ageDrainWindowOut(): void
+    {
+        $window = new \ReflectionProperty($this->collector, 'drainBatchWindow');
+        $aged = [];
+        foreach ($window->getValue($this->collector) as [$ts, $f, $d]) {
+            $aged[] = [$ts - 1_000, $f, $d];
+        }
+        $window->setValue($this->collector, $aged);
+    }
+
     private function activeDiagnosis(array $status, string $code): array|false
     {
         return current(array_filter($status['diagnoses'], fn ($d) => $d['code'] === $code));
@@ -274,6 +285,354 @@ class MetricsCollectorTest extends TestCase
         $this->assertTrue($isWholeTarget->invoke($worker, ['sqlstate' => '25006']));
     }
 
+    /**
+     * `unsignedInteger` is a signed 4-byte integer on PostgreSQL — the platform has
+     * no unsigned types and Laravel drops the modifier — so drain_batches_failed and
+     * drain_transient_failures top out at 2,147,483,647. A report carrying more
+     * raises 22003 on INSERT and the platform loses it entirely, which is the exact
+     * failure the pg_latency_ms / buffer_utilization_pct ceilings were added to
+     * prevent. Emit the ceiling instead of the report.
+     */
+    public function testIntegerCountersAreClampedToWhatThePlatformColumnHolds(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'batches_failed' => 9_000_000_000,
+            'transient_failures' => 4_500_000_000,
+            'rows_drained' => 9_000_000_000_000, // bigint column: must NOT be clamped
+        ]);
+
+        $drain = $this->collector->getFullStatus($now - 60, false, 10, 0, 0)['drain'];
+
+        $this->assertSame(2_147_483_647, $drain['batches_failed']);
+        $this->assertSame(2_147_483_647, $drain['transient_failures']);
+        $this->assertSame(9_000_000_000_000, $drain['total'], 'the bigint counters must pass through untouched');
+    }
+
+    /**
+     * The hole the deadlock fix opened, found by review.
+     *
+     * A transient abort is not a failed batch, so it stamps no write clock and
+     * adds nothing to DRAIN_ERRORS. On a host where a lock-order inversion aborts
+     * EVERY batch, that left batches_failed at 0, no window failures, and only
+     * DRAIN_STOPPED — which is gated on a backlog over 100 rows. A low-volume app
+     * deadlocking continuously therefore reported perfectly healthy, which is
+     * strictly worse than the latched warning the fix removed.
+     */
+    public function testAContinuouslyDeadlockingDrainIsReportedEvenWithATinyBacklog(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        // Every batch deferred: nothing committed, nothing "failed".
+        $this->loadDrainMetrics(['batches_drained' => 0, 'batches_failed' => 0, 'transient_failures' => 40]);
+        $this->collector->runDiagnosis(false, 10, 0, 0); // backlog far below DRAIN_STOPPED's guard
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 10, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertContains('DRAIN_CONTENTION', $codes);
+        $this->assertSame('critical', $this->activeDiagnosis($status, 'DRAIN_CONTENTION')['level'],
+            'committing nothing at all is not a warning');
+        $this->assertNotContains('DRAIN_STOPPED', $codes, 'the backlog is too small for that to cover it');
+    }
+
+    /**
+     * The counterweight: a deadlock now and then against a busy peer is normal and
+     * must stay quiet, or the fix trades a latched false positive for a noisy one.
+     */
+    public function testOccasionalContentionAgainstAHealthyDrainStaysQuiet(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics(['batches_drained' => 900, 'batches_failed' => 0, 'transient_failures' => 3]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+
+        $codes = array_column($this->collector->getFullStatus($now - 60, false, 10, 0, 0)['diagnoses'], 'code');
+
+        $this->assertNotContains('DRAIN_CONTENTION', $codes);
+        $this->assertNotContains('DRAIN_ERRORS', $codes);
+    }
+
+    /**
+     * Drain-metrics files outlive the run that wrote them. On restart the first
+     * read can land on the previous run's lifetime counters before the new worker
+     * has written, and diffing those against a zero baseline replays a whole run
+     * as one sample — lighting DRAIN_ERRORS on a healthy agent that just booted.
+     */
+    public function testAPreviousRunsMetricsFileDoesNotLightUpAFreshlyStartedAgent(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        // Stamped before this collector existed: a dead run's file.
+        $this->loadDrainMetrics([
+            'batches_failed' => 5,
+            'batches_drained' => 10,
+            'rows_drained' => 4_000,
+            'updated_at' => microtime(true) - 3_600,
+        ]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+
+        $window = (new \ReflectionProperty($this->collector, 'drainBatchWindow'))->getValue($this->collector);
+        $this->assertSame([], $window, "a dead run's history is not this run's recent activity");
+
+        $codes = array_column($this->collector->getFullStatus($now - 60, false, 10, 0, 0)['diagnoses'], 'code');
+        $this->assertNotContains('DRAIN_ERRORS', $codes);
+    }
+
+    /**
+     * Review round 2: the dead-run check judged all worker files by the NEWEST
+     * one. After a restart, worker 0 can have written while worker 1's file is
+     * still the previous run's — the newest file is fresh, so worker 1's whole
+     * lifetime was replayed into the window as a single sample.
+     */
+    public function testOneWorkersStaleFileIsNotReplayedWhenAnotherWorkerIsFresh(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+        $base = tempnam(sys_get_temp_dir(), 'nightowl-mixed-run');
+
+        $write = function (int $w, array $fields) use ($base): void {
+            file_put_contents("{$base}.drain-metrics-{$w}.json", json_encode(array_merge([
+                'rows_drained' => 0, 'batches_failed' => 0, 'batches_drained' => 0, 'transient_failures' => 0,
+                'pg_latency_ms' => 0, 'last_write_at' => 0.0, 'last_write_ok_at' => 0.0, 'last_conn_fail_at' => 0.0,
+            ], $fields)));
+        };
+
+        try {
+            // Worker 0 has already written this run: healthy, a handful of batches.
+            $write(0, ['batches_drained' => 3, 'updated_at' => microtime(true)]);
+            // Worker 1's file is the previous run's, which ended badly.
+            $write(1, ['batches_failed' => 50, 'batches_drained' => 10, 'updated_at' => microtime(true) - 3_600]);
+
+            $this->collector->readDrainMetrics($base, 2);
+            $this->collector->runDiagnosis(false, 10, 0, 0);
+            $this->collector->runDiagnosis(false, 10, 0, 0);
+
+            $failedInWindow = array_sum(array_column(
+                (new \ReflectionProperty($this->collector, 'drainBatchWindow'))->getValue($this->collector), 1
+            ));
+            $this->assertSame(0, $failedInWindow, "worker 1's previous run must not enter this run's window");
+
+            $codes = array_column($this->collector->getFullStatus($now - 60, false, 10, 0, 0)['diagnoses'], 'code');
+            $this->assertNotContains('DRAIN_ERRORS', $codes);
+        } finally {
+            @unlink("{$base}.drain-metrics-0.json");
+            @unlink("{$base}.drain-metrics-1.json");
+            @unlink($base);
+        }
+    }
+
+    /**
+     * Review round 2: the contention rate had no floor, so a quiet host committing
+     * fewer than ten batches in the window turned ONE deadlock into a warning —
+     * the github#9 complaint again, just capped at fifteen minutes.
+     */
+    public function testASingleDeadlockOnAQuietHostDoesNotRaiseContention(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics(['batches_drained' => 4, 'batches_failed' => 0, 'transient_failures' => 1]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+
+        $codes = array_column($this->collector->getFullStatus($now - 60, false, 10, 0, 0)['diagnoses'], 'code');
+        $this->assertNotContains('DRAIN_CONTENTION', $codes, '1/(1+4) = 20% is one deadlock, not contention');
+    }
+
+    /**
+     * The cross-repo contract. HealthReporter POSTs getFullStatus() verbatim to
+     * /agent/health, where nightowl-api reads `drain.batches_failed`,
+     * `drain.transient_failures` and `drain.batches_drained` by those exact paths
+     * — the last two are `sometimes` rules, so an older agent omitting them still
+     * validates, which also means a typo here would not 422. Rename either key here and the
+     * platform silently stops recording deadlock pressure. Nothing else asserts these names.
+     *
+     * Covers both hops: DrainWorker writes the metrics file, MetricsCollector
+     * reads it, getFullStatus renders the payload.
+     */
+    public function testDrainStatusCarriesTheKeysTheHealthApiReads(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        // Round-trip through the REAL writer. Writing the JSON by hand here would
+        // assert only half the contract: a reader and a hand-written fixture can
+        // agree on a key the WRITER never emits, and the value would silently be 0.
+        $base = sys_get_temp_dir().'/nightowl-ipc-'.uniqid();
+        $worker = new \NightOwl\Agent\DrainWorker(
+            sqlitePath: $base,
+            pgHost: '127.0.0.1', pgPort: 5432, pgDatabase: 'x', pgUsername: 'x', pgPassword: 'x',
+        );
+        foreach (['transientFailures' => 9, 'batchesFailed' => 2, 'batchesDrained' => 140, 'rowsDrained' => 5_521] as $prop => $value) {
+            (new \ReflectionProperty($worker, $prop))->setValue($worker, $value);
+        }
+        (new \ReflectionMethod($worker, 'writeDrainMetrics'))->invoke($worker);
+
+        $this->collector->readDrainMetrics($base, 1);
+        @unlink($base.'.drain-metrics.json');
+
+        $drain = $this->collector->getFullStatus($now - 60, false, 10, 0, 0)['drain'];
+
+        $this->assertArrayHasKey('transient_failures', $drain);
+        $this->assertArrayHasKey('batches_failed', $drain);
+        $this->assertArrayHasKey('batches_drained', $drain);
+        $this->assertSame(9, $drain['transient_failures'], 'deadlocks must survive the worker -> parent -> payload hops');
+        $this->assertSame(2, $drain['batches_failed'], 'and must stay separate from real batch failures');
+        $this->assertSame(140, $drain['batches_drained']);
+    }
+
+    /**
+     * github#9 — the reported numbers exactly: a low-volume host that drained
+     * 5,521 rows and hit ONE deadlock showed DRAIN_ERRORS at 15.3% and kept
+     * showing it until the process restarted.
+     *
+     * Two things were wrong and this covers both. The denominator guessed batches
+     * from rows (drainTotal/1000), which on a low-volume host undercounts them by
+     * an order of magnitude; and both terms were lifetime, so nothing decayed.
+     */
+    public function testOneFailureOnALowVolumeHostDoesNotTripDrainErrors(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        $this->loadDrainMetrics([
+            'rows_drained' => 5_521,
+            'batches_drained' => 140, // what 5,521 rows actually took on that host
+            'batches_failed' => 1,
+        ]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 10, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        // Old math: 1 / (1 + 5521/1000) = 15.3%, over the 10% threshold.
+        $this->assertGreaterThan(10.0, (1 / (1 + 5_521 / 1000)) * 100, 'the old estimate really did trip');
+        // New math: 1 / (1 + 140) = 0.7%.
+        $this->assertNotContains('DRAIN_ERRORS', $codes);
+    }
+
+    /**
+     * The latch itself: once the failure ages out of the window, the warning
+     * clears on its own. It used to need a restart.
+     */
+    public function testDrainErrorsClearsOnceTheFailureAgesOutOfTheWindow(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        // Enough failures against little volume to light it up.
+        $this->loadDrainMetrics(['rows_drained' => 100, 'batches_drained' => 2, 'batches_failed' => 5]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $codes = array_column($this->collector->getFullStatus($now - 60, false, 10, 0, 0)['diagnoses'], 'code');
+        $this->assertContains('DRAIN_ERRORS', $codes, 'a genuinely failing drain must still be reported');
+
+        // Age every sample past the window, then take a clean one: the drain has
+        // been healthy for 15 minutes.
+        $this->ageDrainWindowOut();
+
+        $this->loadDrainMetrics(['rows_drained' => 200, 'batches_drained' => 6, 'batches_failed' => 5]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+
+        $codes = array_column($this->collector->getFullStatus($now - 60, false, 10, 0, 0)['diagnoses'], 'code');
+        $this->assertNotContains('DRAIN_ERRORS', $codes, 'no failures for a window means no warning');
+    }
+
+    /**
+     * A drain worker that dies and respawns resets its counters, so the summed
+     * total drops. That must not be read as a burst of successful batches: doing
+     * so would credit the surviving workers' whole lifetime to the last five
+     * seconds and mute DRAIN_ERRORS for a full window, starting at a crash.
+     */
+    public function testAWorkerRestartDoesNotFabricateRecentSuccesses(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        // A long, healthy history, then aged out: the window is empty and quiet.
+        $this->loadDrainMetrics(['rows_drained' => 5_000_000, 'batches_drained' => 40_000, 'batches_failed' => 0]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->ageDrainWindowOut();
+
+        // One worker dies; the surviving workers' counters still dominate the sum,
+        // but the sum has DROPPED.
+        $this->loadDrainMetrics(['rows_drained' => 3_000_000, 'batches_drained' => 24_000, 'batches_failed' => 0]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+
+        $window = (new \ReflectionProperty($this->collector, 'drainBatchWindow'))->getValue($this->collector);
+        $this->assertSame([], $window, 'a counter reset must contribute no samples at all');
+
+        // And the batches that fail right after the restart are still reported.
+        $this->loadDrainMetrics(['rows_drained' => 3_000_000, 'batches_drained' => 24_000, 'batches_failed' => 3]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+
+        $codes = array_column($this->collector->getFullStatus($now - 60, false, 10, 0, 0)['diagnoses'], 'code');
+        $this->assertContains('DRAIN_ERRORS', $codes);
+    }
+
+    /**
+     * The windowing must not hide a drain that is failing NOW. An established
+     * host with a huge lifetime volume whose batches are all failing this minute
+     * is exactly the case the lifetime denominator used to dilute away.
+     */
+    public function testDrainErrorsStillFiresForAnEstablishedHostFailingNow(): void
+    {
+        for ($i = 0; $i < 60; $i++) {
+            $this->collector->tick();
+        }
+        $now = microtime(true);
+
+        // Hours of healthy high-volume draining, now behind us.
+        $this->loadDrainMetrics(['rows_drained' => 10_000_000, 'batches_drained' => 20_000, 'batches_failed' => 0]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->ageDrainWindowOut();
+
+        // Now every batch fails. Lifetime volume is unchanged and enormous, which
+        // is what used to dilute the rate to nothing.
+        $this->loadDrainMetrics(['rows_drained' => 10_000_000, 'batches_drained' => 20_000, 'batches_failed' => 12]);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+        $this->collector->runDiagnosis(false, 10, 0, 0);
+
+        $status = $this->collector->getFullStatus($now - 60, false, 10, 0, 0);
+        $codes = array_column($status['diagnoses'], 'code');
+
+        $this->assertContains('DRAIN_ERRORS', $codes);
+        // Old math would have scored 12 / (12 + 10,000) = 0.1% and said nothing.
+        $this->assertGreaterThan(10.0, $this->activeDiagnosis($status, 'DRAIN_ERRORS')['value']);
+    }
+
     public function testDrainErrorsCoversFreshAppConnectivityFailureWithSmallBacklog(): void
     {
         // Regression guard: a fresh app (no successful drain yet, drainTotal==0) whose
@@ -332,7 +691,7 @@ class MetricsCollectorTest extends TestCase
         // The headline Phase-3 bug: an ESTABLISHED, high-volume worker (large lifetime
         // drainTotal) that loses PG CONNECTIVITY with a small backlog. DRAIN_STOPPED is
         // skipped (pendingRows<=100), DRAIN_WRITE_FAILING is skipped (no write-rejection),
-        // and DRAIN_ERRORS' failRate dilutes below threshold against lifetime volume — so
+        // and DRAIN_ERRORS is suppressed because connectivity owns the failure — so
         // before Phase 3 the agent reported HEALTHY (score 100) while unable to drain.
         // Reverting Phase 3 (no DRAIN_UNREACHABLE) yields zero diagnoses → this fails.
         for ($i = 0; $i < 60; $i++) {

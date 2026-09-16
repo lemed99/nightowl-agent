@@ -23,7 +23,19 @@ final class DrainWorker
     // Drain metrics for IPC with parent process
     private int $batchesDrained = 0;
 
+    private const TRANSIENT_LOG_INTERVAL_SECONDS = 60.0;
+
     private int $batchesFailed = 0;
+
+    /**
+     * Batches Postgres aborted as a transient conflict and we deferred. Counted
+     * apart from batchesFailed so the health report can show deadlock pressure
+     * without it reading as the drain failing — see drainBatch's catch.
+     */
+    private int $transientFailures = 0;
+
+    /** Log throttle only — the counter above is what the health report reads. */
+    private float $lastTransientLogAt = 0.0;
 
     private int $rowsDrained = 0;
 
@@ -737,7 +749,43 @@ final class DrainWorker
             }
             $pgElapsed = (microtime(true) - $pgStart) * 1000; // ms
 
-            $this->batchesDrained++;
+            // A batch that only deferred committed nothing, so it is not a drained
+            // batch. Counting it was harmless until batches_drained became
+            // DRAIN_ERRORS' denominator: with quarantine ON, drainUnits handles a
+            // transient abort itself and returns deferred WITHOUT throwing, so the
+            // catch below never runs and every deadlocked batch used to inflate the
+            // healthy side of the ratio. A drain deadlocking on every batch would
+            // have reported a climbing batches_drained and a permanently clean
+            // DRAIN_ERRORS. Record it as the contention it is, on both paths.
+            //
+            // Classified exactly as the catch below classifies a thrown abort, because
+            // drainUnits defers on isTransientFailure(), which is WIDER than a
+            // momentary conflict: it defers 55xxx too. A persistent 55P03 is a full
+            // tenant disk or an orphaned idle-in-transaction session, and counting it
+            // as contention would raise DRAIN_CONTENTION's "no telemetry lost, check
+            // agent versions" instead of the DRAIN_WRITE_FAILING that names the
+            // SQLSTATE (found by review). Only class 40 is contention.
+            if ($result['drained'] === 0 && $result['quarantined'] === 0 && $result['deferred'] > 0) {
+                $err = $writer->lastWriteError;
+                if ($this->isMomentaryConflict($err)) {
+                    // drainUnits swallowed the exception, so describe it from the
+                    // recorded SQLSTATE and table rather than a message.
+                    $this->recordMomentaryConflict(sprintf(
+                        'SQLSTATE[%s] on %s',
+                        $err['sqlstate'] ?? '?',
+                        $err['table'] ?? 'unknown table',
+                    ));
+                } else {
+                    $this->batchesFailed++;
+                    if (is_array($err) && empty($err['connection'])) {
+                        $this->lastWriteSqlstate = is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : null;
+                        $this->lastWriteTable = is_string($err['table'] ?? null) ? $err['table'] : null;
+                        $this->lastWriteAt = microtime(true);
+                    }
+                }
+            } else {
+                $this->batchesDrained++;
+            }
             $this->rowsDrained += $result['drained'];
             $this->pgLatencyEwma = $this->pgLatencyEwma === 0.0
                 ? $pgElapsed
@@ -751,6 +799,31 @@ final class DrainWorker
             // or quarantined) as idle so the loop backs off instead of busy-looping.
             return ($result['drained'] + $result['quarantined']) > 0;
         } catch (\Throwable $e) {
+            // A MOMENTARY conflict (deadlock 40P01, serialization 40001) is not a
+            // failed batch. Postgres chose a victim among writers that were all
+            // behaving, the rows are untouched in the buffer, and the next loop
+            // writes them. Counting it was doing real damage: batchesFailed is
+            // lifetime, and DRAIN_ERRORS divided it by a lifetime denominator, so
+            // ONE deadlock on a low-volume host latched a warning until the
+            // process restarted (github#9 — 1 failure against 5,521 rows read as
+            // 15.3%). It must not stamp lastWriteAt either: that clock means
+            // "Postgres is refusing our writes" and would raise
+            // DRAIN_WRITE_FAILING against a database that did nothing wrong.
+            //
+            // Class 40 ONLY, which is narrower than isTransientFailure() — see
+            // isMomentaryConflict(). Still logged, and counted as what it is, so a
+            // host deadlocking steadily is still visible.
+            $err = $writer->lastWriteError;
+            if (empty($err['connection']) && $this->isMomentaryConflict($err)) {
+                $this->recordMomentaryConflict($e->getMessage());
+
+                // PG answered, so it is reachable — same reasoning as the
+                // write-rejection branch below.
+                $this->connFailStreak = 0;
+
+                return false;
+            }
+
             $this->batchesFailed++;
 
             // While PG is unreachable the message is identical every retry, so log
@@ -769,7 +842,6 @@ final class DrainWorker
             //    DRAIN_UNREACHABLE, independent of backlog size / lifetime drain volume.
             //  - null $err: a local buffer error (SQLite claim/fetch) — NOT a PG problem,
             //    so it stamps neither clock.
-            $err = $writer->lastWriteError;
             if (is_array($err) && empty($err['connection'])) {
                 $this->lastWriteSqlstate = is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : null;
                 $this->lastWriteTable = is_string($err['table'] ?? null) ? $err['table'] : null;
@@ -1022,6 +1094,56 @@ final class DrainWorker
     }
 
     /**
+     * Count one deferred batch as contention and log it, throttled.
+     *
+     * One place for both drain paths. They used to do this separately, and the
+     * quarantine path counted without logging — so DRAIN_CONTENTION sent an
+     * operator to a log line that host never wrote (found by review).
+     *
+     * Throttled for the same reason the failure path throttles a connection error:
+     * under a sustained lock-order inversion the message is identical every loop,
+     * and the loop runs continuously. The counter carries the volume; the log only
+     * has to say it is happening.
+     */
+    private function recordMomentaryConflict(string $detail): void
+    {
+        $this->transientFailures++;
+
+        $now = microtime(true);
+        if ($now - $this->lastTransientLogAt > self::TRANSIENT_LOG_INTERVAL_SECONDS) {
+            $this->lastTransientLogAt = $now;
+            error_log("[NightOwl Drain] Transient conflict, batch deferred: {$detail}");
+        }
+    }
+
+    /**
+     * Momentary conflicts — deadlock (40P01) and serialization failure (40001).
+     * Postgres aborted one of several well-behaved writers to break a tie, and the
+     * same batch succeeds on the next loop. These do not count as failed batches.
+     *
+     * DELIBERATELY narrower than isTransientFailure(), which also covers 55xxx
+     * (lock-not-available / object-in-use). Both should DEFER rather than
+     * quarantine, which is that predicate's job — but 55xxx must still COUNT, and
+     * must still stamp the write-rejection clock, because in this package's field
+     * history it has never been momentary: a full tenant disk and an orphaned
+     * idle-in-transaction session behind a pooler both surface as a persistent
+     * 55P03, and both were diagnosed from the SQLSTATE that DRAIN_WRITE_FAILING
+     * carries. Folding 55xxx in here would have deleted that signal and left a
+     * drain that defers every batch forever looking idle rather than stuck.
+     *
+     * @param  mixed  $err  RecordWriter::$lastWriteError
+     */
+    private function isMomentaryConflict($err): bool
+    {
+        if (! is_array($err)) {
+            return false;
+        }
+        $sqlstate = is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : '';
+
+        return str_starts_with($sqlstate, '40');
+    }
+
+    /**
      * Transient, non-deterministic failures — serialization (40001), deadlock
      * (40P01), lock-not-available / object-in-use (55xxx). Not the payload's fault
      * and likely to succeed on retry, so DEFER rather than quarantine.
@@ -1055,6 +1177,7 @@ final class DrainWorker
         $data = json_encode([
             'batches_drained' => $this->batchesDrained,
             'batches_failed' => $this->batchesFailed,
+            'transient_failures' => $this->transientFailures,
             'rows_drained' => $this->rowsDrained,
             'app_requests_total' => $this->cumRequests,
             'app_requests_5xx' => $this->cum5xx,

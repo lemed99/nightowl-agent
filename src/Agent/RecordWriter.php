@@ -75,6 +75,60 @@ final class RecordWriter
      */
     private const COLUMN_LIMITS_TTL_SECONDS = 60.0;
 
+    /**
+     * The order doWrite hands record types to their writers, and through them the
+     * order this batch takes row locks across the rollup tables.
+     *
+     * It has to be a CONSTANT, shared by every agent writing the database, because
+     * the alternative deadlocks. $grouped is keyed by record type in the order the
+     * types happen to appear in the batch, so a web host whose payloads open with a
+     * `request` wrote nightowl_request_rollups before nightowl_query_rollups, while
+     * a queue host whose payloads open with a `query` wrote them the other way
+     * round. Two such batches sharing a bucket each hold the row the other is
+     * waiting for and Postgres kills one: 40P01 naming whichever rollup the victim
+     * blocked on, which is why the reports named a different relation each time
+     * (github#9, a 4-host deployment; 9 deadlocks in a week).
+     *
+     * upsertRollupGroups' ksort fixed the same hazard WITHIN one table and cannot
+     * see this one — by the time it sorts, the table has already been chosen.
+     *
+     * Any fixed order works, so this is the match arms' own order, unchanged. No
+     * writer may depend on the order: it varied per batch before this existed, and
+     * the schema carries no foreign keys for it to satisfy.
+     */
+    private const WRITE_ORDER = [
+        'request', 'query', 'exception', 'command', 'job', 'cache-event',
+        'mail', 'notification', 'outgoing-request', 'scheduled-task', 'log', 'user',
+    ];
+
+    /**
+     * Record types that share one write slot, and so one position in WRITE_ORDER.
+     *
+     * A fixed type order is only half the guarantee. The other half is that each
+     * slot is written ONCE per batch, because a handler invoked from two positions
+     * locks its tables at two positions — and then an agent carrying the earlier
+     * type and an agent carrying the later one invert against any table written
+     * between them. writeJobs was exactly that: `queued-job` and `job-attempt` both
+     * reach it, so nightowl_jobs, nightowl_job_rollups, nightowl_user_job_rollups
+     * and the 'job' rows of nightowl_issues were each locked at two positions. A
+     * web host dispatching jobs carries `queued-job`; the queue host running them
+     * carries `job-attempt`; they share a database and deadlocked (github#9 named
+     * nightowl_job_rollups and nightowl_user_job_rollups among the relations).
+     *
+     * Merged, every handler runs at exactly one position, so any batch's lock
+     * sequence is a SUBSEQUENCE of one canonical sequence — and subsequences of a
+     * total order cannot invert against each other. That is the whole property.
+     * Keep it: a new record type routed to an existing handler belongs here, not
+     * in a match arm of its own.
+     *
+     * writeJobs reads both shapes through the same `??` fallbacks and branches on
+     * neither, so merging their records changes nothing about what is written.
+     */
+    private const WRITE_SLOTS = [
+        'queued-job' => 'job',
+        'job-attempt' => 'job',
+    ];
+
     /** @var array<string, true> Table.column pairs already warned about, so a repeat offender can't storm the log. */
     private array $clampWarned = [];
 
@@ -682,6 +736,42 @@ final class RecordWriter
         }
     }
 
+    /**
+     * Reorder a batch's type => records map into WRITE_ORDER.
+     *
+     * Types WRITE_ORDER does not name keep their arrival order at the end. They
+     * reach doWrite's `default => null` arm and write nothing, so they take no
+     * lock and their order cannot deadlock anything; a type added to the match
+     * but forgotten here still writes, just without the ordering guarantee.
+     *
+     * @param  array<string, list<array<string, mixed>>>  $grouped
+     * @return array<string, list<array<string, mixed>>>
+     */
+    private static function orderedForWrite(array $grouped): array
+    {
+        $slotted = [];
+        foreach ($grouped as $type => $records) {
+            $slot = self::WRITE_SLOTS[$type] ?? $type;
+            $slotted[$slot] = isset($slotted[$slot])
+                ? array_merge($slotted[$slot], $records)
+                : $records;
+        }
+
+        $ordered = [];
+        foreach (self::WRITE_ORDER as $slot) {
+            if (isset($slotted[$slot])) {
+                $ordered[$slot] = $slotted[$slot];
+            }
+        }
+        foreach ($slotted as $slot => $records) {
+            if (! isset($ordered[$slot])) {
+                $ordered[$slot] = $records;
+            }
+        }
+
+        return $ordered;
+    }
+
     private function doWrite(array $records): void
     {
         // Clear last-error state; a null value after write() returns means success.
@@ -817,20 +907,19 @@ final class RecordWriter
             $pdo->beginTransaction();
             $this->applyTransactionGuards($pdo);
 
-            foreach ($grouped as $type => $typeRecords) {
+            foreach (self::orderedForWrite($grouped) as $type => $typeRecords) {
                 $this->heartbeat?->enter("pg:write:{$type}");
                 match ($type) {
                     'request' => $this->writeRequests($typeRecords),
                     'query' => $this->writeQueries($typeRecords),
                     'exception' => $this->writeExceptions($typeRecords),
                     'command' => $this->writeCommands($typeRecords),
-                    'queued-job' => $this->writeJobs($typeRecords),
+                    'job' => $this->writeJobs($typeRecords),
                     'cache-event' => $this->writeCacheEvents($typeRecords),
                     'mail' => $this->writeMail($typeRecords),
                     'notification' => $this->writeNotifications($typeRecords),
                     'outgoing-request' => $this->writeOutgoingRequests($typeRecords),
                     'scheduled-task' => $this->writeScheduledTasks($typeRecords),
-                    'job-attempt' => $this->writeJobs($typeRecords),
                     'log' => $this->writeLogs($typeRecords),
                     'user' => $this->writeUsers($typeRecords),
                     default => null,
@@ -4235,6 +4324,15 @@ final class RecordWriter
 
         $now = gmdate('Y-m-d H:i:s');
 
+        // Lock order — the same guarantee upsertRollupGroups makes, for the same
+        // reason. $issueGroups is keyed by the conflict key but iterates in the
+        // order the records landed in this batch, so two agents seeing the same two
+        // fingerprints in opposite orders each hold the nightowl_issues row the
+        // other waits for. Every host running the same code breaches the same
+        // thresholds and throws the same exceptions, so overlapping groups are the
+        // normal case, not a rare one. SORT_STRING for the reason given there: a
+        // byte order that cannot depend on a key ever looking numeric to PHP.
+        ksort($issueGroups, SORT_STRING);
         foreach ($issueGroups as $key => $group) {
             $timestamps = $group['timestamps'];
             sort($timestamps);
@@ -4601,6 +4699,18 @@ final class RecordWriter
         ');
 
         $now = gmdate('Y-m-d H:i:s');
+
+        // Lock order, for the same reason upsertRollupGroups sorts its groups: this
+        // loop takes one row lock per user_id, in whatever order the records landed
+        // in the batch. Two agents seeing the same two signed-in users in opposite
+        // orders each hold the row the other waits for, and Postgres kills one
+        // (github#9). nightowl_issues needed the same fix, in both of its upserts.
+        //
+        // strcmp, not the default comparison: numeric-looking ids ('10' vs '9')
+        // must order by bytes, so that every agent agrees regardless of how PHP
+        // would juggle their types. usort is stable (PHP 8.0+), so a user appearing
+        // twice in one batch keeps arrival order and the last record still wins.
+        usort($records, static fn ($a, $b) => strcmp((string) ($a['id'] ?? ''), (string) ($b['id'] ?? '')));
 
         foreach ($records as $r) {
             $userId = $r['id'] ?? null;
@@ -5186,6 +5296,15 @@ final class RecordWriter
 
         $now = gmdate('Y-m-d H:i:s');
 
+        // Lock order — the same guarantee upsertRollupGroups makes, for the same
+        // reason. $issueGroups is keyed by the conflict key but iterates in the
+        // order the records landed in this batch, so two agents seeing the same two
+        // fingerprints in opposite orders each hold the nightowl_issues row the
+        // other waits for. Every host running the same code breaches the same
+        // thresholds and throws the same exceptions, so overlapping groups are the
+        // normal case, not a rare one. SORT_STRING for the reason given there: a
+        // byte order that cannot depend on a key ever looking numeric to PHP.
+        ksort($issueGroups, SORT_STRING);
         foreach ($issueGroups as $key => $group) {
             $timestamps = $group['timestamps'];
             sort($timestamps);
