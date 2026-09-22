@@ -5,6 +5,40 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.4.7] - 2026-09-22
+
+### Added
+
+- **Request payloads for any status, and response bodies.** Nightwatch records a
+  request payload only when the response is a 500 — the check is hard-coded in
+  its `RequestSensor` — and never records a response body. NightOwl now rewrites
+  the request record on its own side of the ingest, after Nightwatch builds it,
+  so the copy sent to the agent can carry both. Nightwatch's own copy, in
+  parallel mode, is untouched.
+  - `NIGHTOWL_CAPTURE_REQUEST_PAYLOAD` — `true` captures every request's
+    payload, `false` none; unset keeps Nightwatch's 500-only behaviour.
+  - `NIGHTOWL_CAPTURE_RESPONSE_BODY` — `true` captures response bodies.
+  - `NIGHTOWL_CAPTURE_STATUS_CODE` (`422,5xx`) and `NIGHTOWL_CAPTURE_ROUTES`
+    (the `NIGHTOWL_IGNORE_ROUTES` pattern language) narrow both. A filter that
+    is set but holds nothing valid captures nothing.
+  - `NIGHTOWL_CAPTURE_MAX_BYTES` truncates each body; `0` (the default) is no
+    limit. Bodies that together exceed ~4 MB are replaced by a `TOO_LARGE`
+    marker regardless, because the agent refuses a frame over 10 MB and that
+    would lose the whole request's telemetry.
+  - `NIGHTOWL_REDACT_RESPONSE_FIELDS` redacts JSON response keys at any depth,
+    case-insensitively. Unset, it covers `password`, `password_confirmation`,
+    `token`, `access_token`, `refresh_token`, `api_key`, `secret` and
+    `client_secret` — including for a published config whose `capture` block
+    lacks the key. Payloads keep Nightwatch's `NIGHTWATCH_REDACT_PAYLOAD_FIELDS`
+    and any `Nightwatch::redactRequests()` callback. Non-JSON text bodies are
+    stored as sent; file, streamed and binary responses become a marker.
+
+  Response bodies land in `nightowl_requests_v2.response_z` (migration 000075,
+  storage v2 only). A batch carrying bodies against a tenant without the column
+  drains its requests and drops the bodies, logged once, instead of failing the
+  batch. Capture fails open: anything it throws sends the record exactly as
+  Nightwatch built it. Read support shipped in the API first.
+
 ## [2.4.6] - 2026-09-16
 
 ### Changed

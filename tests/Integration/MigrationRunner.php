@@ -57,8 +57,8 @@ final class MigrationRunner
         // with its own static state. Probe the NEWEST migration's observable
         // effect — probing an early artifact would skip every migration added
         // since the test DB was first provisioned. Update this probe whenever
-        // a migration is added (high-water 000074 widened v1 route_action;
-        // 000073 widened dict text columns;
+        // a migration is added (high-water 000075 requests_v2.response_z;
+        // 000074 widened v1 route_action; 000073 widened dict text columns;
         // 000072 searchable log context; 000071 rollup tier autovacuum floor; 000070 linear ddsketch aggregate;
         // 000069 v2 id-sequence re-fence is artifact-less and rides
         // REPLAY_ALWAYS instead of a clause; before that 000068
@@ -66,6 +66,7 @@ final class MigrationRunner
         // 000063 concurrency rollup, 000064 mail/notification composites,
         // 000065 cache key_pattern).
         if (Schema::connection('nightowl')->hasTable('nightowl_dict_string')
+            && Schema::connection('nightowl')->hasColumn('nightowl_requests_v2', 'response_z')
             && Schema::connection('nightowl')->getConnection()->selectOne(
                 // 000074: type probe, same reason as 000073 below.
                 "SELECT EXISTS (

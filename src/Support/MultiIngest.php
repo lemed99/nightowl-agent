@@ -47,6 +47,12 @@ final class MultiIngest implements Ingest
 
     private static function signatureFor(Ingest $ingest): string
     {
+        // A capturing wrapper is the same destination as what it wraps; without
+        // this every re-wrap would read as a new target and double the sends.
+        if ($ingest instanceof CapturingIngest) {
+            return 'cap:'.self::signatureFor($ingest->inner);
+        }
+
         // For Nightwatch's Ingest, two instances pointing at the same socket
         // with the same token hash are functionally identical — collapse them
         // even when they're freshly constructed (different object IDs).

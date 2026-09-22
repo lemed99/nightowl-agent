@@ -217,10 +217,11 @@ final class RecordWriter
      */
     private ?bool $logContextFenceState = null;
 
-    /** Positive column probe, cached for process life — see logContextColumnExists(). */
-    private ?bool $logContextColumnChecked = null;
+    /** @var array<string, true> "table.column" → present; positive only, process life — see v2ColumnExists() */
+    private array $v2ColumnPresent = [];
 
-    private bool $logContextColumnWarned = false;
+    /** @var array<string, true> "table.column" → the absent-column warning was logged */
+    private array $v2ColumnWarned = [];
 
     private DictionaryCache $dict;
 
@@ -2334,6 +2335,19 @@ final class RecordWriter
             'peak_memory_usage', 'exception_preview', 'context_z', 'headers_z', 'payload_z',
         ];
 
+        // Only name response_z when this batch carries a body AND the column
+        // exists — the common batch (capture off) never pays for the probe.
+        $withResponse = false;
+        foreach ($records as $r) {
+            if (is_string($r['response_body'] ?? null) && $r['response_body'] !== '') {
+                $withResponse = $this->responseColumnExists();
+                break;
+            }
+        }
+        if ($withResponse) {
+            $columns[] = 'response_z';
+        }
+
         $envId = $this->v2Sid('environment', $this->environment);
 
         $rows = [];
@@ -2377,6 +2391,9 @@ final class RecordWriter
                 StorageV2::deflateOrNull($r['headers'] ?? null),
                 StorageV2::deflateOrNull($r['payload'] ?? null),
             ];
+            if ($withResponse) {
+                $rows[array_key_last($rows)][] = StorageV2::deflateOrNull($r['response_body'] ?? null);
+            }
         }
 
         $this->copyBatch('nightowl_requests_v2', $columns, $rows);
@@ -2811,55 +2828,92 @@ final class RecordWriter
      * state is only updated on success, so the next batch retries.
      */
     /**
+     * Whether nightowl_requests_v2 carries `response_z` (migration 000075).
+     * Without it the bodies are dropped (logged once) and the requests
+     * themselves drain normally. See v2ColumnExists() for why this gate exists.
+     *
+     * The probe only runs for a batch that carries a body, so a migration
+     * takes effect on the next such batch without a restart — at the cost of
+     * one catalog read per such batch meanwhile.
+     */
+    private function responseColumnExists(): bool
+    {
+        return $this->v2ColumnExists(
+            'nightowl_requests_v2', 'response_z',
+            'requests carry captured response bodies but nightowl_requests_v2 has no `response_z` column — '
+            .'dropping the bodies until `php artisan nightowl:migrate` adds it (no restart needed).',
+            'response-body column probe failed (dropping bodies for this batch)',
+        );
+    }
+
+    /**
      * Whether nightowl_logs_v2 carries the searchable `context` column
-     * (migration 000072) — gating the flag the way v2Enabled() gates the v2
-     * family on its tables.
+     * (migration 000072). Writing compressed instead costs a narrowed search
+     * until the migration runs, and the fence follows $plain so it correctly
+     * stays closed meanwhile.
+     */
+    private function logContextColumnExists(): bool
+    {
+        return $this->v2ColumnExists(
+            'nightowl_logs_v2', 'context',
+            'NIGHTOWL_LOG_CONTEXT_SEARCHABLE is on but nightowl_logs_v2 has no `context` column — '
+            .'writing compressed. Run `php artisan nightowl:migrate` and restart the agent.',
+            'searchable-log-context column probe failed (writing compressed for this batch)',
+        );
+    }
+
+    /**
+     * Does the tenant's v2 table carry a column a LATER migration adds? Gates
+     * a write-path flag on the column the way v2Enabled() gates the v2 family
+     * on its tables.
      *
      * Without this gate the flag is a drain-wedge: a customer sets the env var
      * and updates the package, but the column is not there yet (auto_migrate
      * off or timed out, a drain worker booted before the migrate ran), and the
-     * COPY into `context` throws 42703. The drain loop rolls the batch back and
+     * COPY into it throws 42703. The drain loop rolls the batch back and
      * retries it, intact, forever — the poison-batch failure mode, with the
      * buffer filling behind it until back-pressure starts refusing payloads.
-     * Reproduced before this gate existed. Writing compressed instead costs a
-     * narrowed search until the migration runs, and the fence follows $plain so
-     * it correctly stays closed meanwhile.
+     * Reproduced before the first of these gates existed (000072).
      *
-     * Cached for process life on a POSITIVE probe only (run nightowl:migrate
-     * then restart to flip, the same discipline as v2Enabled). A thrown probe
-     * reads as absent for this batch and is not cached, so a transient fault
-     * cannot pin the tenant to compressed for the process's life.
+     * Cached for process life on a POSITIVE probe only. A thrown probe reads as
+     * absent for this batch and is not cached, so a transient fault cannot pin
+     * the tenant to the degraded write for the process's life. An absent
+     * column is logged once per column, with the operator advice.
      */
-    private function logContextColumnExists(): bool
+    private function v2ColumnExists(string $table, string $column, string $absentAdvice, string $failureContext): bool
     {
-        if ($this->logContextColumnChecked === true) {
+        $key = $table.'.'.$column;
+
+        if (isset($this->v2ColumnPresent[$key])) {
             return true;
         }
 
         try {
-            $n = $this->pdo()->query(
-                "SELECT count(*) FROM pg_attribute
-                 WHERE attrelid = to_regclass('nightowl_logs_v2')
-                   AND attname = 'context' AND NOT attisdropped"
-            )->fetchColumn();
-            $exists = (int) $n > 0;
+            $stmt = $this->pdo()->prepare(
+                'SELECT count(*) FROM pg_attribute
+                 WHERE attrelid = to_regclass(?)
+                   AND attname = ? AND NOT attisdropped'
+            );
+            $stmt->execute([$table, $column]);
+            $exists = (int) $stmt->fetchColumn() > 0;
         } catch (\Throwable $e) {
-            error_log('[NightOwl Agent] searchable-log-context column probe failed (writing compressed for this batch): '.$e->getMessage());
+            error_log('[NightOwl Agent] '.$failureContext.': '.$e->getMessage());
 
             return false;
         }
 
         if (! $exists) {
-            if (! $this->logContextColumnWarned) {
-                $this->logContextColumnWarned = true;
-                error_log('[NightOwl Agent] NIGHTOWL_LOG_CONTEXT_SEARCHABLE is on but nightowl_logs_v2 has no `context` column — '
-                    .'writing compressed. Run `php artisan nightowl:migrate` and restart the agent.');
+            if (! isset($this->v2ColumnWarned[$key])) {
+                $this->v2ColumnWarned[$key] = true;
+                error_log('[NightOwl Agent] '.$absentAdvice);
             }
 
             return false;
         }
 
-        return $this->logContextColumnChecked = true;
+        $this->v2ColumnPresent[$key] = true;
+
+        return true;
     }
 
     private function noteLogContextFence(bool $plain): void

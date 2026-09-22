@@ -61,9 +61,13 @@ final class IgnoredRoutes
      * Lives here rather than inline in config/nightowl.php so the standalone
      * harness (which has no Laravel `env()`) parses the value the same way.
      *
+     * `$setting` only names the env var in those log lines: the same parser
+     * reads NIGHTOWL_CAPTURE_ROUTES (see PayloadCapture), which shares this
+     * pattern language on purpose.
+     *
      * @return array<int, string>
      */
-    public static function parse(mixed $value): array
+    public static function parse(mixed $value, string $setting = 'NIGHTOWL_IGNORE_ROUTES'): array
     {
         if ($value === null || $value === false || $value === '') {
             return [];
@@ -74,7 +78,7 @@ final class IgnoredRoutes
         $patterns = [];
         foreach ($entries as $entry) {
             if (! is_string($entry)) {
-                self::warnOnce('non-string entry ('.get_debug_type($entry).') dropped');
+                self::warnOnce($setting, 'non-string entry ('.get_debug_type($entry).') dropped');
 
                 continue;
             }
@@ -83,7 +87,7 @@ final class IgnoredRoutes
                 continue;
             }
             if (! mb_check_encoding($entry, 'UTF-8')) {
-                self::warnOnce('pattern with invalid UTF-8 dropped — it would make the drain\'s route matcher throw on every record');
+                self::warnOnce($setting, 'pattern with invalid UTF-8 dropped — it would make the route matcher throw on every record');
 
                 continue;
             }
@@ -96,11 +100,11 @@ final class IgnoredRoutes
     /** @var array<string, true> */
     private static array $warned = [];
 
-    private static function warnOnce(string $what): void
+    private static function warnOnce(string $setting, string $what): void
     {
-        if (! isset(self::$warned[$what])) {
-            self::$warned[$what] = true;
-            error_log('[NightOwl Agent] NIGHTOWL_IGNORE_ROUTES: '.$what);
+        if (! isset(self::$warned[$setting.$what])) {
+            self::$warned[$setting.$what] = true;
+            error_log('[NightOwl Agent] '.$setting.': '.$what);
         }
     }
 

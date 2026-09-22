@@ -5,8 +5,11 @@ namespace NightOwl;
 use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
 use Illuminate\Events\Dispatcher;
 use Illuminate\Support\ServiceProvider;
+use Illuminate\Foundation\Http\Events\RequestHandled;
+use Laravel\Nightwatch\Contracts\Ingest as IngestContract;
 use Laravel\Nightwatch\Core;
 use Laravel\Nightwatch\Ingest;
+use Laravel\Nightwatch\Records\Request as RequestRecord;
 use Laravel\Nightwatch\RecordsBuffer;
 use Laravel\Nightwatch\SocketStreamFactory;
 use NightOwl\Agent\AsyncServer;
@@ -30,9 +33,11 @@ use NightOwl\Commands\PartitionCommand;
 use NightOwl\Commands\PruneCommand;
 use NightOwl\Commands\RepairCacheRollupKeysCommand;
 use NightOwl\Commands\TestAlertCommand;
+use NightOwl\Support\CapturingIngest;
 use NightOwl\Support\InstalledVersionReader;
 use NightOwl\Support\MultiIngest;
 use NightOwl\Support\NightwatchIngestArguments;
+use NightOwl\Support\PayloadCapture;
 
 class NightOwlAgentServiceProvider extends ServiceProvider
 {
@@ -171,6 +176,8 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 ? new Dispatcher($this->app)
                 : $this->app->make(DispatcherContract::class)));
 
+            $nightowlIngest = $this->wirePayloadCapture($core, $nightowlIngest);
+
             // Both modes go through MultiIngest — single-agent mode wraps a lone
             // ingest purely for its fail-open write path. A monitoring package
             // must never take the host application down: Nightwatch's own hooks
@@ -211,6 +218,49 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 backfillMarkerPath: MigrateCommand::backfillMarkerPath(),
             );
         });
+    }
+
+    /**
+     * Wrap the NightOwl-bound ingest with request-payload / response-body
+     * capture when `nightowl.capture` asks for it (see PayloadCapture).
+     *
+     * Runs during the host application's boot, so it fails OPEN: if the
+     * installed Nightwatch lacks a hook this relies on, capture is skipped with
+     * a log line and the ingest is returned as it came. A monitoring setting
+     * must never be the reason an application does not boot.
+     */
+    protected function wirePayloadCapture(object $core, IngestContract $ingest): IngestContract
+    {
+        try {
+            $capture = PayloadCapture::fromConfig(
+                (array) config('nightowl.capture', []),
+                (array) config('nightwatch.redact_payload_fields', ['_token', 'password', 'password_confirmation']),
+            );
+            if ($capture === null) {
+                return $ingest;
+            }
+
+            // Nightwatch runs these right before it writes the request record
+            // (CapturesState::request), which is what pairs the two exactly.
+            // A request Nightwatch sampled out is still built and written, then
+            // flushed unsent — so skip it here, or every discarded request would
+            // pay for a response-body encode.
+            $core->redactRequests(static function ($record) use ($capture, $core): void {
+                if ($record instanceof RequestRecord && (! method_exists($core, 'sampling') || $core->sampling())) {
+                    $capture->remember($record);
+                }
+            });
+
+            $this->app['events']->listen(RequestHandled::class, static function (RequestHandled $event) use ($capture): void {
+                $capture->rememberResponse($event->response);
+            });
+
+            return new CapturingIngest($ingest, $capture);
+        } catch (\Throwable $e) {
+            error_log('[NightOwl Agent] payload capture disabled — could not hook into Nightwatch: '.$e->getMessage());
+
+            return $ingest;
+        }
     }
 
     /**

@@ -169,6 +169,57 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Request Payload & Response Body Capture
+    |--------------------------------------------------------------------------
+    |
+    | Nightwatch captures a request payload only when the response is a 500
+    | (NIGHTWATCH_CAPTURE_REQUEST_PAYLOAD), and never a response body. These
+    | settings replace that for the copy sent to NightOwl; in parallel mode
+    | Nightwatch's own copy is left exactly as it was.
+    |
+    |     NIGHTOWL_CAPTURE_REQUEST_PAYLOAD=true
+    |     NIGHTOWL_CAPTURE_RESPONSE_BODY=true
+    |     NIGHTOWL_CAPTURE_STATUS_CODE="4xx,5xx"
+    |     NIGHTOWL_CAPTURE_ROUTES="api/*,webhooks.*"
+    |
+    | NIGHTOWL_CAPTURE_REQUEST_PAYLOAD left UNSET keeps Nightwatch's behaviour
+    | (500s only). true captures every request's payload; false captures none.
+    | NIGHTOWL_CAPTURE_RESPONSE_BODY=true captures response bodies.
+    |
+    | Both are narrowed by the same two filters. STATUS_CODE takes exact codes
+    | and classes (`422,5xx`); ROUTES takes the NIGHTOWL_IGNORE_ROUTES pattern
+    | language, matched on the route path, name or action. Empty = no narrowing.
+    | A filter that is set but holds nothing valid captures NOTHING — a typo
+    | never widens capture to every request.
+    |
+    | Payloads are redacted with NIGHTWATCH_REDACT_PAYLOAD_FIELDS (and any
+    | Nightwatch::redactRequests() callback you registered). JSON response
+    | bodies are redacted with NIGHTOWL_REDACT_RESPONSE_FIELDS — matched on key
+    | name at any depth, case-insensitively. Non-JSON text bodies (HTML, XML,
+    | plain text) have no fields and are stored as sent. File downloads and
+    | streamed responses are recorded as a marker, not their bytes.
+    |
+    | NIGHTOWL_CAPTURE_MAX_BYTES truncates each body (0 = no limit). Separately,
+    | bodies that together exceed ~4 MB are replaced by a TOO_LARGE marker: the
+    | agent refuses a frame over 10 MB, and that would lose the whole request's
+    | telemetry, not just its body. Response bodies are stored in storage v2
+    | only (migration 000075). TOP-LEVEL key (shallow-merge rule).
+    |
+    */
+    'capture' => [
+        'request_payload' => env('NIGHTOWL_CAPTURE_REQUEST_PAYLOAD'),
+        'response_body' => env('NIGHTOWL_CAPTURE_RESPONSE_BODY', false),
+        'status_codes' => env('NIGHTOWL_CAPTURE_STATUS_CODE', ''),
+        'routes' => env('NIGHTOWL_CAPTURE_ROUTES', ''),
+        'max_bytes' => (int) env('NIGHTOWL_CAPTURE_MAX_BYTES', 0),
+        // Unset = password, password_confirmation, token, access_token,
+        // refresh_token, api_key, secret, client_secret. Set to a list to
+        // replace those (not extend); an empty string turns redaction off.
+        'redact_response_fields' => env('NIGHTOWL_REDACT_RESPONSE_FIELDS'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Storage Format v2
     |--------------------------------------------------------------------------
     |
