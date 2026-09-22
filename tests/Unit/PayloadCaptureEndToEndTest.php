@@ -151,20 +151,27 @@ final class PayloadCaptureEndToEndTest extends TestCase
         $this->assertInstanceOf(MultiIngest::class, $core->ingest);
         $target = (new \ReflectionClass($core->ingest))->getProperty('ingests')->getValue($core->ingest)[0];
 
-        // Keep the records off the socket: observe the buffer right after each write.
-        $seen = [];
-        $core->ingest = new class($target, $seen) implements Ingest
+        // Keep the records off the socket, without reaching into Nightwatch's
+        // internals: re-wrap the capture the provider built around a recorder,
+        // so the records arrive exactly as CapturingIngest hands them on. The
+        // Ingest CONTRACT is all this touches, and that is identical across the
+        // ^1.26 range — Nightwatch's own RecordsBuffer is not: reading
+        // `buffer->all()` here passed on the locked 1.30 and was an undefined
+        // method on 1.26, which the SDK swallowed as a reported exception.
+        $recorder = new class implements Ingest
         {
-            public function __construct(private Ingest $target, private array &$seen) {}
+            /** @var list<array<mixed>> */
+            public array $records = [];
 
             public function write(array $record): void
             {
-                $this->target->write($record);
-                $inner = $this->target instanceof CapturingIngest ? $this->target->inner : $this->target;
-                $this->seen = $inner->buffer->all();
+                $this->records[] = $record;
             }
 
-            public function writeNow(array $record): void {}
+            public function writeNow(array $record): void
+            {
+                $this->records[] = $record;
+            }
 
             public function ping(): void {}
 
@@ -176,10 +183,15 @@ final class PayloadCaptureEndToEndTest extends TestCase
 
             public function flush(): void {}
         };
+        // With capture off entirely the provider leaves the ingest unwrapped —
+        // that IS the assertion of the unset test, so record straight from it.
+        $core->ingest = $target instanceof CapturingIngest
+            ? new CapturingIngest($recorder, (new \ReflectionClass($target))->getProperty('capture')->getValue($target))
+            : $recorder;
 
         $kernel->terminate($request, $response);
 
-        foreach ($seen as $record) {
+        foreach ($recorder->records as $record) {
             if (($record['t'] ?? null) === 'request') {
                 return $record;
             }
