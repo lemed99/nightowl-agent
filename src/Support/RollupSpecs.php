@@ -14,6 +14,23 @@ namespace NightOwl\Support;
  */
 final class RollupSpecs
 {
+    /**
+     * Cache event_type spellings behind each cache counter. The Nightwatch SDK
+     * sends hit, miss, write, write-failure, delete and delete-failure
+     * (CacheEventSensor) and the agent stores them unchanged. The other
+     * spellings come from seeders and older simulator data, and stay counted
+     * so those rows read the same. Failures are every failure spelling, so
+     * fails = write_failures + delete_failures on every row.
+     * nightowl-api's CacheController raw fallback counts the same lists.
+     */
+    public const CACHE_WRITE_TYPES = ['write', 'set', 'put'];
+
+    public const CACHE_DELETE_TYPES = ['delete', 'forget'];
+
+    public const CACHE_WRITE_FAILURE_TYPES = ['write-failure', 'write_fail', 'set_fail', 'put_fail', 'fail'];
+
+    public const CACHE_DELETE_FAILURE_TYPES = ['delete-failure', 'delete_fail', 'forget_fail'];
+
     /** @return list<RollupSpec> */
     public static function all(): array
     {
@@ -152,6 +169,11 @@ final class RollupSpecs
         // UI shows no p95), so no histogram. Duration totals power the list's avg
         // column only. event_type lives in the record's `type` field.
         $type = static fn (array $r): string => (string) ($r['type'] ?? '');
+        // One list feeds both forms of a counter, so the drain and the backfill
+        // cannot drift apart on a spelling.
+        $is = static fn (array $types): \Closure => static fn (array $r): bool => in_array($type($r), $types, true);
+        $in = static fn (array $types): string => "event_type IN ('".implode("', '", $types)."')";
+        $failures = array_merge(self::CACHE_WRITE_FAILURE_TYPES, self::CACHE_DELETE_FAILURE_TYPES);
 
         return new RollupSpec(
             table: 'nightowl_cache_rollups',
@@ -175,11 +197,11 @@ final class RollupSpecs
             counters: [
                 'hits' => ['php' => static fn (array $r): bool => $type($r) === 'hit', 'sql' => "event_type = 'hit'"],
                 'misses' => ['php' => static fn (array $r): bool => $type($r) === 'miss', 'sql' => "event_type = 'miss'"],
-                'writes' => ['php' => static fn (array $r): bool => in_array($type($r), ['set', 'put'], true), 'sql' => "event_type IN ('set', 'put')"],
-                'deletes' => ['php' => static fn (array $r): bool => in_array($type($r), ['forget', 'delete'], true), 'sql' => "event_type IN ('forget', 'delete')"],
-                'fails' => ['php' => static fn (array $r): bool => $type($r) === 'fail', 'sql' => "event_type = 'fail'"],
-                'delete_failures' => ['php' => static fn (array $r): bool => in_array($type($r), ['delete_fail', 'forget_fail'], true), 'sql' => "event_type IN ('delete_fail', 'forget_fail')"],
-                'write_failures' => ['php' => static fn (array $r): bool => in_array($type($r), ['write_fail', 'set_fail', 'put_fail', 'fail'], true), 'sql' => "event_type IN ('write_fail', 'set_fail', 'put_fail', 'fail')"],
+                'writes' => ['php' => $is(self::CACHE_WRITE_TYPES), 'sql' => $in(self::CACHE_WRITE_TYPES)],
+                'deletes' => ['php' => $is(self::CACHE_DELETE_TYPES), 'sql' => $in(self::CACHE_DELETE_TYPES)],
+                'fails' => ['php' => $is($failures), 'sql' => $in($failures)],
+                'delete_failures' => ['php' => $is(self::CACHE_DELETE_FAILURE_TYPES), 'sql' => $in(self::CACHE_DELETE_FAILURE_TYPES)],
+                'write_failures' => ['php' => $is(self::CACHE_WRITE_FAILURE_TYPES), 'sql' => $in(self::CACHE_WRITE_FAILURE_TYPES)],
             ],
             representatives: [],
             hasDuration: true,

@@ -190,11 +190,24 @@ final class SqliteBuffer
      * Worker IDs use range 100+ (100 = worker 0, 101 = worker 1, etc.)
      * to avoid collision with 0 (pending) and 1 (synced).
      *
+     * Rows the worker ALREADY holds are returned first, and nothing new is
+     * claimed while it holds any. A batch whose write failed stays claimed, and
+     * this used to claim a fresh batch on top of it every retry: through a
+     * Postgres outage one worker's claim grew by a batch per attempt until it
+     * held the whole buffer, back-pressure (which counted only unclaimed rows)
+     * never engaged, and the first write after recovery was the entire backlog
+     * in one transaction.
+     *
      * @return array<int, array{id: int, payload: string, record_count: int}>
      */
     public function claimBatch(int $workerId, int $limit = 1000): array
     {
         $claimValue = 100 + $workerId;
+
+        $held = $this->claimedBy($claimValue, $limit);
+        if ($held !== []) {
+            return $held;
+        }
 
         // Atomic claim: mark unclaimed rows for this worker.
         // Values are internally-supplied ints but we bind them anyway — matches
@@ -209,10 +222,19 @@ final class SqliteBuffer
         $claimStmt->bindValue('lim', $limit, PDO::PARAM_INT);
         $claimStmt->execute();
 
+        return $this->claimedBy($claimValue, $limit);
+    }
+
+    /**
+     * @return array<int, array{id: int, payload: string, record_count: int}>
+     */
+    private function claimedBy(int $claimValue, int $limit): array
+    {
         $stmt = $this->pdo->prepare(
-            'SELECT id, payload, record_count FROM buffer WHERE synced = :claim ORDER BY id ASC'
+            'SELECT id, payload, record_count FROM buffer WHERE synced = :claim ORDER BY id ASC LIMIT :lim'
         );
         $stmt->bindValue('claim', $claimValue, PDO::PARAM_INT);
+        $stmt->bindValue('lim', $limit, PDO::PARAM_INT);
         $stmt->execute();
 
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -294,6 +316,96 @@ final class SqliteBuffer
     }
 
     /**
+     * Release every worker's claims back to pending. Returns the rows released.
+     *
+     * For agent startup only, before any drain worker exists. A claim outlives
+     * the agent that made it when the agent dies without reaping its workers,
+     * and nothing else would ever free it: releaseClaimed() runs only for a
+     * worker the running agent saw die, a claim value above the new worker
+     * count is never claimed again, and a single worker reads with
+     * fetchPending(), which skips claimed rows. Those rows were never counted,
+     * drained or cleaned up. Safe only because the agent holds the buffer's
+     * owner lock (acquireOwnerLock()), so no other agent's workers are live on
+     * this file.
+     */
+    public function releaseAllClaimed(): int
+    {
+        return $this->pdo->exec('UPDATE buffer SET synced = 0 WHERE synced >= 100');
+    }
+
+    /**
+     * Take the exclusive lock that makes one agent the owner of the buffer at
+     * $path: an flock on a sidecar file next to it.
+     *
+     * Two agents on one buffer both drain it, and a single drain worker reads
+     * without claiming (fetchPending()), so the same rows can reach Postgres
+     * twice. The lock turns that into a refused start.
+     *
+     * Returns the handle, which the caller must keep open for the life of the
+     * process. The kernel drops the lock when the last descriptor on it closes,
+     * so a crashed agent never leaves it stale. Forked drain workers share the
+     * parent's descriptor and therefore its lock, and a worker exiting does not
+     * release it. The handle is close-on-exec, so an exec'd drain worker and the
+     * commands the agent spawns (boot migrate, the detached rollup backfill)
+     * cannot keep the lock held after the agent is gone.
+     *
+     * Returns null when another process holds the lock, with that process's pid
+     * in $holderPid (0 when the lock file does not say). Throws when the lock
+     * could not be taken for any other reason, such as a filesystem without
+     * flock support.
+     *
+     * @param-out int|null $holderPid
+     *
+     * @return resource|null
+     *
+     * @throws RuntimeException
+     */
+    public static function acquireOwnerLock(string $path, ?int &$holderPid = null)
+    {
+        $holderPid = null;
+        $lockPath = self::lockPath($path);
+
+        $dir = dirname($lockPath);
+        if (! is_dir($dir) && ! @mkdir($dir, 0755, true) && ! is_dir($dir)) {
+            throw new RuntimeException("Cannot create directory: {$dir}");
+        }
+
+        // 'c' opens for read/write without truncating (the holder's pid stays
+        // readable), 'e' sets close-on-exec.
+        $handle = @fopen($lockPath, 'c+e');
+        if ($handle === false) {
+            throw new RuntimeException("Cannot open {$lockPath}: ".(error_get_last()['message'] ?? 'unknown error'));
+        }
+
+        $wouldBlock = 0;
+        if (! flock($handle, LOCK_EX | LOCK_NB, $wouldBlock)) {
+            if ($wouldBlock) {
+                $holderPid = (int) trim((string) stream_get_contents($handle, 32, 0));
+                fclose($handle);
+
+                return null;
+            }
+
+            fclose($handle);
+
+            throw new RuntimeException("Cannot lock {$lockPath}");
+        }
+
+        // The pid is only for the refusal message a second agent prints, so a
+        // failed write (full disk) is not a reason to give the lock back.
+        @ftruncate($handle, 0);
+        @fwrite($handle, (string) getmypid());
+        @fflush($handle);
+
+        return $handle;
+    }
+
+    public static function lockPath(string $path): string
+    {
+        return $path.'.lock';
+    }
+
+    /**
      * Delete synced rows older than $maxAge seconds.
      */
     public function cleanup(int $maxAge = 300): int
@@ -357,11 +469,26 @@ final class SqliteBuffer
     }
 
     /**
-     * Count of rows not yet synced.
+     * Count of rows waiting to be drained and not claimed by any worker.
      */
     public function pendingCount(): int
     {
         return (int) $this->pdo->query('SELECT COUNT(*) FROM buffer WHERE synced = 0')->fetchColumn();
+    }
+
+    /**
+     * Count of rows not yet in Postgres: pending plus claimed by a drain worker.
+     *
+     * The agent's back-pressure and health report read this rather than
+     * pendingCount(). With several drain workers, every in-flight batch is
+     * claimed, and leaving those out would hide up to one batch per worker
+     * from both. The two subqueries each stay on the (synced, id) index.
+     */
+    public function backlogCount(): int
+    {
+        return (int) $this->pdo->query(
+            'SELECT (SELECT COUNT(*) FROM buffer WHERE synced = 0) + (SELECT COUNT(*) FROM buffer WHERE synced >= 100)'
+        )->fetchColumn();
     }
 
     /**

@@ -2,6 +2,7 @@
 
 namespace NightOwl\Tests\System;
 
+use NightOwl\Agent\EmailTemplate;
 use NightOwl\Agent\SmtpClient;
 use NightOwl\Tests\Fixtures\ScriptedServer;
 use PHPUnit\Framework\TestCase;
@@ -47,7 +48,7 @@ class SmtpClientConversationTest extends TestCase
      * @param  array<string, mixed>  $config  Merged over a working email-channel config
      * @return array{transcript: list<string>, error: string|null}
      */
-    private function converse(array $script = [], array $config = [], ?SmtpClient $client = null, string $body = 'Body text.'): array
+    private function converse(array $script = [], array $config = [], ?SmtpClient $client = null, string $body = 'Body text.', bool $isHtml = false, string $subject = 'Test subject'): array
     {
         $server = ScriptedServer::start('fake-smtp-server.php', $script);
         $this->servers[] = $server;
@@ -63,7 +64,7 @@ class SmtpClientConversationTest extends TestCase
                 'from_address' => 'alerts@example.com',
                 'from_name' => 'NightOwl',
                 'to_addresses' => ['ops@example.com'],
-            ], $config), 'Test subject', $body, false);
+            ], $config), $subject, $body, $isHtml);
         } catch (\Throwable $e) {
             $error = $e->getMessage();
         }
@@ -182,6 +183,71 @@ class SmtpClientConversationTest extends TestCase
         $this->assertNull($this->line($result['transcript'], 'AUTH'));
     }
 
+    /**
+     * The API now saves email channels with no credentials, as null or as
+     * blanks. None of those may produce an AUTH command, and a null password
+     * must not break the send.
+     */
+    public function test_no_auth_is_attempted_with_a_null_or_blank_username(): void
+    {
+        foreach ([
+            'null' => ['username' => null, 'password' => null],
+            'blank' => ['username' => '   ', 'password' => null],
+        ] as $case => $credentials) {
+            $result = $this->converse(config: $credentials);
+
+            $this->assertNull($result['error'], "{$case} username");
+            $this->assertNull($this->line($result['transcript'], 'AUTH'), "{$case} username still sent AUTH");
+            $this->assertNotNull($this->line($result['transcript'], 'MAIL FROM:'), "{$case} username: the message was never sent");
+        }
+    }
+
+    /**
+     * A username on a relay that takes no login used to fail with the relay's
+     * bare "502 Command not implemented" after AUTH LOGIN, which pointed
+     * nowhere. The error now names the cause and the fix, and still carries
+     * the server's own reply.
+     */
+    public function test_a_username_on_a_relay_without_auth_fails_with_a_clear_error(): void
+    {
+        $result = $this->converse([
+            'ehlo' => "250-fake.test\r\n250 8BITMIME\r\n",
+            'auth' => "502 5.5.2 Command not implemented\r\n",
+        ]);
+
+        $this->assertNotNull($result['error']);
+        $this->assertStringContainsString('a username is set but 127.0.0.1:', $result['error']);
+        $this->assertStringContainsString('does not advertise AUTH', $result['error']);
+        $this->assertStringContainsString('clear the username and password', $result['error']);
+        $this->assertStringContainsString('502 5.5.2 Command not implemented', $result['error']);
+        $this->assertStringNotContainsString("encryption to 'tls'", $result['error']);
+        $this->assertNull($this->line($result['transcript'], 'MAIL FROM:'));
+    }
+
+    public function test_a_relay_that_hides_auth_behind_starttls_is_named_in_the_error(): void
+    {
+        $result = $this->converse([
+            'ehlo' => "250-fake.test\r\n250 STARTTLS\r\n",
+            'auth' => "530 5.7.0 Must issue a STARTTLS command first\r\n",
+        ]);
+
+        $this->assertNotNull($result['error']);
+        $this->assertStringContainsString('does not advertise AUTH', $result['error']);
+        $this->assertStringContainsString("set encryption to 'tls'", $result['error']);
+    }
+
+    /** An advertised mechanism that fails is a credentials problem, reported as before. */
+    public function test_a_refused_advertised_login_keeps_the_servers_own_error(): void
+    {
+        $result = $this->converse([
+            'ehlo' => "250-fake.test\r\n250 AUTH LOGIN\r\n",
+            'auth' => "504 5.5.4 Unrecognized authentication type\r\n",
+        ]);
+
+        $this->assertNotNull($result['error']);
+        $this->assertSame('SMTP error after AUTH LOGIN: 504 5.5.4 Unrecognized authentication type', $result['error']);
+    }
+
     // ─── Message ─────────────────────────────────────────────────────
 
     /**
@@ -206,6 +272,69 @@ class SmtpClientConversationTest extends TestCase
         $this->assertSame(1, preg_match('/^Message-ID: <[^@>]+@example\.com>$/', $messageId), $messageId);
     }
 
+    /**
+     * An app name like "Café Ünïcode" went into the Subject as raw UTF-8.
+     * Headers are 7-bit: it has to go out as RFC 2047 encoded-words, the
+     * display name in From too, and read back as the same text.
+     */
+    public function test_a_non_ascii_subject_and_sender_name_go_out_encoded(): void
+    {
+        $subject = '[Café Ünïcode] Agent Health: DRAIN_STOPPED';
+
+        $result = $this->converse(config: ['username' => '', 'from_name' => 'Café Ünïcode'], subject: $subject);
+
+        $this->assertNull($result['error']);
+
+        $data = array_search('DATA', $result['transcript'], true);
+        $lines = array_slice($result['transcript'], $data + 1);
+        $headers = array_slice($lines, 0, (int) array_search('', $lines, true));
+        foreach ($headers as $line) {
+            $this->assertMatchesRegularExpression('/^[\x20-\x7E]*$/', $line, "a header line is not 7-bit: {$line}");
+        }
+
+        $subjectHeader = $this->unfold($headers, 'Subject: ');
+        $this->assertSame($subject, self::decodeWords($subjectHeader));
+
+        $from = $this->unfold($headers, 'From: ');
+        $this->assertStringEndsWith(' <alerts@example.com>', $from);
+        $this->assertSame('Café Ünïcode <alerts@example.com>', self::decodeWords($from));
+    }
+
+    /** Decode B-encoded words as a mail client does: adjacent words join, the folding between them goes. */
+    private static function decodeWords(string $header): string
+    {
+        return (string) preg_replace_callback(
+            '/=\?UTF-8\?B\?([A-Za-z0-9+\/=]*)\?=(?:\r\n )?/',
+            static fn (array $m): string => base64_decode($m[1]),
+            $header,
+        );
+    }
+
+    /** A header and its folded continuation lines, as one value. */
+    private function unfold(array $headers, string $prefix): string
+    {
+        $value = null;
+        foreach ($headers as $line) {
+            if ($value === null) {
+                if (str_starts_with($line, $prefix)) {
+                    $value = substr($line, strlen($prefix));
+                }
+
+                continue;
+            }
+
+            if (! str_starts_with($line, ' ') && ! str_starts_with($line, "\t")) {
+                break;
+            }
+
+            $value .= "\r\n".$line;
+        }
+
+        $this->assertNotNull($value, "no {$prefix}header");
+
+        return $value;
+    }
+
     public function test_message_ids_are_unique_across_sends(): void
     {
         $first = $this->line($this->converse()['transcript'], 'Message-ID: ');
@@ -227,6 +356,44 @@ class SmtpClientConversationTest extends TestCase
         $this->assertNull($result['error']);
         $this->assertContains('..hidden line', $result['transcript']);
         $this->assertContains('Last line', $result['transcript'], 'body was truncated at the stray period');
+    }
+
+    /**
+     * EmailTemplate renders each email as a single line of several KB, and
+     * RFC 5321 §4.5.3.1.6 caps a line at 1000 octets, so a relay could bounce
+     * the alert after answering 250. The body is sent quoted-printable and must
+     * decode to exactly what was rendered, UTF-8 included.
+     */
+    public function test_a_long_html_body_goes_out_in_short_lines_and_decodes_unchanged(): void
+    {
+        $html = EmailTemplate::renderHealth('Café & Co', [
+            'code' => 'DRAIN_STOPPED',
+            'level' => 'critical',
+            'message' => 'Drain has not written for 120s — check PostgreSQL',
+            'recommendation' => '.leading dot, then a=b',
+        ], 'degraded', 'web-1:2407', 'https://dash.example/dashboard/app_1/health', 'https://dash.example');
+        $this->assertGreaterThan(998, strlen($html), 'the fixture no longer exercises the line limit');
+
+        $result = $this->converse(config: ['username' => ''], body: $html, isHtml: true);
+
+        $this->assertNull($result['error']);
+        $this->assertContains('Content-Transfer-Encoding: quoted-printable', $result['transcript']);
+
+        $data = array_search('DATA', $result['transcript'], true);
+        $lines = array_slice($result['transcript'], $data + 1);
+        $start = array_search('', $lines, true);
+        $end = array_search('.', $lines, true);
+        $body = array_slice($lines, $start + 1, $end - $start - 1);
+
+        foreach ($body as $line) {
+            $this->assertLessThanOrEqual(998, strlen($line), 'a body line is over the SMTP line limit');
+        }
+
+        $decoded = quoted_printable_decode(implode("\r\n", array_map(
+            static fn (string $line): string => str_starts_with($line, '..') ? substr($line, 1) : $line,
+            $body,
+        )));
+        $this->assertSame($html, $decoded);
     }
 
     // ─── Failure reporting ───────────────────────────────────────────

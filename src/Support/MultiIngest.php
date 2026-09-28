@@ -16,8 +16,8 @@ final class MultiIngest implements Ingest
     public function __construct(Ingest ...$ingests)
     {
         // Flatten + dedupe so re-wrapping can't multiply outbound writes.
-        // Without this, NightOwlAgentServiceProvider::booted() firing more than
-        // once with parallel_with_nightwatch=true compounds the chain (each
+        // Without this, NightOwlAgentServiceProvider::wireIngest() running more
+        // than once with parallel_with_nightwatch=true compounds the chain (each
         // wrap adds another path to the agent), producing N copies of every
         // event in the customer's DB.
         $flat = [];
@@ -69,6 +69,16 @@ final class MultiIngest implements Ingest
         }
 
         return 'oid:'.spl_object_id($ingest);
+    }
+
+    /**
+     * Whether $ingest is one of the targets, by identity. One passed to the
+     * constructor can be missing: the dedupe above drops an ingest aimed at
+     * the same place as one before it.
+     */
+    public function contains(Ingest $ingest): bool
+    {
+        return in_array($ingest, $this->ingests, true);
     }
 
     public function write(array $record): void

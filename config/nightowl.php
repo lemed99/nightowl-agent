@@ -98,6 +98,21 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Buffer Lock Wait
+    |--------------------------------------------------------------------------
+    |
+    | One agent owns a buffer file at a time. When another agent still holds
+    | it, a new agent waits up to this many seconds for it to exit before it
+    | refuses to start. This covers a restart or rolling deploy where the old
+    | agent is still stopping. The process stays up while it waits, so a
+    | process manager such as supervisord does not count a failed start for
+    | each attempt. 0 refuses at once. TOP-LEVEL key (shallow-merge rule).
+    |
+    */
+    'buffer_lock_wait' => (int) env('NIGHTOWL_BUFFER_LOCK_WAIT', 30),
+
+    /*
+    |--------------------------------------------------------------------------
     | Cache Key Templating
     |--------------------------------------------------------------------------
     |
@@ -362,6 +377,23 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | SSL Mode, When Set
+    |--------------------------------------------------------------------------
+    |
+    | NIGHTOWL_DB_SSLMODE as set, null when it is not. 'database.sslmode' above
+    | falls back to 'prefer', so it cannot say whether anyone set it. The drain
+    | connects with 'database.sslmode'. The artisan commands (through Laravel's
+    | `nightowl` connection) and the health alerts use a mode only when one was
+    | set, and otherwise leave it to libpq, which applies a PGSSLMODE
+    | environment variable or its own default ('prefer'). See
+    | NightOwl\Support\DatabaseSslMode. TOP-LEVEL on purpose (shallow-merge
+    | rule — see 'drain_connection').
+    |
+    */
+    'explicit_sslmode' => env('NIGHTOWL_DB_SSLMODE'),
+
+    /*
+    |--------------------------------------------------------------------------
     | Drain Connection — network timeouts
     |--------------------------------------------------------------------------
     |
@@ -503,6 +535,8 @@ return [
         'sqlite_path' => env('NIGHTOWL_AGENT_SQLITE_PATH', storage_path('nightowl/agent-buffer.sqlite')),
         'drain_interval_ms' => env('NIGHTOWL_DRAIN_INTERVAL_MS', 100),
         'drain_batch_size' => env('NIGHTOWL_DRAIN_BATCH_SIZE', 5000),
+        // Parallel drain processes, 1 to 16 (AsyncServer::MAX_DRAIN_WORKERS).
+        // Each one holds its own Postgres connection.
         'drain_workers' => env('NIGHTOWL_DRAIN_WORKERS', 1),
         // Poison-row isolation (Phase 2): when true, a batch failing with a
         // row-level data error (SQLSTATE class 22/23) is bisected to quarantine

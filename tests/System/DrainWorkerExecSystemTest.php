@@ -133,9 +133,19 @@ class DrainWorkerExecSystemTest extends TestCase
         <?php
         require {$autoloadExport};
 
+        use Illuminate\\Config\\Repository;
+        use Illuminate\\Container\\Container;
         use NightOwl\\Agent\\AsyncServer;
         use NightOwl\\Agent\\DrainWorker;
         use NightOwl\\Agent\\PayloadParser;
+
+        // listen() reads config() once its workers are forked (the health alert
+        // notifier). Without a repository that threw, and the agent now stops
+        // its workers on any error after the fork, so the stub would be
+        // signalled before it could write the marker.
+        \$container = new Container();
+        \$container->instance('config', new Repository([]));
+        Container::setInstance(\$container);
 
         \$marker = {$marker};
 

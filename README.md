@@ -22,7 +22,7 @@
 NightOwl Agent is an MIT-licensed Laravel package that:
 
 1. **Sits in front of [`laravel/nightwatch`](https://github.com/laravel/nightwatch)** — Laravel's official observability SDK. Nightwatch already does the hard part: instrumenting all 12 record types — requests, queries, jobs, exceptions, commands, cache events, mail, notifications, outgoing HTTP, scheduled tasks, logs, users. The agent receives those payloads over a local TCP socket.
-2. **Buffers them in a local SQLite WAL** — non-blocking ReactPHP ingest, ~13,400 payloads/s on a single instance.
+2. **Buffers them in a local SQLite WAL** with non-blocking ReactPHP ingest. An ingest-only benchmark accepted 13,400 payloads/s on a single instance; see the [throughput guide](https://docs.usenightowl.com/performance/throughput) for drain numbers.
 3. **Drains them into a PostgreSQL database you provision** via the COPY protocol. Telemetry never leaves your network.
 
 All tables are prefixed `nightowl_` and the schema is documented. You're free to query the data with `psql`, point Metabase at it, or build your own UI on top — Livewire, Next.js, whatever.
@@ -34,7 +34,7 @@ This package is fully usable on its own. Point it at a PostgreSQL database you c
 ```bash
 composer require nightowl/agent
 php artisan nightowl:install        # publishes config + runs migrations against your PG
-php artisan nightowl:agent          # starts the TCP/UDP/health daemon (ports 2407/2408/2409)
+php artisan nightowl:agent          # starts the agent: TCP ingest on 2407, health API on 2409
 ```
 
 Minimal `.env` (PostgreSQL credentials — that's it):
@@ -48,7 +48,9 @@ NIGHTOWL_DB_PASSWORD=nightowl
 NIGHTOWL_DB_SSLMODE=prefer
 ```
 
-You don't need to wire up Nightwatch's transport — the service provider automatically redirects its ingest to the local agent on `127.0.0.1:2407`. For a local-only setup you also don't need any token; the agent only enforces one if you set `NIGHTOWL_TOKEN` (useful when the agent listens on something other than loopback).
+You don't need to wire up Nightwatch's transport — the service provider automatically redirects its ingest to the local agent on `127.0.0.1:2407`. For a local-only setup you also don't need any token; the agent only enforces one if you set `NIGHTOWL_TOKEN` (useful when the agent listens on something other than loopback). Without a token the agent also sends nothing to NightOwl's platform (see [Data ownership & privacy](#data-ownership--privacy)).
+
+UDP ingest on port 2408 is off unless you set `NIGHTOWL_ENABLE_UDP=true`.
 
 Tables fill up. Run any SQL you want against them.
 
@@ -122,7 +124,7 @@ By default these migrations are **not** bundled into your app's `php artisan mig
 
 ## What you get out of the box
 
-These features run in the agent process. Postgres is the only thing it talks to.
+These features run in the agent process, against your Postgres.
 
 - **Exception fingerprinting** — `nightowl_exceptions` upserts into `nightowl_issues` keyed on `(group_hash, type, environment)`, so repeats roll up into one grouped issue.
 - **New-issue alerts** — when an issue is seen for the first time the drain worker fans it out to whatever you've configured in `nightowl_alert_channels`: Email (BYO SMTP), Webhook (HMAC-signed), Slack, Discord.
@@ -134,11 +136,11 @@ These features run in the agent process. Postgres is the only thing it talks to.
   php artisan nightowl:test-alert --channel="Ops email"
   ```
 
-  This matters more than it sounds. New-issue and reopened-issue alerts are sent **by the agent, from your server**, over its own SMTP and HTTP. If you use the hosted dashboard, its "Send test" button and its status-change alerts are sent by NightOwl's API from NightOwl's infrastructure. Two different senders reading the same channel row — so a green test in the dashboard does not prove your server can reach your SMTP relay. `nightowl:test-alert` is the one that does, and it prints the actual failure per channel rather than leaving it in the log.
+  This matters more than it sounds. New-issue and reopened-issue alerts, and agent health alerts, are sent **by the agent, from your server**, over its own SMTP and HTTP. If you use the hosted dashboard, its "Send test" button and its status-change alerts are sent by NightOwl's API from NightOwl's infrastructure. Two different senders reading the same channel row — so a green test in the dashboard does not prove your server can reach your SMTP relay. `nightowl:test-alert` is the one that does, and it prints the actual failure per channel rather than leaving it in the log.
 
   It ignores each channel's event filter on purpose, so a transport problem can't hide behind one, and tells you afterwards if a channel that passed has new-issue alerts switched off.
 
-  Two SMTP knobs, if your relay is fussy or far away — the credentials themselves stay in the dashboard:
+  SMTP settings, if your relay is fussy or far away. The credentials themselves stay in the dashboard:
 
   ```
   NIGHTOWL_SMTP_HELO=mail.example.com   # default: your machine's FQDN, else an address literal
@@ -171,7 +173,7 @@ These features run in the agent process. Postgres is the only thing it talks to.
                               └─────────────────────────┘
 ```
 
-> **13,400 payloads/s** on a single instance — ReactPHP non-blocking TCP ingest, SQLite WAL buffering, PostgreSQL `COPY` drain with `synchronous_commit = off`.
+> ReactPHP non-blocking TCP ingest, SQLite WAL buffering, PostgreSQL `COPY` drain with `synchronous_commit = off`. An ingest-only benchmark accepted **13,400 payloads/s** on a single instance. In a July 2026 load test, one drain worker wrote about **2,500 payloads/s** to PostgreSQL. Details in the [throughput guide](https://docs.usenightowl.com/performance/throughput).
 
 ## What the agent collects
 
@@ -197,9 +199,14 @@ P95s, N+1 detection, slow-query rankings, request timelines, etc. are queries yo
 
 ## Data ownership & privacy
 
-The agent writes telemetry **directly to your PostgreSQL database**. Zero request, query, or exception data leaves your infrastructure.
+The agent writes telemetry **directly to your PostgreSQL database**. Request, query, exception and log data is never sent to NightOwl.
 
-The only thing the agent _can_ send outbound, and only if you opt in to remote health reporting, is **agent/host health metadata** (ingest rates, buffer depth, drain lag, CPU/memory), so a remote backend can warn you when the agent is unhealthy.
+When the agent has a token (`NIGHTOWL_TOKEN`, or `NIGHTWATCH_TOKEN` as a fallback), it also sends two things to the NightOwl platform at `NIGHTOWL_API_URL` (default `https://api.usenightowl.com`):
+
+- **A health report every 30 seconds** by default: the agent's host name, process id, version and uptime, the name of its PostgreSQL database, ingest and drain rates, buffer depth, PostgreSQL latency, CPU and memory, the active diagnoses, and counts of requests, 5xx responses, exceptions and open issues. This is what the dashboard's Agent Health page shows. `NIGHTOWL_HEALTH_REPORT_ENABLED=false` turns it off.
+- **An hourly sample of table statistics** about the `nightowl_*` tables (row counts, sizes, scan and vacuum counters, server settings), read from PostgreSQL's catalog views. `NIGHTOWL_TABLE_STATS=false` turns it off.
+
+Without a token, neither is sent. The alerts the agent sends go straight to the channels you configure (your SMTP server, Slack, Discord, your webhooks).
 
 The schema is documented and stable, so your data stays usable even if you stop running the agent.
 

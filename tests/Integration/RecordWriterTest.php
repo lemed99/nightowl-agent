@@ -2149,21 +2149,54 @@ class RecordWriterTest extends TestCase
         $this->assertSame(1, (int) $row['misses']);
         $this->assertSame(1, (int) $row['writes']);
         $this->assertSame(1, (int) $row['deletes']);
-        $this->assertSame(1, (int) $row['fails']);
+        // fails is every failure spelling: fail + write_fail + delete_fail.
+        $this->assertSame(3, (int) $row['fails']);
         $this->assertSame(1, (int) $row['delete_failures']);
         // write_failures includes 'write_fail' AND 'fail'.
         $this->assertSame(2, (int) $row['write_failures']);
         $this->assertSame(1500, (int) $row['total_duration']);
     }
 
+    /**
+     * The Nightwatch SDK's own spellings (CacheEventSensor: write,
+     * write-failure, delete, delete-failure). Writes, both failure counters
+     * and fails used to read 0 for every real app because the counters only
+     * knew the legacy names.
+     */
+    public function test_cache_rollup_counts_sdk_event_types(): void
+    {
+        $mk = fn (string $trace, string $type): array => $this->sim->makeCacheEvent([
+            'trace_id' => $trace, 'type' => $type, 'key' => 'sdk:key', 'store' => 'redis', 'duration' => 10,
+        ]);
+
+        $this->writer->write([
+            $mk('sdk-1', 'hit'), $mk('sdk-2', 'miss'),
+            $mk('sdk-3', 'write'), $mk('sdk-4', 'write'), $mk('sdk-5', 'write-failure'),
+            $mk('sdk-6', 'delete'), $mk('sdk-7', 'delete-failure'), $mk('sdk-8', 'delete-failure'),
+        ]);
+
+        $row = self::$pdo->query(
+            "SELECT * FROM nightowl_cache_rollups WHERE \"key\" = 'sdk:key' AND store = 'redis'"
+        )->fetch(PDO::FETCH_ASSOC);
+
+        $this->assertSame(8, (int) $row['call_count']);
+        $this->assertSame(1, (int) $row['hits']);
+        $this->assertSame(1, (int) $row['misses']);
+        $this->assertSame(2, (int) $row['writes']);
+        $this->assertSame(1, (int) $row['deletes']);
+        $this->assertSame(1, (int) $row['write_failures']);
+        $this->assertSame(2, (int) $row['delete_failures']);
+        $this->assertSame(3, (int) $row['fails'], 'fails = write_failures + delete_failures');
+    }
+
     public function test_cache_rollup_drift_matches_raw(): void
     {
-        $types = ['hit', 'miss', 'set', 'forget', 'fail', 'write_fail'];
+        $types = ['hit', 'miss', 'set', 'forget', 'fail', 'write_fail', 'write', 'delete', 'write-failure', 'delete-failure', 'put', 'delete_fail'];
         $records = [];
         for ($i = 1; $i <= 24; $i++) {
             $records[] = $this->sim->makeCacheEvent([
                 'trace_id' => "cd-{$i}",
-                'type' => $types[$i % 6],
+                'type' => $types[$i % count($types)],
                 'key' => 'k:'.($i % 3),
                 'store' => $i % 2 === 0 ? 'redis' : 'file',
                 'duration' => $i * 10,
@@ -2176,18 +2209,29 @@ class RecordWriterTest extends TestCase
         // written by the PHP fold (_key_pattern), the re-aggregation uses the
         // SQL expression over the same raw rows. They must agree exactly, or
         // backfill would silently re-key what the drain wrote.
+        // Every counter's SQL form (what backfill runs) against the PHP form
+        // the drain just folded, so a spelling in one list and not the other
+        // shows up here.
+        $counters = RollupSpecs::cacheEvents()->counters;
+        $rawCounters = implode(', ', array_map(
+            static fn (string $col, array $c): string => "SUM(CASE WHEN {$c['sql']} THEN 1 ELSE 0 END) AS {$col}",
+            array_keys($counters),
+            $counters,
+        ));
+        $rollupCounters = implode(', ', array_map(static fn (string $col): string => "SUM({$col}) AS {$col}", array_keys($counters)));
+
         $raw = self::$pdo->query(
             "SELECT COALESCE(key_pattern, \"key\", '') AS k, COALESCE(store, '') AS s, COUNT(*) AS c,
-                    SUM(CASE WHEN event_type = 'hit' THEN 1 ELSE 0 END) AS h,
-                    SUM(CASE WHEN event_type IN ('write_fail', 'set_fail', 'put_fail', 'fail') THEN 1 ELSE 0 END) AS wf,
+                    {$rawCounters},
                     COALESCE(SUM(duration), 0) AS sd
              FROM nightowl_cache_events GROUP BY 1, 2 ORDER BY 1, 2"
         )->fetchAll(PDO::FETCH_ASSOC);
 
         $rollup = self::$pdo->query(
-            'SELECT "key" AS k, store AS s, SUM(call_count) AS c, SUM(hits) AS h,
-                    SUM(write_failures) AS wf, SUM(total_duration) AS sd
-             FROM nightowl_cache_rollups GROUP BY 1, 2 ORDER BY 1, 2'
+            "SELECT \"key\" AS k, store AS s, SUM(call_count) AS c,
+                    {$rollupCounters},
+                    SUM(total_duration) AS sd
+             FROM nightowl_cache_rollups GROUP BY 1, 2 ORDER BY 1, 2"
         )->fetchAll(PDO::FETCH_ASSOC);
 
         $this->assertEquals($raw, $rollup, 'Cache rollup must match a raw re-aggregation');
@@ -2487,6 +2531,38 @@ class RecordWriterTest extends TestCase
 
         $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetch(PDO::FETCH_ASSOC);
         $this->assertSame(0, (int) $issue['users_count'], 'Null users should not be counted');
+    }
+
+    public function test_exception_issue_users_count_ignores_guests_across_batches(): void
+    {
+        // Guests arrive with user '' (not null) and are stored that way. The first batch inserts the issue from the
+        // batch's own user set, which skips ''; every later batch recounts from the raw rows, which used to count ''
+        // as one user, so a guest-only issue read "1 user" from its second batch on.
+        $baseRecord = [
+            'class' => 'App\\Exceptions\\GuestUserTest',
+            'file' => 'app/GuestUser.php',
+            'line' => 51,
+        ];
+        $fingerprint = md5('App\\Exceptions\\GuestUserTest'.'|'.'0'.'|'.'app/GuestUser.php'.'|'.'51');
+
+        $this->writer->write([
+            $this->sim->makeException(array_merge($baseRecord, ['trace_id' => 'gu-1', 'user' => ''])),
+        ]);
+        $this->writer->write([
+            $this->sim->makeException(array_merge($baseRecord, ['trace_id' => 'gu-2', 'user' => ''])),
+            $this->sim->makeException(array_merge($baseRecord, ['trace_id' => 'gu-3', 'user' => ''])),
+        ]);
+
+        $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame(3, (int) $issue['occurrences_count']);
+        $this->assertSame(0, (int) $issue['users_count'], 'Guests must not count as a user');
+
+        // A signed-in user afterwards counts once.
+        $this->writer->write([
+            $this->sim->makeException(array_merge($baseRecord, ['trace_id' => 'gu-4', 'user' => 'user_A'])),
+        ]);
+        $issue = self::$pdo->query("SELECT * FROM nightowl_issues WHERE group_hash = '{$fingerprint}'")->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame(1, (int) $issue['users_count']);
     }
 
     // ─── Auto-reopen on recurrence ─────────────────────────

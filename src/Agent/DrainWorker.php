@@ -258,6 +258,12 @@ final class DrainWorker
         pcntl_signal(SIGTERM, fn () => $this->running = false);
         pcntl_signal(SIGINT, fn () => $this->running = false);
 
+        // The agent that started this worker. An agent that dies without
+        // stopping its workers (SIGKILL, the OOM killer) leaves them re-parented
+        // and still draining, next to the workers of the agent a supervisor
+        // starts in its place: the same rows read twice. See parentIsGone().
+        $agentPid = self::startingParentPid();
+
         // Liveness channel to the parent. Stamped at every step boundary inside a
         // batch, unlike the drain metrics file, which only advances BETWEEN batches
         // and so freezes for the whole of any batch — slow or wedged alike.
@@ -322,6 +328,13 @@ final class DrainWorker
         $lastTableStats = 0;
 
         while ($this->running) {
+            if (self::parentIsGone($agentPid)) {
+                // No final drain: the rows stay in the buffer, and the next
+                // agent's workers may already be reading them.
+                error_log("[NightOwl Drain] {$workerLabel} stopping: the agent that started it (pid {$agentPid}) is gone. Undrained rows stay in the buffer for the next agent.");
+                exit(0);
+            }
+
             $drained = $this->drainBatch($buffer, $writer);
 
             if ($drained) {
@@ -331,14 +344,7 @@ final class DrainWorker
             // Cleanup + WAL checkpoint on the configured cadence (default 60s)
             if (time() - $lastCleanup >= $this->checkpointIntervalSeconds) {
                 try {
-                    $buffer->cleanup(300);
-                    // Prune dead-letter rows regardless of whether quarantine is
-                    // currently enabled. Rows dead-lettered while it was on must still
-                    // be reclaimed after the retention window if the flag is later
-                    // turned off — otherwise they are orphaned forever (never
-                    // re-drained: fetchPending selects synced=0; never cleaned:
-                    // cleanup targets synced=1). A no-op when no synced=-1 rows exist.
-                    $buffer->pruneQuarantined($this->quarantineRetentionSeconds);
+                    $this->sweepBuffer($buffer);
 
                     // Every tick: strip an interrupted nightowl:partition run's
                     // leftovers. A stranded {t}_hist_ck rejects EVERY drain row
@@ -391,7 +397,7 @@ final class DrainWorker
                         $this->rollupRepairDebt = $debt;
                     }
 
-                    $this->checkpointWithEscalation($buffer);
+                    $this->checkpointBuffer($buffer);
                 } catch (\Throwable $e) {
                     error_log("[NightOwl Drain] Cleanup error: {$e->getMessage()}");
                 }
@@ -465,6 +471,76 @@ final class DrainWorker
         }
 
         exit(0);
+    }
+
+    /**
+     * Whether this worker looks after the SQLite buffer file itself: deleting
+     * drained rows, the WAL checkpoint and handing free pages back.
+     *
+     * One buffer, one caretaker. The work is per file, not per worker, and
+     * with several workers every one of them used to repeat it each tick,
+     * each pass taking the write lock the others' claims and marks wait on.
+     * Worker 0 always exists (worker ids run 0..N-1) and is respawned when it
+     * dies, so the work still happens with any worker count, and a single
+     * worker behaves exactly as before.
+     */
+    private function ownsBufferHousekeeping(): bool
+    {
+        return $this->workerId === 0;
+    }
+
+    /** Delete drained and expired dead-letter rows. Worker 0 only. */
+    private function sweepBuffer(SqliteBuffer $buffer): void
+    {
+        if (! $this->ownsBufferHousekeeping()) {
+            return;
+        }
+
+        $buffer->cleanup(300);
+        // Prune dead-letter rows regardless of whether quarantine is
+        // currently enabled. Rows dead-lettered while it was on must still
+        // be reclaimed after the retention window if the flag is later
+        // turned off — otherwise they are orphaned forever (never
+        // re-drained: fetchPending selects synced=0; never cleaned:
+        // cleanup targets synced=1). A no-op when no synced=-1 rows exist.
+        $buffer->pruneQuarantined($this->quarantineRetentionSeconds);
+    }
+
+    /** WAL checkpoint and page reclaim (checkpointWithEscalation()). Worker 0 only. */
+    private function checkpointBuffer(SqliteBuffer $buffer): void
+    {
+        if (! $this->ownsBufferHousekeeping()) {
+            return;
+        }
+
+        $this->checkpointWithEscalation($buffer);
+    }
+
+    /**
+     * The parent pid to watch, or 0 when there is none worth watching: without
+     * posix, or when the parent is already pid 1 (an agent running as a
+     * container's init, whose death ends the container anyway; or a worker
+     * orphaned before it got this far, which cannot tell from here).
+     */
+    private static function startingParentPid(): int
+    {
+        if (! function_exists('posix_getppid')) {
+            return 0;
+        }
+
+        $parent = posix_getppid();
+
+        return $parent > 1 ? $parent : 0;
+    }
+
+    /**
+     * Whether the watched parent has died. A process's parent pid only changes
+     * when that parent exits and the kernel re-parents it, so any change is the
+     * signal; comparing against 1 would miss a subreaper (tini, systemd --user).
+     */
+    private static function parentIsGone(int $watchedPid): bool
+    {
+        return $watchedPid !== 0 && posix_getppid() !== $watchedPid;
     }
 
     /**
@@ -625,7 +701,9 @@ final class DrainWorker
             // backlog is fully drained and do it once. Afterwards the file is in
             // INCREMENTAL mode and the cheap path below handles it from then on.
             if ($buffer->needsCompaction()) {
-                if ($buffer->pendingCount() > 0) {
+                // Backlog, not pending: another worker's claimed batch is
+                // still waiting to be marked, and VACUUM would lock it out.
+                if ($buffer->backlogCount() > 0) {
                     return;
                 }
 

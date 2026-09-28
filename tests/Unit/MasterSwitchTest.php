@@ -4,6 +4,7 @@ namespace NightOwl\Tests\Unit;
 
 use Illuminate\Config\Repository;
 use Illuminate\Foundation\Application;
+use Illuminate\Support\ServiceProvider;
 use Laravel\Nightwatch\Core;
 use NightOwl\NightOwlAgentServiceProvider;
 use NightOwl\Support\MultiIngest;
@@ -53,11 +54,26 @@ final class MasterSwitchTest extends TestCase
     }
 
     /**
+     * The swap runs before any provider's boot(), so a boot() that turns the
+     * switch off is only seen in booted(). NightOwl must still end up off.
+     */
+    public function test_switch_turned_off_in_a_providers_boot_puts_the_ingest_back(): void
+    {
+        $core = $this->bootProviderWithSwitch(true, disableInBoot: true);
+
+        $this->assertSame(
+            'SENTINEL',
+            $core->ingest,
+            'nightowl.enabled set to false in a provider\'s boot() must leave Core::$ingest as the SDK had it.'
+        );
+    }
+
+    /**
      * Boot a minimal application with the provider registered, returning the
      * stand-in Core whose public $ingest the booted hook may (or may not)
      * rebind depending on the switch.
      */
-    private function bootProviderWithSwitch(bool $enabled): object
+    private function bootProviderWithSwitch(bool $enabled, bool $disableInBoot = false): object
     {
         $app = new Application(sys_get_temp_dir().'/nightowl-master-switch-test');
         $app->instance('config', new Repository([
@@ -78,6 +94,17 @@ final class MasterSwitchTest extends TestCase
         $app->instance(Core::class, $core);
 
         $app->register(new NightOwlAgentServiceProvider($app));
+
+        if ($disableInBoot) {
+            $app->register(new class($app) extends ServiceProvider
+            {
+                public function boot(): void
+                {
+                    config(['nightowl.enabled' => false]);
+                }
+            });
+        }
+
         $app->boot();
 
         return $core;

@@ -1026,8 +1026,11 @@ final class AlertNotifier
         $name = $this->issueName($group);
         $group['view_url'] = $this->buildViewUrl($group['issue_id'] ?? null);
 
-        $subjectPrefix = $this->headerStyle($prefix, $issueType)['label'];
-        $body = EmailTemplate::renderIssue($appName, $group, $issueType, $this->frontendUrl);
+        // The event goes to the template too: without it the badge read "New
+        // Issue" under a "Reopened Issue" subject.
+        $style = $this->headerStyle($prefix, $issueType);
+        $subjectPrefix = $style['label'];
+        $body = EmailTemplate::renderIssue($appName, $group, $issueType, $this->frontendUrl, $style['event']);
 
         // Config extraction, header sanitising and the incomplete-config check
         // all live in SmtpClient — the two notifiers had drifted on all three.

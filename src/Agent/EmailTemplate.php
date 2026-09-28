@@ -6,7 +6,8 @@ namespace NightOwl\Agent;
  * Fork-safe HTML email template builder.
  *
  * Produces branded NightOwl emails via string concatenation (no Blade).
- * Used by AlertNotifier (forked drain worker) for issue alerts.
+ * Used by AlertNotifier (forked drain worker) for issue alerts and by
+ * HealthAlertNotifier (forked health-alert child) for agent health alerts.
  *
  * Renders are tested against Gmail (strips SVG + position:absolute), Outlook desktop
  * (drops rgba + span padding), Apple Mail, and mobile clients. The output matches
@@ -21,8 +22,9 @@ final class EmailTemplate
      * @param  array<string, mixed>  $group        Enriched group data from AlertNotifier
      * @param  string                $issueType    'exception' or 'performance'
      * @param  string                $frontendUrl  Frontend base URL (for logo asset)
+     * @param  string                $event        'issue.new' or 'issue.reopened' — picks the badge
      */
-    public static function renderIssue(string $appName, array $group, string $issueType = 'exception', string $frontendUrl = ''): string
+    public static function renderIssue(string $appName, array $group, string $issueType = 'exception', string $frontendUrl = '', string $event = 'issue.new'): string
     {
         $e = fn (string $s): string => htmlspecialchars($s, ENT_QUOTES | ENT_HTML5, 'UTF-8');
 
@@ -49,21 +51,33 @@ final class EmailTemplate
         $isException = $issueType === 'exception';
         $subtypeLabel = self::subtypeLabel($subtype);
 
+        // Built unescaped, then escaped once: the preheader goes through
+        // layout()'s own escaping, so feeding it the escaped title showed
+        // "&amp;" in the inbox preview for any name carrying an ampersand.
         if ($isException) {
-            $titleText = 'Exception: ' . $e($name);
+            $plainTitle = 'Exception: ' . $name;
         } elseif ($thresholdMs !== null) {
-            $titleText = $e($name) . ' exceeded ' . number_format($thresholdMs) . 'ms threshold';
+            $plainTitle = $name . ' exceeded ' . number_format($thresholdMs) . 'ms threshold';
         } elseif ($subtype === 'worker_saturation') {
             // The name IS the event ("Worker saturation") — a "Slow Worker
             // Saturation:" prefix would be nonsense. Details ride the message.
-            $titleText = $e($name);
+            $plainTitle = $name;
         } else {
-            $titleText = 'Slow ' . $e($subtypeLabel) . ': ' . $e($name);
+            $plainTitle = 'Slow ' . $subtypeLabel . ': ' . $name;
         }
+        $titleText = $e($plainTitle);
 
         // Solid hex equivalents of rgba(...,0.15) composited over the #18181b card
         // so Outlook desktop (which drops rgba) still renders the tinted pill.
-        if ($isException) {
+        // Matches nightowl-api's issue.blade.php: a reopen gets the orange
+        // "Reopened" badge whatever the issue type; only a NEW performance
+        // issue gets the amber "Performance Alert" one.
+        if ($event === 'issue.reopened') {
+            $badgeBg = '#382216';
+            $badgeColor = '#fb923c';
+            $badgeBorder = '#ea580c';
+            $badgeLabel = 'Reopened';
+        } elseif ($isException) {
             $badgeBg = '#351a1a';
             $badgeColor = '#f87171';
             $badgeBorder = '#dc2626';
@@ -137,7 +151,18 @@ final class EmailTemplate
                 $sections .= self::section('Environment', self::kvTable($envRows), '20px');
             }
         } else {
-            $sections .= self::textSection($subtypeLabel, $e($name), '18px');
+            // Skipped when the name only restates the subtype ("Worker
+            // saturation" under a "Worker Saturation" label) — the title
+            // already says it.
+            if (strcasecmp($name, $subtypeLabel) !== 0) {
+                $sections .= self::textSection($subtypeLabel, $e($name), '18px');
+            }
+
+            // Threshold issues carry no message; checks like worker saturation
+            // put their numbers here and nowhere else.
+            if ($message !== '') {
+                $sections .= self::textSection('Message', $e($message), '18px');
+            }
 
             $perfRows = [];
             if ($durationMs !== null) {
@@ -154,26 +179,111 @@ final class EmailTemplate
 
             if (! empty($perfRows)) {
                 $sections .= self::section('Performance', self::kvTable($perfRows), '20px');
-            } else {
+            } elseif ($message === '') {
                 $sections .= self::textSection('Performance', 'Exceeded configured threshold.', '20px');
             }
         }
 
         // View issue button
-        $cta = '';
-        if ($viewUrl !== null) {
-            $cta = '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
-                . '<tr><td align="center">'
-                . '<a href="' . $e($viewUrl) . '" style="display:block;background-color:#00af55;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;padding:12px 32px;border-radius:2px;letter-spacing:0.3px;text-align:center;">View issue</a>'
-                . '</td></tr></table>';
-        }
+        $cta = $viewUrl !== null ? self::button($viewUrl, 'View issue') : '';
 
-        $preheader = $titleText . ($occurrences > 0 ? ' — ' . number_format($occurrences) . ' occurrences' : '');
+        $preheader = $plainTitle . ($occurrences > 0
+            ? ' — ' . number_format($occurrences) . ($occurrences === 1 ? ' occurrence' : ' occurrences')
+            : '');
 
         return self::layout(
             $titleText,
             $preheader,
             $header . $details . $sections . $cta,
+            $e($appName),
+            $frontendUrl,
+        );
+    }
+
+    /**
+     * Render an agent health alert email (a diagnosis raised or cleared).
+     *
+     * Same card, badge and button as renderIssue so a health alert reads as
+     * part of the same family. The link goes to the app's Agent Health page;
+     * with no dashboard URL configured there is nothing to link to and the
+     * button is left out.
+     *
+     * @param  array<string, mixed>  $diagnosis  {code, level, message, recommendation}
+     * @param  string                $variant    'degraded' or 'recovered'
+     * @param  string                $instance   Agent instance id, '' when unknown
+     * @param  string|null           $healthUrl  Agent Health page URL, null to omit the button
+     * @param  string                $frontendUrl  Frontend base URL (for logo asset)
+     */
+    public static function renderHealth(
+        string $appName,
+        array $diagnosis,
+        string $variant,
+        string $instance = '',
+        ?string $healthUrl = null,
+        string $frontendUrl = '',
+    ): string {
+        $e = fn (string $s): string => htmlspecialchars($s, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+        $code = (string) ($diagnosis['code'] ?? 'UNKNOWN');
+        $level = (string) ($diagnosis['level'] ?? '');
+        $message = (string) ($diagnosis['message'] ?? '');
+        $recommendation = (string) ($diagnosis['recommendation'] ?? '');
+        $recovered = $variant === 'recovered';
+
+        // Same solid-hex palette as the issue badges: resolved green, new-issue
+        // red for critical, performance amber for anything milder.
+        if ($recovered) {
+            [$bg, $color, $border] = ['#142f21', '#4ade80', '#16a34a'];
+            $badgeLabel = 'Recovered';
+            $pillLabel = 'Resolved';
+        } elseif ($level === 'critical') {
+            [$bg, $color, $border] = ['#351a1a', '#f87171', '#dc2626'];
+            $badgeLabel = 'Agent Health Alert';
+            $pillLabel = 'Critical';
+        } else {
+            [$bg, $color, $border] = ['#392c16', '#fbbf24', '#f59e0b'];
+            $badgeLabel = 'Agent Health Alert';
+            $pillLabel = $level !== '' ? ucfirst($level) : 'Warning';
+        }
+
+        $badgeCell = '<td style="background-color:' . $bg . ';color:' . $color
+            . ';font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;'
+            . 'padding:4px 12px;border-radius:2px;border-left:3px solid ' . $border . ';">'
+            . $badgeLabel . '</td>';
+        $pillCell = '<td style="background-color:' . $bg . ';color:' . $color
+            . ';font-size:12px;font-weight:600;padding:4px 10px;border-radius:2px;">' . $e($pillLabel) . '</td>';
+
+        $header = '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px;">'
+            . '<tr><td align="center" style="padding-bottom:14px;">' . self::pillTable($badgeCell) . '</td></tr>'
+            . '<tr><td align="center" style="font-size:18px;font-weight:700;color:#fafafa;line-height:1.4;padding-bottom:12px;word-break:break-word;">' . $e($code) . '</td></tr>'
+            . '<tr><td align="center">' . self::pillTable($pillCell) . '</td></tr>'
+            . '</table>';
+
+        $detailRows = ['Application' => $e($appName)];
+        if ($instance !== '') {
+            $detailRows['Instance'] = $e($instance);
+        }
+        $body = self::section('Details', self::kvTable($detailRows), '18px');
+
+        if ($message !== '') {
+            $body .= self::textSection('Message', $e($message), $recovered || $recommendation === '' ? '20px' : '18px');
+        }
+        if (! $recovered && $recommendation !== '') {
+            $body .= self::textSection('Recommendation', $e($recommendation), '20px');
+        }
+
+        $cta = $healthUrl !== null ? self::button($healthUrl, 'View agent health') : '';
+
+        $plainTitle = ($recovered ? 'Recovered: ' : 'Agent Health Alert: ') . $code;
+        $preheader = $recovered ? $plainTitle : $code . ($message !== '' ? ': ' . $message : '');
+        if (mb_strlen($preheader) > 200) {
+            $preheader = mb_substr($preheader, 0, 200) . '...';
+        }
+
+        return self::layout(
+            $e($plainTitle),
+            $preheader,
+            $header . $body . $cta,
             $e($appName),
             $frontendUrl,
         );
@@ -208,6 +318,19 @@ final class EmailTemplate
         return '<table role="presentation" align="center" border="0" cellpadding="0" cellspacing="0" style="margin:0 auto;"><tr>'
             . $cells
             . '</tr></table>';
+    }
+
+    /**
+     * Full-width call-to-action link, the "View issue" button's style.
+     */
+    private static function button(string $url, string $label): string
+    {
+        $href = htmlspecialchars($url, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+        return '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+            . '<tr><td align="center">'
+            . '<a href="' . $href . '" style="display:block;background-color:#00af55;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;padding:12px 32px;border-radius:2px;letter-spacing:0.3px;text-align:center;">' . $label . '</a>'
+            . '</td></tr></table>';
     }
 
     /**

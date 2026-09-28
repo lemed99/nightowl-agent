@@ -24,7 +24,8 @@ Laravel package installed in customer apps. Receives telemetry from `laravel/nig
 ### SQLite (Buffer Layer)
 - PDO + WAL mode, NORMAL sync, 64MB cache, 256MB mmap
 - `appendRaw($json)` zero-copy insert (raw wire JSON straight into SQLite, no re-encode)
-- Checkpoints: PASSIVE (non-blocking) → TRUNCATE (blocking, >200MB)
+- Checkpoints: PASSIVE (non-blocking) → TRUNCATE (blocking, >200MB). Cleanup, checkpoint and page reclaim run on drain worker 0 only (one file, one caretaker)
+- One agent per buffer: an flock on `<buffer>.lock` (`SqliteBuffer::acquireOwnerLock`). A second agent waits up to `NIGHTOWL_BUFFER_LOCK_WAIT` (30s) for it, then refuses. Forked alert/prime children close their inherited copy (`AsyncServer::setBufferLock`), so they never hold the buffer after the agent dies. `nightowl:agent` writes a `.gitignore` (`*`, `!.gitignore`) into storage/nightowl and into a custom buffer dir it created inside the app (`Support\BufferDirectory`), never replacing an existing one
 - Multi-worker claiming: `claimBatch()` atomically sets `synced=100+workerId`
 
 ### PostgreSQL (Drain Target)
@@ -62,7 +63,7 @@ Laravel package installed in customer apps. Receives telemetry from `laravel/nig
 **New since Apr 2026.** Agent can run in parallel with `laravel/nightwatch` so customers can trial NightOwl without ripping out existing monitoring.
 
 - `NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=true` enables dual ingestion
-- `NightOwlAgentServiceProvider` boot hook detects `Core::ingest` binding and wraps it with `Support\MultiIngest` (fan-out to both Nightwatch hosted ingest and NightOwl TCP agent)
+- `NightOwlAgentServiceProvider::wireIngest()` swaps `Core::$ingest` for `Support\MultiIngest` (fan-out to both Nightwatch hosted ingest and NightOwl TCP agent) in `$app->booting()`, before any provider's `boot()`, so boot-time records reach NightOwl; records the SDK buffered earlier (in `register()`) are handed over (moved alone, copied in parallel; needs `RecordsBuffer::all()`, absent on 1.26). `booted()` is the fallback for late registration and re-checks the settings a `boot()` may have changed: `nightowl.enabled` off puts the SDK's ingest back (its buffered records returned to it), changed port/token/ingest_uri/parallel/capture rebuilds the ingest
 - **Both** modes go through `MultiIngest` — single-agent mode wraps a lone ingest for its fail-open path, so an unreachable agent socket can never throw inside a host request. Exception: `ping()` deliberately rethrows (`nightwatch:status` reads reachability off it); absorbed failures go to `error_log` **and** `Nightwatch::handleUnrecoverableExceptionsUsing()`
 - `laravel/nightwatch ^1.26` is now a hard require (was `suggest`), enabling one-step install
 
@@ -80,8 +81,8 @@ src/Agent/
   RecordWriter.php       — PG writer: COPY (10 tables) + INSERT (2 upsert), sync_commit=off
   PayloadParser.php      — Wire protocol, gzip, token extraction
   AlertNotifier.php      — Issue alerts: rich Slack blocks, Discord embeds, branded HTML email
-  HealthAlertNotifier.php — Agent health alerts (DRAIN_STOPPED, PG_LATENCY_CRITICAL, etc.)
-  SmtpClient.php         — The agent's SMTP, shared by both notifiers (they had a private copy each, drifted on three points). RFC-conformant HELO (FQDN or address literal — a bare `nightowl` is refused by Exchange/O365/Postfix), EHLO re-issued after STARTTLS, AUTH chosen from what's advertised, Date + Message-ID + dot-stuffing. Throws on incomplete config instead of returning
+  HealthAlertNotifier.php — Agent health alerts (DRAIN_STOPPED, PG_LATENCY_CRITICAL, etc.). Saves the channel list to `<buffer>.alert-channels.json` (0600, plaintext secrets) and falls back to it when the DB is down; AsyncServer primes it 5s after start and every 15 min (`primeChannels()`, forked child, gives way to an alert round). Connects with `NIGHTOWL_DB_SSLMODE` only when it is set (`DatabaseSslMode::explicit()`; otherwise libpq applies PGSSLMODE), a 5s connect bound (`PDO::ATTR_TIMEOUT`; a DSN connect_timeout is overridden by PDO_PGSQL) and a 5s `SET LOCAL statement_timeout` per channel query. AsyncServer's SIGALRM ceiling (`ALERT_CHILD_MAX_SECONDS`, 180s) ends an alert child stuck on a database that went silent
+  SmtpClient.php         — The agent's SMTP, shared by both notifiers (they had a private copy each, drifted on three points). RFC-conformant HELO (FQDN or address literal — a bare `nightowl` is refused by Exchange/O365/Postfix), EHLO re-issued after STARTTLS, AUTH chosen from what's advertised, Date + Message-ID + dot-stuffing, quoted-printable body, non-ASCII Subject/From name as RFC 2047 encoded-words. Throws on incomplete config instead of returning
   WebhookClient.php      — The agent's webhook POST, shared by both notifiers. READS the response: non-2xx raises with the status + the receiver's first 200 bytes (it used to `@file_get_contents` and discard, so a revoked webhook looked exactly like a delivered alert). URLs redacted to `host/…` in errors — a Slack/Discord path IS the credential
   EmailTemplate.php      — Branded email rendering (fallback logo if FRONTEND_URL unset)
   Server.php             — Sync fallback (stream_select)
@@ -95,6 +96,7 @@ src/Support/
   PayloadCapture.php / CapturingIngest.php — NightOwl's own request-payload + response-body capture (`capture` config key). Nightwatch hard-codes payload capture to 500s (RequestSensor, final/@internal) and has no response bodies, so CapturingIngest wraps ONLY the NightOwl-bound ingest (never Nightwatch's own in parallel mode) and rewrites `t=request` records at write(). Inputs: the RequestRecord via Core::redactRequests() (runs in the same call that writes the record → exact pairing, and read at write time so customer redactRequests edits are honored) + the Response via RequestHandled; both cleared on use (Octane), method+status must agree. Filters (status codes/classes, IgnoredRoutes patterns) set-but-all-invalid → capture NOTHING. Hard ~4 MB wire ceiling → TOO_LARGE marker (AsyncServer refuses >10 MB frames = whole request lost). Fails open. Proven against the REAL Nightwatch in PayloadCaptureEndToEndTest
   IgnoredRoutes.php      — Glob matching for nightowl.ignore_routes (path/name/action, leading slash optional both sides)
   QueryHistogram.php     — Frozen √2-spaced duration bin edges + bin assignment for rollups; MUST stay byte-identical to nightowl-api's App\Support\QueryHistogram (checksum-guarded both sides)
+  OutgoingHost.php       — normalize(): reduces an outgoing_request threshold target to the host the SDK records (`$uri->getHost()`: lowercase, no scheme/userinfo/port/path; IPv6 bracketed). The Thresholds dialog saves the rollup's scheme+host (`https://api.stripe.com`), which the old strict compare never matched. getThresholds() stores each host rule's normalized `host` once per load; findThreshold() normalizes the record host and compares hosts for outgoing_request only, every other type exactly. Mirrored by nightowl-api's App\Support\PerformanceThresholds::normalizeHost(): keep the two in step, their test tables are identical row for row (OutgoingHostTest / PerformanceThresholdsHostTest)
   RollupSpec.php / RollupSpecs.php — Declarative per-type rollup config (group cols, counters w/ PHP predicate + SQL condition, representatives, duration/histogram flags) driving RecordWriter::writeRollup + BackfillRollupsCommand. One spec each for queries/requests/jobs/outgoing/cache.
 src/Commands/
   AgentCommand.php        — nightowl:agent [--driver=async|sync]; auto-migrates at startup when the nightowl-DB history is behind (schema sync via nightowl:migrate --no-backfill PRE-listen in a deadline-killed child process — NIGHTOWL_AUTO_MIGRATE_TIMEOUT — so drain children see new rollup tables and a tenant-DB lock can never hold the ingest port unbound; backfill reconciliation detached to background with a completion marker retried each boot, gated by NIGHTOWL_AUTO_BACKFILL and paced by measured lock-hold time so it can't starve the drain; warn-and-continue on failure; warns only under NIGHTOWL_AUTO_MIGRATE=false; skipped under run_migrations ride-along)
@@ -149,7 +151,7 @@ src/Commands/
 - Threshold checks extend beyond requests → queries, cache, mail, notifications, outgoing_requests
 - Worker saturation alert (`RecordWriter::checkWorkerSaturation`, called from the drain cleanup tick): fires a `performance` issue (subtype `worker_saturation`) when avg request concurrency — `SUM(total_duration)` per completed minute from `nightowl_request_rollups` — holds ≥ `percent`% of the env's `http_workers` count for `sustained_minutes` consecutive minutes. Config = tenant settings keys `http_workers` + `worker_saturation` (same cached 30s updated_at poll as thresholds, via the generic `getCachedSetting`). Own-environment only (shared tenant DBs would double-alert otherwise); advisory-locked to one evaluation per tenant per minute. `threshold_ms`/`triggered_duration_ms` stay NULL by design — alert formatters suffix them with "ms"; the numbers ride `exception_message` / the group `message`.
 - Raw HTTP dispatchers (AlertNotifier, HealthAlertNotifier `httpPost`) reject non-http(s) schemes before `file_get_contents` — PHP's URL wrappers otherwise allow `file://`/`phar://` etc.
-- SMTP header builders must pass user-controllable fields (from/to/subject) through `sanitizeHeader()` to strip CR/LF (email-header injection).
+- SMTP header builders must pass user-controllable fields (from/to/subject) through `sanitizeHeader()` to strip CR/LF (email-header injection), then `encodeHeader()` for anything non-ASCII.
 - `json_decode` in drain/runtime paths uses `(..., true, N, JSON_THROW_ON_ERROR)` — never no-args decode. Depth N: 512 for payload re-parse, 32 for channel config, 16 for metrics/thresholds.
 - PII redaction is delegated upstream to `laravel/nightwatch` via `NIGHTWATCH_REDACT_HEADERS` / `NIGHTWATCH_REDACT_PAYLOAD_FIELDS`. The agent daemon itself does not redact — payloads are buffered and drained as received. The one exception runs in the customer's process, not the daemon: `PayloadCapture` redacts captured JSON response bodies with `NIGHTOWL_REDACT_RESPONSE_FIELDS` (and re-applies Nightwatch's payload list to payloads it captures).
 
@@ -219,7 +221,9 @@ NIGHTOWL_RUN_MIGRATIONS=false            # Legacy ride-along. true also runs mig
 NIGHTOWL_ENVIRONMENT=                    # Override APP_ENV for the environment column (rare: standalone harness or custom labels)
 NIGHTOWL_PARALLEL_WITH_NIGHTWATCH=false  # Run alongside Nightwatch (fan-out via MultiIngest)
 NIGHTOWL_DRAIN_BATCH_SIZE=5000           # Rows per COPY batch
-NIGHTOWL_DRAIN_WORKERS=1                 # Parallel drain workers
+NIGHTOWL_DRAIN_WORKERS=1                 # Parallel drain workers (1-16)
+NIGHTOWL_BUFFER_LOCK_WAIT=30             # Seconds a new agent waits for the previous owner of its buffer to exit before refusing to start. 0 = refuse at once. Top-level key `buffer_lock_wait`
+NIGHTOWL_DB_SSLMODE=prefer               # The drain always uses it (prefer when unset). The health-alert notifier and the Laravel `nightowl` connection (install/migrate/other commands) use it only when set, else libpq/PGSSLMODE (top-level `explicit_sslmode` key)
 NIGHTOWL_DRAIN_INTERVAL_MS=100           # Drain loop idle interval
 NIGHTOWL_MAX_PENDING_ROWS=100000         # Back-pressure threshold
 NIGHTOWL_MAX_BUFFER_MEMORY=268435456     # 256MB RSS limit

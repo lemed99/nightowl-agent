@@ -85,7 +85,13 @@ final class SmtpClient
     {
         $host = trim((string) ($config['host'] ?? ''));
         $port = (int) ($config['port'] ?? 587);
+        // Both are optional: a relay that needs no login gets a channel with no
+        // username (missing, null or blank all mean "don't AUTH"), and a null
+        // password is sent as an empty one rather than rejected.
         $username = (string) ($config['username'] ?? '');
+        if (trim($username) === '') {
+            $username = '';
+        }
         $password = (string) ($config['password'] ?? '');
         $encryption = strtolower((string) ($config['encryption'] ?? 'tls'));
 
@@ -164,7 +170,7 @@ final class SmtpClient
             }
 
             if ($username !== '') {
-                $this->authenticate($socket, $capabilities, $username, $password);
+                $this->authenticate($socket, $capabilities, $username, $password, "{$host}:{$port}");
             }
 
             $this->command($socket, "MAIL FROM:<{$fromAddress}>", 2, 'MAIL FROM');
@@ -202,26 +208,104 @@ final class SmtpClient
         string $body,
         bool $isHtml,
     ): string {
-        // Normalise to CRLF, then dot-stuff any line that begins with a period
-        // so it can't be read as the end-of-data terminator (RFC 5321 §4.5.2).
+        // Normalise to CRLF, encode, then dot-stuff any line that begins with a
+        // period so it can't be read as the end-of-data terminator (RFC 5321
+        // §4.5.2).
+        //
+        // Quoted-printable because EmailTemplate renders each email as ONE line
+        // of several KB, and RFC 5321 §4.5.3.1.6 caps a line at 1000 octets:
+        // relays may refuse such a message, or break the line and with it the
+        // markup (Exim's smtp transport bounces it as "lines too long for
+        // transport", often after this client already got its 250). QP keeps
+        // every line at 76 characters or fewer and 7-bit, and decodes back to
+        // the same bytes. Symfony Mailer, which the API sends with, encodes the
+        // same way.
         $smtpBody = str_replace(["\r\n", "\r", "\n"], ["\n", "\n", "\r\n"], $body);
+        $smtpBody = quoted_printable_encode($smtpBody);
         $smtpBody = str_replace("\r\n.", "\r\n..", $smtpBody);
         if (str_starts_with($smtpBody, '.')) {
             $smtpBody = '.'.$smtpBody;
         }
 
-        $message = "From: {$fromName} <{$fromAddress}>\r\n";
+        $message = 'From: '.self::mailbox($fromName, $fromAddress)."\r\n";
         $message .= 'To: '.implode(', ', $toAddresses)."\r\n";
-        $message .= "Subject: {$subject}\r\n";
+        $message .= 'Subject: '.self::encodeHeader($subject)."\r\n";
         $message .= 'Date: '.date('r')."\r\n";
         $message .= 'Message-ID: <'.self::messageId($fromAddress).">\r\n";
         $message .= "MIME-Version: 1.0\r\n";
         $message .= 'Content-Type: '.($isHtml ? 'text/html' : 'text/plain')."; charset=UTF-8\r\n";
+        $message .= "Content-Transfer-Encoding: quoted-printable\r\n";
         $message .= "\r\n";
         $message .= $smtpBody;
         $message .= "\r\n.\r\n";
 
         return $message;
+    }
+
+    /**
+     * A header value as RFC 2047 encoded-words when it is not plain ASCII.
+     *
+     * Headers are 7-bit (RFC 5322 §2.2). A raw UTF-8 subject such as an app
+     * named "Café" reaches some clients as mojibake, and strict relays refuse
+     * it. Pure ASCII is returned unchanged. Anything else becomes base64
+     * UTF-8 words of at most 75 characters (§2), folded onto continuation
+     * lines, never splitting a character (§5). Symfony Mailer, which the API
+     * sends with, encodes the same way.
+     */
+    public static function encodeHeader(string $value): string
+    {
+        if (preg_match('/^[\x20-\x7E]*$/', $value) === 1) {
+            return $value;
+        }
+
+        // Characters when the value is valid UTF-8, single bytes otherwise, so
+        // a word never ends in the middle of a character.
+        $units = preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY);
+        if ($units === false) {
+            $units = str_split($value);
+        }
+
+        // "=?UTF-8?B?" and "?=" take 12 of a word's 75 characters, which
+        // leaves 63 for base64, or 45 bytes of text.
+        $words = [];
+        $chunk = '';
+        foreach ($units as $unit) {
+            if ($chunk !== '' && strlen($chunk) + strlen($unit) > 45) {
+                $words[] = '=?UTF-8?B?'.base64_encode($chunk).'?=';
+                $chunk = '';
+            }
+            $chunk .= $unit;
+        }
+        if ($chunk !== '') {
+            $words[] = '=?UTF-8?B?'.base64_encode($chunk).'?=';
+        }
+
+        // Whitespace between encoded-words is dropped on decoding (§6.2).
+        return implode("\r\n ", $words);
+    }
+
+    /**
+     * A From mailbox: the display name encoded when it is not ASCII, quoted
+     * when it holds characters that would otherwise be read as address
+     * syntax (a comma, say), left bare when it needs neither.
+     */
+    private static function mailbox(string $name, string $address): string
+    {
+        $name = trim($name);
+
+        if ($name === '') {
+            return "<{$address}>";
+        }
+
+        if (preg_match('/^[\x20-\x7E]*$/', $name) !== 1) {
+            return self::encodeHeader($name)." <{$address}>";
+        }
+
+        if (preg_match('/[()<>\[\]:;@\\\\,."]/', $name) === 1) {
+            return '"'.addcslashes($name, '"\\')."\" <{$address}>";
+        }
+
+        return "{$name} <{$address}>";
     }
 
     /** Right-hand side taken from the sender's domain — a Message-ID must be globally unique. */
@@ -320,9 +404,13 @@ final class SmtpClient
      * relays accept AUTH without ever announcing it — removing that attempt
      * would break working installs to no benefit.
      *
+     * When that blind attempt is refused, the server's bare "502 command not
+     * implemented" pointed nowhere. The real cause is a username on a channel
+     * whose relay takes no login, so that is what the error says.
+     *
      * @param  array<string, string>  $capabilities
      */
-    private function authenticate($socket, array $capabilities, string $username, string $password): void
+    private function authenticate($socket, array $capabilities, string $username, string $password, string $server): void
     {
         $mechanisms = self::authMechanisms($capabilities);
 
@@ -339,7 +427,25 @@ final class SmtpClient
             return;
         }
 
-        $this->command($socket, 'AUTH LOGIN', 3, 'AUTH LOGIN');
+        try {
+            $this->command($socket, 'AUTH LOGIN', 3, 'AUTH LOGIN');
+        } catch (\RuntimeException $e) {
+            if ($mechanisms !== []) {
+                throw $e;
+            }
+
+            $hint = isset($capabilities['STARTTLS'])
+                ? " It offers STARTTLS, and some servers only offer AUTH after it: set encryption to 'tls'."
+                : '';
+
+            throw new \RuntimeException(
+                "a username is set but {$server} does not advertise AUTH, and it did not accept AUTH LOGIN ({$e->getMessage()}). "
+                .'To send without logging in, clear the username and password.'.$hint,
+                0,
+                $e,
+            );
+        }
+
         $this->command($socket, base64_encode($username), 3, 'AUTH LOGIN (username)');
         $this->command($socket, base64_encode($password), 2, 'AUTH LOGIN (password)');
     }

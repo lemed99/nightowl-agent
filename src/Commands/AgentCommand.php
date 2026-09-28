@@ -8,6 +8,7 @@ use NightOwl\Agent\AsyncServer;
 use NightOwl\Agent\PortInUseException;
 use NightOwl\Agent\Server;
 use NightOwl\Agent\SqliteBuffer;
+use NightOwl\Support\BufferDirectory;
 
 class AgentCommand extends Command
 {
@@ -21,6 +22,14 @@ class AgentCommand extends Command
 
     /** Shared tail of every "schema is behind" operator message — one string so the remediation advice can't drift between branches. */
     private const SCHEMA_BEHIND_ADVICE = 'The agent will keep running, but some writes may fail until the schema is updated.';
+
+    /**
+     * The buffer's owner lock, held open for as long as this process runs.
+     * See SqliteBuffer::acquireOwnerLock().
+     *
+     * @var resource|null
+     */
+    private $bufferLock = null;
 
     public function handle(): int
     {
@@ -42,7 +51,19 @@ class AgentCommand extends Command
             config()->set('nightowl.agent.sqlite_path', $this->option('sqlite-path'));
         }
 
+        // Read before the buffer is opened, which creates a missing directory.
+        $bufferDirExisted = is_dir(dirname((string) config('nightowl.agent.sqlite_path')));
+
         if (! $this->guardBufferWritable()) {
+            return self::FAILURE;
+        }
+
+        $this->protectBufferDirectory($bufferDirExisted);
+
+        // Async only: the sync driver writes straight to Postgres and never
+        // drains the buffer. Before the schema step, so a second agent refuses
+        // without running a boot migrate first.
+        if ($driver === 'async' && ! $this->lockBuffer()) {
             return self::FAILURE;
         }
 
@@ -97,6 +118,100 @@ class AgentCommand extends Command
 
             return false;
         }
+    }
+
+    /**
+     * Write a .gitignore into the buffer directory and storage/nightowl.
+     *
+     * They hold the buffer and the saved alert-channel list, whose SMTP
+     * passwords and webhook secrets are plain text, and a default Laravel
+     * .gitignore covers neither. See BufferDirectory. Best-effort: a failure
+     * here never stops the agent.
+     */
+    private function protectBufferDirectory(bool $bufferDirExisted): void
+    {
+        try {
+            $storageDir = storage_path('nightowl');
+            $bufferDir = dirname((string) config('nightowl.agent.sqlite_path'));
+
+            foreach ([[$bufferDir, ! $bufferDirExisted], [$storageDir, false]] as [$dir, $created]) {
+                if (BufferDirectory::shouldProtect($dir, $created, $storageDir, base_path())) {
+                    BufferDirectory::ensureGitignore($dir);
+                }
+            }
+        } catch (\Throwable $e) {
+            error_log('[NightOwl Agent] Could not write a .gitignore next to the buffer: '.$e->getMessage());
+        }
+    }
+
+    /**
+     * Refuse to start when another agent already owns this buffer.
+     *
+     * Several agents on one host share storage/nightowl/agent-buffer.sqlite
+     * unless each is given its own path, and two agents draining one buffer can
+     * write the same rows to Postgres twice. When the lock cannot be taken for
+     * any other reason (a filesystem without flock support), the agent starts
+     * without it, as every version before this one did, and says so.
+     *
+     * A held lock is waited on first, up to NIGHTOWL_BUFFER_LOCK_WAIT seconds
+     * (30 by default). A restart or rolling deploy often starts the new agent
+     * while the old one is still stopping, and refusing at once made the new
+     * one exit in a loop until a process manager gave up on it (supervisord
+     * marks a program FATAL after startretries=3 quick exits).
+     */
+    private function lockBuffer(): bool
+    {
+        $path = (string) config('nightowl.agent.sqlite_path');
+        $wait = max(0, (int) config('nightowl.buffer_lock_wait', 30));
+        $started = microtime(true);
+        $waiting = false;
+
+        try {
+            while (($lock = SqliteBuffer::acquireOwnerLock($path, $holderPid)) === null
+                && microtime(true) - $started < $wait) {
+                if (! $waiting) {
+                    $waiting = true;
+                    $holder = $holderPid > 0 ? "Another agent (pid {$holderPid})" : 'Another agent';
+                    $message = "{$holder} is using the buffer at {$path}. Waiting up to {$wait}s for it to exit.";
+                    error_log('[NightOwl Agent] '.$message);
+                    $this->line($message);
+                }
+
+                usleep(250_000);
+            }
+        } catch (\Throwable $e) {
+            $message = 'Could not lock the buffer, so this agent cannot tell whether another one is using it: '.$e->getMessage();
+            error_log('[NightOwl Agent] '.$message);
+            $this->warn($message);
+
+            return true;
+        }
+
+        if ($lock !== null && $waiting) {
+            $message = sprintf('The other agent exited after %.1fs. Starting.', microtime(true) - $started);
+            error_log('[NightOwl Agent] '.$message);
+            $this->line($message);
+        }
+
+        if ($lock === null) {
+            $holder = $holderPid > 0 ? "another agent (pid {$holderPid})" : 'another agent';
+
+            $using = $wait > 0 ? "is still using this buffer after {$wait}s" : 'is already using this buffer';
+
+            $this->error("NightOwl agent will not start: {$holder} {$using}.");
+            $this->line('  Buffer: '.$path);
+            $this->newLine();
+            $this->line('Two agents on one buffer can write the same rows to Postgres twice.');
+            $this->line('Give each agent its own buffer with --sqlite-path or NIGHTOWL_AGENT_SQLITE_PATH, or stop the other agent.');
+
+            error_log("[NightOwl Agent] Refusing to start: {$holder} {$using} ({$path}). Set --sqlite-path or NIGHTOWL_AGENT_SQLITE_PATH per agent.");
+
+            return false;
+        }
+
+        $this->bufferLock = $lock;
+
+        return true;
     }
 
     /**
@@ -337,6 +452,9 @@ class AgentCommand extends Command
         $marker = $this->backfillMarkerPath();
         @mkdir(dirname($marker), 0755, true);
         @file_put_contents($marker, (string) time());
+
+        // storage/nightowl, which the line above may just have created.
+        BufferDirectory::ensureGitignore(dirname($marker));
     }
 
     /**
@@ -459,9 +577,11 @@ class AgentCommand extends Command
         }
 
         $server = app(AsyncServer::class);
+        $server->setBufferLock($this->bufferLock);
 
         $this->info("NightOwl agent (async) listening on {$host}:{$port}");
         $this->line('SQLite buffer: ' . config('nightowl.agent.sqlite_path'));
+        $this->line('Drain workers: ' . $server->drainWorkerCount());
 
         if (config('nightowl.agent.enable_udp', false)) {
             $this->line('UDP listener: ' . $host . ':' . config('nightowl.agent.udp_port', 2408));

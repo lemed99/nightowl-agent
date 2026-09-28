@@ -156,4 +156,82 @@ class SmtpClientTest extends TestCase
 
         $this->assertSame('[App] New Issue: RuntimeException', $sanitize->invoke(null, '[App] New Issue: RuntimeException'));
     }
+
+    // ─── Non-ASCII headers (RFC 2047) ────────────────────────────────
+
+    public function test_an_ascii_subject_is_sent_as_is(): void
+    {
+        $this->assertSame('[App] Agent Health: DRAIN_STOPPED', SmtpClient::encodeHeader('[App] Agent Health: DRAIN_STOPPED'));
+    }
+
+    /**
+     * Headers are 7-bit. A raw UTF-8 app name in the subject reached some
+     * clients as mojibake and was refused by strict relays.
+     */
+    public function test_a_non_ascii_subject_is_encoded_and_decodes_back(): void
+    {
+        $subject = '[Café Ünïcode] Agent Health: DRAIN_STOPPED';
+
+        $encoded = SmtpClient::encodeHeader($subject);
+
+        $this->assertMatchesRegularExpression('/^[\x20-\x7E\r\n]*$/', $encoded, 'the header is not 7-bit');
+        $this->assertStringStartsWith('=?UTF-8?B?', $encoded);
+        $this->assertSame($subject, self::decode($encoded));
+    }
+
+    /**
+     * RFC 2047 caps an encoded-word at 75 characters and forbids splitting a
+     * character across two of them.
+     */
+    public function test_a_long_subject_is_split_into_short_words_on_character_boundaries(): void
+    {
+        $subject = '[Café Ünïcode] '.str_repeat('日本語のアプリ ', 12);
+
+        $encoded = SmtpClient::encodeHeader($subject);
+        $lines = explode("\r\n", $encoded);
+
+        $this->assertGreaterThan(1, count($lines));
+        foreach ($lines as $i => $line) {
+            $word = $i === 0 ? $line : substr($line, 1);
+            $this->assertSame($i === 0 ? $line : ' '.$word, $line, 'continuation lines must be folded with a space');
+            $this->assertLessThanOrEqual(75, strlen($word));
+            $this->assertMatchesRegularExpression('/^=\?UTF-8\?B\?[A-Za-z0-9+\/=]+\?=$/', $word);
+            $this->assertTrue(mb_check_encoding(base64_decode(substr($word, 10, -2)), 'UTF-8'), "a word splits a character: {$word}");
+        }
+        $this->assertSame($subject, self::decode($encoded));
+    }
+
+    public function test_invalid_utf8_is_still_encoded_rather_than_sent_raw(): void
+    {
+        $subject = "[App\xC3] Recovered";
+
+        $encoded = SmtpClient::encodeHeader($subject);
+
+        $this->assertMatchesRegularExpression('/^[\x20-\x7E\r\n]*$/', $encoded);
+        $this->assertSame($subject, self::decode($encoded));
+    }
+
+    public function test_a_from_name_is_encoded_quoted_or_left_bare_as_it_needs(): void
+    {
+        $mailbox = (new \ReflectionClass(SmtpClient::class))->getMethod('mailbox');
+
+        $this->assertSame('NightOwl <a@example.com>', $mailbox->invoke(null, 'NightOwl', 'a@example.com'));
+        $this->assertSame('"Acme, Inc." <a@example.com>', $mailbox->invoke(null, 'Acme, Inc.', 'a@example.com'));
+        $this->assertSame('"say \\"hi\\"" <a@example.com>', $mailbox->invoke(null, 'say "hi"', 'a@example.com'));
+        $this->assertSame('<a@example.com>', $mailbox->invoke(null, '', 'a@example.com'));
+
+        $encoded = $mailbox->invoke(null, 'Café Ünïcode', 'a@example.com');
+        $this->assertStringEndsWith(' <a@example.com>', $encoded);
+        $this->assertSame('Café Ünïcode', self::decode(substr($encoded, 0, -strlen(' <a@example.com>'))));
+    }
+
+    /** Decode B-encoded words the way a mail client does: adjacent words join, the folding between them goes. */
+    private static function decode(string $header): string
+    {
+        return (string) preg_replace_callback(
+            '/=\?UTF-8\?B\?([A-Za-z0-9+\/=]*)\?=(?:\r\n )?/',
+            static fn (array $m): string => base64_decode($m[1]),
+            $header,
+        );
+    }
 }

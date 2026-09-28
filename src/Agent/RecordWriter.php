@@ -7,6 +7,7 @@ use NightOwl\Support\ConcurrencyRollup;
 use NightOwl\Support\DDSketchHistogram;
 use NightOwl\Support\DictionaryCache;
 use NightOwl\Support\IgnoredRoutes;
+use NightOwl\Support\OutgoingHost;
 use NightOwl\Support\StorageV2;
 use NightOwl\Support\QueryHistogram;
 use NightOwl\Support\RawPartitions;
@@ -4310,6 +4311,8 @@ final class RecordWriter
         // users_count uses a subquery on the raw exceptions to compute the
         // actual distinct user count, instead of blindly accumulating per batch
         // (which inflates the count when the same user appears across batches).
+        // Guests are stored with user_id '' (not NULL), so '' is excluded too: counting it
+        // made every guest-only issue read "1 user" once a second batch updated it.
         // In v2 mode the subquery unions BOTH families: pre-fence occurrences
         // live in v1, post-fence in v2, and the count must span the fence. The
         // v1 leg is emitted only while the v1 table still exists (prune's EOL
@@ -4320,6 +4323,7 @@ final class RecordWriter
                     WHERE fingerprint = EXCLUDED.group_hash
                       AND environment IS NOT DISTINCT FROM EXCLUDED.environment
                       AND user_id IS NOT NULL
+                      AND user_id <> \'\'
                 )';
         if ($this->v2Enabled()) {
             $v1Exists = false;
@@ -4338,12 +4342,14 @@ final class RecordWriter
                           AND (environment_id = (SELECT id FROM nightowl_dict_string
                                                   WHERE kind = \'environment\' AND value = EXCLUDED.environment)
                                OR (EXCLUDED.environment IS NULL AND environment_id IS NULL))
-                          AND user_id IS NOT NULL';
+                          AND user_id IS NOT NULL
+                          AND user_id <> \'\'';
             $v1Leg = '
                         SELECT user_id FROM nightowl_exceptions
                         WHERE fingerprint = EXCLUDED.group_hash
                           AND environment IS NOT DISTINCT FROM EXCLUDED.environment
-                          AND user_id IS NOT NULL';
+                          AND user_id IS NOT NULL
+                          AND user_id <> \'\'';
 
             $usersCountSql = '(
                     SELECT COUNT(DISTINCT user_id) FROM ('
@@ -4872,7 +4878,7 @@ final class RecordWriter
      * If it did, the cache is invalidated and thresholds are reloaded immediately.
      * This lets users update thresholds from the dashboard without restarting the agent.
      *
-     * @return array<string, list<array{target?: string, duration_ms: int}>>
+     * @return array<string, list<array{target?: string, duration_ms: int, host: ?string}>>
      */
     private function getThresholds(): array
     {
@@ -4926,9 +4932,13 @@ final class RecordWriter
 
             foreach ($items as $item) {
                 $type = $item['type'] ?? 'route';
+                $target = $item['target'] ?? $item['route'] ?? null;
                 $this->thresholdCache[$type][] = [
-                    'target' => $item['target'] ?? $item['route'] ?? null,
+                    'target' => $target,
                     'duration_ms' => (int) ($item['duration_ms'] ?? 0),
+                    // What findThreshold() compares a host rule on, normalized
+                    // once per load rather than once per record.
+                    'host' => $type === 'outgoing_request' && is_string($target) ? OutgoingHost::normalize($target) : null,
                 ];
             }
         } catch (\Throwable) {
@@ -5214,10 +5224,18 @@ final class RecordWriter
         $globalThreshold = null;
         $specificThreshold = null;
 
+        // Hosts compare as hosts (OutgoingHost): the dashboard saves
+        // "https://api.stripe.com" while the record carries "api.stripe.com".
+        // Every other type compares exactly.
+        $byHost = $type === 'outgoing_request';
+        if ($byHost && $target !== null) {
+            $target = OutgoingHost::normalize($target);
+        }
+
         foreach ($typeThresholds as $t) {
             if (empty($t['target'])) {
                 $globalThreshold = $t['duration_ms'] * 1000; // ms → μs
-            } elseif ($target !== null && $t['target'] === $target) {
+            } elseif ($target !== null && ($byHost ? $t['host'] : $t['target']) === $target) {
                 $specificThreshold = $t['duration_ms'] * 1000; // ms → μs
             }
         }

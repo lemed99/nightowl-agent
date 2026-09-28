@@ -20,6 +20,33 @@ final class AsyncServer
     private const RESTART_COOLDOWN = 2.0; // seconds — suppress rapid restart loops
     private const BACK_PRESSURE_CHECK_INTERVAL = 5.0; // seconds
 
+    /**
+     * When the saved alert-channel list is refreshed: once this long after
+     * startup, then every CHANNEL_PRIME_INTERVAL. See primeAlertChannels().
+     */
+    private const CHANNEL_PRIME_DELAY = 5.0; // seconds
+    private const CHANNEL_PRIME_INTERVAL = 900.0; // seconds
+
+    /**
+     * Longest an alert child may live, in seconds (see forkAlertChild()). A
+     * round is two passes, alerts then recoveries, each up to
+     * HealthAlertNotifier::MAX_DISPATCH_SECONDS plus the one send that runs
+     * past it and a channel load: about 100s at worst. The rest is margin for
+     * slow DNS.
+     */
+    private const ALERT_CHILD_MAX_SECONDS = 180;
+
+    /**
+     * Ceiling on NIGHTOWL_DRAIN_WORKERS. Every worker holds its own Postgres
+     * connection for its whole life (plus short-lived ones for maintenance),
+     * and all of them share one SQLite file, which takes one writer at a time
+     * for every claim and mark. Well before this many, extra workers mostly
+     * wait on that lock, and without a ceiling a mistyped value (100) would
+     * open that many connections against a database whose default
+     * max_connections is 100.
+     */
+    public const MAX_DRAIN_WORKERS = 16;
+
     private LoopInterface $loop;
     private ?TcpServer $server = null;
     private ?DatagramSocket $udpSocket = null;
@@ -30,7 +57,20 @@ final class AsyncServer
     private array $drainChildPids = [];
     /** In-flight health-alert dispatch child, at most one — see dispatchHealthAlerts(). */
     private ?int $alertChildPid = null;
+    /** Whether that child is only refreshing the saved channel list, which an alert round may cut short. */
+    private bool $alertChildIsPrime = false;
+    /** ALERT_CHILD_MAX_SECONDS, as a property so a test can shorten it. */
+    private int $alertChildMaxSeconds = self::ALERT_CHILD_MAX_SECONDS;
     private bool $shuttingDown = false;
+    /** Pid of the process that called listen(). Only it stops the workers; a forked child never does. */
+    private int $ownerPid = 0;
+    /**
+     * The buffer's owner lock, taken and kept open by AgentCommand. Held here
+     * only so the alert children can close their copy (forkAlertChild()).
+     *
+     * @var resource|null
+     */
+    private $bufferLock = null;
     /** @var float[] Last spawn time per worker ID */
     private array $lastChildSpawns = [];
 
@@ -102,6 +142,7 @@ final class AsyncServer
         $this->expectedTokenHash = $token !== null
             ? substr(hash('xxh128', $token), 0, 7)
             : null;
+        $this->drainWorkerCount = self::clampDrainWorkerCount($drainWorkerCount);
         // Pin the select loop, whatever extensions the host has loaded.
         // Loop::get() auto-picks a kernel-backed loop (ExtUvLoop / ExtEvLoop /
         // ExtEventLoop) whenever its extension is present — ext-uv is common
@@ -125,6 +166,39 @@ final class AsyncServer
         $this->loop = $loop;
         $this->metrics = new MetricsCollector($maxPendingRows, $maxBufferMemory);
         $this->metrics->setDrainWedgeSeconds($drainWedgeSeconds);
+    }
+
+    /**
+     * NIGHTOWL_DRAIN_WORKERS clamped to 1..MAX_DRAIN_WORKERS. Zero, a negative
+     * number or a non-number (which casts to 0) means the one worker the agent
+     * always ran with.
+     */
+    public static function clampDrainWorkerCount(int $requested): int
+    {
+        if ($requested > self::MAX_DRAIN_WORKERS) {
+            error_log('[NightOwl Agent] NIGHTOWL_DRAIN_WORKERS='.$requested.' is above the maximum of '
+                .self::MAX_DRAIN_WORKERS.'; using '.self::MAX_DRAIN_WORKERS.'.');
+
+            return self::MAX_DRAIN_WORKERS;
+        }
+
+        return max(1, $requested);
+    }
+
+    public function drainWorkerCount(): int
+    {
+        return $this->drainWorkerCount;
+    }
+
+    /**
+     * Hand over the buffer's owner lock (SqliteBuffer::acquireOwnerLock()).
+     * The caller keeps it open; this process never releases it.
+     *
+     * @param  resource|null  $lock
+     */
+    public function setBufferLock($lock): void
+    {
+        $this->bufferLock = is_resource($lock) ? $lock : null;
     }
 
     /**
@@ -155,6 +229,7 @@ final class AsyncServer
     public function listen(string $host, int $port): void
     {
         $this->startTime = microtime(true);
+        $this->ownerPid = getmypid();
 
         // SO_REUSEPORT lets multiple instances bind to the same port.
         // The kernel distributes incoming connections across all listeners.
@@ -165,8 +240,7 @@ final class AsyncServer
                 'so_reuseport' => true,
             ]);
         } catch (RuntimeException $e) {
-            $message = strtolower($e->getMessage());
-            if (str_contains($message, 'address already in use') || str_contains($message, 'eaddrinuse')) {
+            if (self::isAddressInUse($e)) {
                 $hint = $port === 2407
                     ? "Port 2407 is also Nightwatch's default ingest port — if the Nightwatch agent is running, NightOwl can't share it. "
                     : '';
@@ -184,6 +258,84 @@ final class AsyncServer
 
             throw $e;
         }
+
+        // Health API, bound BEFORE any drain worker is forked. A second agent on
+        // the same host fails here on the default port 2409, and failing after
+        // the fork left its drain workers running with no parent to stop them.
+        if ($this->healthEnabled) {
+            $this->listenHealth($host);
+        }
+
+        try {
+            $this->serve($host);
+        } catch (\Throwable $e) {
+            // Whatever failed after the fork, the workers must not outlive this
+            // process: an orphaned worker keeps draining the buffer next to the
+            // workers of the agent a supervisor starts to replace this one. Only
+            // the agent process cleans up. A forked child reaches here when its
+            // in-process drain throws, and must not signal its siblings.
+            if (getmypid() === $this->ownerPid) {
+                error_log("[NightOwl Agent] Stopping after an unexpected error: {$e->getMessage()}");
+                try {
+                    $this->shutdown();
+                } catch (\Throwable) {
+                    // The original error is the one to report.
+                }
+            }
+
+            throw $e;
+        }
+    }
+
+    /**
+     * Bind the health API, or fail with the settings that fix a clash.
+     */
+    private function listenHealth(string $host): void
+    {
+        $this->healthServer = new HealthServer($this->loop);
+
+        try {
+            $this->healthServer->listen($host, $this->healthPort, $this);
+        } catch (RuntimeException $e) {
+            $this->healthServer = null;
+            $this->server?->close();
+            $this->server = null;
+
+            $advice = 'Give each agent on a host its own health port with NIGHTOWL_HEALTH_PORT, '
+                .'or turn the health API off with NIGHTOWL_HEALTH_ENABLED=false.';
+
+            if (self::isAddressInUse($e)) {
+                throw new PortInUseException(
+                    "Could not start the agent: health port {$host}:{$this->healthPort} is already in use, "
+                    ."often by another nightowl:agent on this host.\n\n".$advice,
+                    (int) $e->getCode(),
+                    $e
+                );
+            }
+
+            throw new RuntimeException(
+                "Could not start the agent: the health API could not listen on {$host}:{$this->healthPort} "
+                ."({$e->getMessage()}).\n\n".$advice,
+                (int) $e->getCode(),
+                $e
+            );
+        }
+    }
+
+    private static function isAddressInUse(RuntimeException $e): bool
+    {
+        $message = strtolower($e->getMessage());
+
+        return str_contains($message, 'address already in use') || str_contains($message, 'eaddrinuse');
+    }
+
+    /**
+     * Everything after the listeners are bound: fork the drain workers, arm the
+     * timers and signal handlers, run the loop until shutdown.
+     */
+    private function serve(string $host): void
+    {
+        $this->releaseStaleClaims();
 
         // forkDrainWorker() closes any existing SQLite buffer before fork
         // and re-creates it after — ensuring the child never inherits an open
@@ -272,7 +424,7 @@ final class AsyncServer
         // RSS check because PHP's Zend Memory Manager doesn't return freed memory
         // to the OS — totalBufferBytes can't detect the RSS staircase.
         $this->loop->addPeriodicTimer(self::BACK_PRESSURE_CHECK_INTERVAL, function () {
-            $pending = $this->buffer?->pendingCount() ?? 0;
+            $pending = $this->buffer?->backlogCount() ?? 0;
             $rss = memory_get_usage(true);
             $wasActive = $this->backPressure;
 
@@ -296,9 +448,14 @@ final class AsyncServer
         $instanceId = AgentInstanceId::current();
         $this->healthAlertNotifier = HealthAlertNotifier::fromConfig($instanceId);
 
+        // Keep the saved alert-channel list current while the database is
+        // reachable, so the first alert of an outage has somewhere to go.
+        $this->loop->addTimer(self::CHANNEL_PRIME_DELAY, fn () => $this->primeAlertChannels());
+        $this->loop->addPeriodicTimer(self::CHANNEL_PRIME_INTERVAL, fn () => $this->primeAlertChannels());
+
         // 10-second diagnosis — run health checks and update score
         $this->loop->addPeriodicTimer(10.0, function () {
-            $pending = $this->buffer?->pendingCount() ?? 0;
+            $pending = $this->buffer?->backlogCount() ?? 0;
             $walSize = $this->buffer?->walSize() ?? 0;
             $rss = memory_get_usage(true);
             // Read liveness immediately before diagnosing, so read -> diagnose is one
@@ -345,55 +502,11 @@ final class AsyncServer
         }
 
         // Restart drain workers if they die unexpectedly
-        $this->loop->addSignal(SIGCHLD, function () {
-            // Reap all terminated children
-            while (($result = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
-                // Find which worker this PID belongs to
-                $deadWorkerId = array_search($result, $this->drainChildPids, true);
-                if ($deadWorkerId === false) {
-                    continue;
-                }
-
-                unset($this->drainChildPids[$deadWorkerId]);
-
-                // Release any rows claimed by the dead worker back to pending
-                if ($this->buffer !== null) {
-                    $this->buffer->releaseClaimed($deadWorkerId);
-                }
-
-                // Don't restart during shutdown — but keep reaping other dead children
-                if ($this->shuttingDown) {
-                    continue;
-                }
-
-                // Restart cooldown — prevents fork bomb when child crashes on startup
-                $elapsed = microtime(true) - ($this->lastChildSpawns[$deadWorkerId] ?? 0);
-                if ($elapsed < self::RESTART_COOLDOWN) {
-                    $delay = self::RESTART_COOLDOWN - $elapsed;
-                    error_log("[NightOwl Agent] Drain worker #{$deadWorkerId} died, restarting in {$delay}s...");
-                    $this->loop->addTimer($delay, function () use ($deadWorkerId) {
-                        if (! $this->shuttingDown && ! isset($this->drainChildPids[$deadWorkerId])) {
-                            $this->forkDrainWorker($deadWorkerId);
-                        }
-                    });
-                    continue;
-                }
-
-                $exitCode = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : -1;
-                error_log("[NightOwl Agent] Drain worker #{$deadWorkerId} exited (code: {$exitCode}), restarting...");
-                $this->forkDrainWorker($deadWorkerId);
-            }
-        });
+        $this->loop->addSignal(SIGCHLD, fn () => $this->reapChildren());
 
         // Graceful shutdown
         $this->loop->addSignal(SIGINT, fn () => $this->shutdown());
         $this->loop->addSignal(SIGTERM, fn () => $this->shutdown());
-
-        // Health API server
-        if ($this->healthEnabled) {
-            $this->healthServer = new HealthServer($this->loop);
-            $this->healthServer->listen($host, $this->healthPort, $this);
-        }
 
         // Remote health reporting to api
         if ($this->healthReportEnabled && $this->apiUrl !== '' && $this->healthReportToken !== '') {
@@ -417,6 +530,28 @@ final class AsyncServer
         }
 
         $this->loop->run();
+    }
+
+    /**
+     * Free rows a previous run's drain workers claimed and never finished.
+     *
+     * Runs before the first fork, on a connection that is closed again before
+     * it (the fork-safety rule in forkDrainWorker()). A failure is logged, not
+     * fatal: the rows stay in the buffer and the next start tries again.
+     */
+    private function releaseStaleClaims(): void
+    {
+        try {
+            $buffer = new SqliteBuffer($this->sqlitePath);
+            $released = $buffer->releaseAllClaimed();
+            unset($buffer);
+
+            if ($released > 0) {
+                error_log("[NightOwl Agent] Released {$released} buffer rows a previous run's drain workers had claimed.");
+            }
+        } catch (\Throwable $e) {
+            error_log("[NightOwl Agent] Could not release stale buffer claims: {$e->getMessage()}");
+        }
     }
 
     /**
@@ -469,25 +604,95 @@ final class AsyncServer
             return;
         }
 
-        if ($this->alertChildPid !== null) {
-            // >0 reaped here, -1 already reaped by the SIGCHLD handler; 0 means
-            // it is still running and this round is skipped.
-            if (pcntl_waitpid($this->alertChildPid, $status, WNOHANG) === 0) {
-                error_log('[NightOwl Agent] Health alert dispatch still in flight, skipping this round.');
+        $forked = $this->forkAlertChild(
+            fn () => $this->dispatchHealthAlertsInline($active, $resolved),
+            prime: false,
+        );
 
-                return;
+        if ($forked === null) {
+            error_log('[NightOwl Agent] Could not fork for health alert dispatch — sending inline.');
+            $this->dispatchHealthAlertsInline($active, $resolved);
+        }
+    }
+
+    /**
+     * Refresh the saved alert-channel list (HealthAlertNotifier::primeChannels()).
+     *
+     * The list is what a round falls back to when the database is down, and a
+     * round saves it only when it reaches the database. A healthy agent may
+     * never run a round, so without this its first outage alert had no list to
+     * go to. The load is a blocking Postgres query, so it runs in the same kind
+     * of child as an alert round and never on the loop. Without pcntl there is
+     * no such child, and priming is skipped: an inline query here would stall
+     * ingest on every tick for a list that may never be needed.
+     */
+    private function primeAlertChannels(): void
+    {
+        if ($this->shuttingDown || $this->healthAlertNotifier === null) {
+            return;
+        }
+
+        if (! function_exists('pcntl_fork') || ! function_exists('posix_kill')) {
+            return;
+        }
+
+        $this->forkAlertChild(fn () => $this->healthAlertNotifier?->primeChannels(), prime: true);
+    }
+
+    /**
+     * Run $work in a short-lived forked child, at most one at a time.
+     *
+     * An alert round in flight makes the next one skip, as before. A prime in
+     * flight gives way instead: it is killed, because it only refreshes a file
+     * and an alert must not be skipped for it. A prime can also be stuck on a
+     * database that accepts the connection and never answers, and this is what
+     * ends it.
+     *
+     * @return bool|null true when forked, false when skipped, null when fork failed
+     */
+    private function forkAlertChild(\Closure $work, bool $prime): ?bool
+    {
+        // Read once: the SIGCHLD handler runs between any two statements
+        // (ReactPHP turns on async signals) and clears the pid when it reaps
+        // the child.
+        $inFlight = $this->alertChildPid;
+        $inFlightIsPrime = $this->alertChildIsPrime;
+
+        if ($inFlight !== null) {
+            // >0 reaped here, -1 already reaped elsewhere; 0 means it is still
+            // running.
+            if (pcntl_waitpid($inFlight, $status, WNOHANG) === 0) {
+                if (! $inFlightIsPrime) {
+                    if (! $prime) {
+                        error_log('[NightOwl Agent] Health alert dispatch still in flight, skipping this round.');
+                    }
+
+                    // A prime has nothing to add: the round in flight loads the
+                    // channels and saves them itself.
+                    return false;
+                }
+
+                $this->stopAlertChild();
             }
 
             $this->alertChildPid = null;
         }
 
+        // SIGCHLD is held until the pid is recorded below. A child that ended
+        // before that would be reaped as an unknown pid, and the pid recorded
+        // after it would be stale. The child keeps the mask: it has no
+        // children of its own.
+        $masked = function_exists('pcntl_sigprocmask')
+            && pcntl_sigprocmask(SIG_BLOCK, [SIGCHLD], $previousMask);
+
         $pid = pcntl_fork();
 
         if ($pid === -1) {
-            error_log('[NightOwl Agent] Could not fork for health alert dispatch — sending inline.');
-            $this->dispatchHealthAlertsInline($active, $resolved);
+            if ($masked) {
+                pcntl_sigprocmask(SIG_SETMASK, $previousMask);
+            }
 
-            return;
+            return null;
         }
 
         if ($pid === 0) {
@@ -500,19 +705,67 @@ final class AsyncServer
             // ingest port open. (Dropping them via close() is fork-safe only
             // under the pinned StreamSelectLoop — see forkDrainWorker.)
             try {
+                // A ceiling on this child's life. The notifier's statement
+                // timeout covers a database that is waiting on something, but
+                // nothing on the client side covers one that took the
+                // connection and went silent, and a round stuck there made
+                // every later transition skip as still in flight. SIGALRM
+                // with its default action ends the process in the kernel,
+                // blocked in libpq or not, and like SIGKILL runs no
+                // destructors. A PHP handler would not help: it only runs
+                // between opcodes, never inside a blocked libpq call.
+                pcntl_signal(SIGALRM, SIG_DFL);
+                pcntl_alarm($this->alertChildMaxSeconds);
+
                 $this->server?->close();
                 $this->udpSocket?->close();
                 $this->healthServer?->close();
 
-                $this->dispatchHealthAlertsInline($active, $resolved);
+                // The owner lock came through the fork, and the kernel keeps it
+                // while any copy is open. This child never touches the buffer,
+                // and if the agent died first, its copy would keep the next
+                // agent from starting until the round ended. Closing it here
+                // leaves the agent's own lock in place.
+                if (is_resource($this->bufferLock)) {
+                    fclose($this->bufferLock);
+                }
+
+                $work();
             } catch (\Throwable $e) {
-                error_log("[NightOwl Agent] Health alert dispatch child failed: {$e->getMessage()}");
+                $what = $prime ? 'Alert channel refresh' : 'Health alert dispatch';
+                error_log("[NightOwl Agent] {$what} child failed: {$e->getMessage()}");
             } finally {
                 posix_kill(posix_getpid(), SIGKILL);
             }
         }
 
         $this->alertChildPid = $pid;
+        $this->alertChildIsPrime = $prime;
+
+        if ($masked) {
+            pcntl_sigprocmask(SIG_SETMASK, $previousMask);
+        }
+
+        return true;
+    }
+
+    /** SIGKILL the in-flight alert child and reap it. */
+    private function stopAlertChild(): void
+    {
+        // A local copy, as in forkAlertChild(): the SIGCHLD handler may clear
+        // the property at any point, and a null pid here would turn the wait
+        // below into a blocking wait on any child.
+        $pid = $this->alertChildPid;
+        if ($pid === null) {
+            return;
+        }
+
+        posix_kill($pid, SIGKILL);
+        // Returns at once: the child is dead, or the SIGCHLD handler already
+        // reaped it (-1).
+        pcntl_waitpid($pid, $status);
+        $this->alertChildPid = null;
+        $this->alertChildIsPrime = false;
     }
 
     /**
@@ -526,6 +779,67 @@ final class AsyncServer
             $this->healthAlertNotifier?->dispatchRecovered($resolved);
         } catch (\Throwable $e) {
             error_log("[NightOwl Agent] Health alert dispatch failed: {$e->getMessage()}");
+        }
+    }
+
+    /**
+     * Reap every child that has exited (the SIGCHLD handler). A drain worker
+     * has its claimed rows released and is forked again.
+     */
+    private function reapChildren(): void
+    {
+        // Reap all terminated children
+        while (($result = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
+            // The alert child is reaped here too. Forget its pid, or once the
+            // kernel hands that pid to a new process (a respawned drain worker,
+            // say), forkAlertChild() and shutdown() would take it for the alert
+            // child still running, and stopAlertChild() would SIGKILL it.
+            if ($result === $this->alertChildPid) {
+                if (pcntl_wifsignaled($status) && pcntl_wtermsig($status) === SIGALRM) {
+                    $what = $this->alertChildIsPrime ? 'Alert channel refresh' : 'Health alert dispatch';
+                    error_log("[NightOwl Agent] {$what} was stopped after {$this->alertChildMaxSeconds}s. The database or an alert channel did not answer.");
+                }
+
+                $this->alertChildPid = null;
+                $this->alertChildIsPrime = false;
+
+                continue;
+            }
+
+            // Find which worker this PID belongs to
+            $deadWorkerId = array_search($result, $this->drainChildPids, true);
+            if ($deadWorkerId === false) {
+                continue;
+            }
+
+            unset($this->drainChildPids[$deadWorkerId]);
+
+            // Release any rows claimed by the dead worker back to pending
+            if ($this->buffer !== null) {
+                $this->buffer->releaseClaimed($deadWorkerId);
+            }
+
+            // Don't restart during shutdown — but keep reaping other dead children
+            if ($this->shuttingDown) {
+                continue;
+            }
+
+            // Restart cooldown — prevents fork bomb when child crashes on startup
+            $elapsed = microtime(true) - ($this->lastChildSpawns[$deadWorkerId] ?? 0);
+            if ($elapsed < self::RESTART_COOLDOWN) {
+                $delay = self::RESTART_COOLDOWN - $elapsed;
+                error_log("[NightOwl Agent] Drain worker #{$deadWorkerId} died, restarting in {$delay}s...");
+                $this->loop->addTimer($delay, function () use ($deadWorkerId) {
+                    if (! $this->shuttingDown && ! isset($this->drainChildPids[$deadWorkerId])) {
+                        $this->forkDrainWorker($deadWorkerId);
+                    }
+                });
+                continue;
+            }
+
+            $exitCode = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : -1;
+            error_log("[NightOwl Agent] Drain worker #{$deadWorkerId} exited (code: {$exitCode}), restarting...");
+            $this->forkDrainWorker($deadWorkerId);
         }
     }
 
@@ -666,6 +980,15 @@ final class AsyncServer
             $this->healthServer = null;
         }
 
+        // A prime in flight is only refreshing a file, and one stuck on a slow
+        // database would otherwise outlive the agent. An alert round is left
+        // to finish: it is bounded, and killing it loses the alert.
+        $alertChild = $this->alertChildPid;
+        if ($alertChild !== null && $this->alertChildIsPrime
+            && pcntl_waitpid($alertChild, $status, WNOHANG) === 0) {
+            $this->stopAlertChild();
+        }
+
         // Signal all drain workers to finish and wait
         foreach ($this->drainChildPids as $workerId => $pid) {
             posix_kill($pid, SIGTERM);
@@ -744,7 +1067,7 @@ final class AsyncServer
         return $this->metrics->getFullStatus(
             $this->startTime,
             $this->backPressure,
-            $this->buffer?->pendingCount() ?? 0,
+            $this->buffer?->backlogCount() ?? 0,
             $this->buffer?->walSize() ?? 0,
             $this->drainChildPids[0] ?? -1,
         );
