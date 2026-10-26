@@ -5,6 +5,96 @@ version is taken from the git tag. Entries for `1.0.x` and earlier are
 reconstructed from the annotated release tags; pre-`1.0` (`0.1.x`) history lives
 in the git tags.
 
+## [2.4.8] - 2026-10-26
+
+### Added
+
+- **A corrupt buffer is repaired or set aside instead of stopping the agent.**
+  When the drain, an append or the backlog count hits a SQLite corruption error
+  (11/26), the agent stops its drain workers and runs `integrity_check`.
+  Damage confined to indexes is fixed with `REINDEX` and nothing is lost.
+  Anything else is renamed to `<buffer>.corrupt-<time>` (the newest two are
+  kept) and a fresh buffer starts, so ingest carries on. Rows not yet drained
+  stay in that copy and are not drained; the diagnosis gives the count. A check that cannot
+  run, or a rename that fails, leaves the file where it is and is retried
+  later. Rows a worker had already written to PostgreSQL but could not mark are
+  marked from `<buffer>.unmarked-<id>.json` so they are not drained twice. A
+  buffer that is already corrupt when `nightowl:agent` starts is recovered the
+  same way, under the owner lock, where the agent used to refuse to start and
+  advise deleting it, undrained rows included. A buffer another agent holds is
+  never touched.
+- **`BUFFER_UNWRITABLE` and `BUFFER_REPAIRED` diagnoses.** `BUFFER_UNWRITABLE`
+  names the SQLite cause (full disk, read-only file, I/O error, corruption,
+  lock) on the ingest side over 60 seconds and on the drain side per worker.
+  While it shows, `DRAIN_STOPPED` and `DRAIN_ERRORS` are suppressed, because
+  they sent operators to PostgreSQL for a fault on the agent's own disk, and its
+  refusals are kept out of `REJECT_RATE`. `BUFFER_REPAIRED` shows for an hour
+  after a repair or a set-aside, naming the file kept and the rows it held.
+- **CPU thresholds are configurable.** `NIGHTOWL_CPU_HIGH_PCT` (70),
+  `NIGHTOWL_CPU_CRITICAL_PCT` (90) and `NIGHTOWL_CPU_SUSTAIN_SECONDS` (60).
+- **Health alerts survive a database outage.** The alert channels live in the
+  database the agent drains into, so every health alert raised while it was
+  down was lost. The channel list is now saved to
+  `<buffer>.alert-channels.json` (0600) on each successful load and read when
+  the database is unreachable.
+- **One agent per buffer.** An flock on `<buffer>.lock`. A second agent waits
+  up to `NIGHTOWL_BUFFER_LOCK_WAIT` (30 s) for the first to exit, which covers
+  rolling deploys, then refuses to start.
+- Health alert emails are HTML with a "View agent health" button, and Slack,
+  Discord and webhook health payloads carry the same link.
+- The buffer directory gets a `.gitignore` (`*`, `!.gitignore`), never
+  replacing an existing one.
+
+### Changed
+
+- **`CPU_HIGH` and `CPU_SATURATION` judge a sustained average, not one
+  sample** ([#10](https://github.com/lemed99/nightowl-agent/issues/10)). Both
+  fired on the latest 10-second `/proc/stat` delta, so a scheduler burst on a
+  host that was ~90% idle raised a critical diagnosis advising a hardware
+  upgrade. They now fire on the average over `NIGHTOWL_CPU_SUSTAIN_SECONDS`,
+  computed as one delta across the window, and the message carries the average
+  and the peak. Percentages clamp to 0–100, a critical below the warning is
+  raised to it, the window rounds up to 10 s ticks and caps at 600 s, and `0`
+  keeps the single-sample behaviour. `system.cpu_usage_pct` in the health
+  payload still reports the latest tick.
+- **Buffer checkpoints run under a lock.** Every buffer write holds
+  `<buffer>.ckpt` shared and every checkpoint holds it exclusive, with SQLite's
+  own autocheckpoint off. This closes SQLite's WAL-reset bug (3.7.0 to 3.51.2,
+  the system library on Ubuntu 22.04 and 24.04), where a checkpoint racing
+  another process's commit can drop part of it, the suspected cause of the
+  corruption above. The agent checkpoints once 4 MB of WAL is waiting, counting
+  drain workers' writes, or 10 seconds after the last checkpoint when anything
+  was written.
+- SIGTERM and SIGINT shut down on the next loop tick, never in the middle of a
+  checkpoint.
+- The ingest is swapped in before any provider's `boot()`, so logs, queries,
+  cache calls and outgoing requests made during boot reach NightOwl, and
+  records the SDK buffered earlier are handed over.
+
+### Fixed
+
+- **`NIGHTOWL_DRAIN_WORKERS` had no effect.** It was never passed to the
+  server, so every agent ran one worker. It is honoured now, clamped to 1–16.
+- The health port is bound before any worker forks, so a clash stops the agent
+  with a message naming `NIGHTOWL_HEALTH_PORT` instead of leaving orphaned
+  workers behind.
+- The alert notifier connects with a 5 s bound and runs each channel query
+  under a 5 s `statement_timeout`. `NIGHTOWL_DB_SSLMODE` is applied only when
+  set, so `PGSSLMODE` is no longer overridden by the `prefer` default, on both
+  the notifier and the Laravel `nightowl` connection.
+- SMTP without a username sends no `AUTH`, so a relay without authentication
+  works, and non-ASCII subjects and sender names are RFC 2047 encoded.
+- A reopened issue's email is badged "Reopened", the worker-saturation email
+  prints its numbers, and the preheader reads "1 occurrence".
+- Cache rollups count every spelling the SDK sends (`write`, `write-failure`,
+  `delete-failure` and the older forms). Writes, write failures and delete
+  failures always read 0 before.
+- An outgoing-request threshold saved as `https://api.example.com` matches
+  calls to `api.example.com`.
+- `users_count` on exception issues no longer counts guests as one user.
+- A stop no longer blocks on an unrelated child after the alert child is
+  reaped.
+
 ## [2.4.7] - 2026-09-22
 
 ### Added
