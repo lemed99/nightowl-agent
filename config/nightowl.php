@@ -583,6 +583,15 @@ return [
             'degraded' => env('NIGHTOWL_HEALTH_INTERVAL_DEGRADED'),
             'critical' => env('NIGHTOWL_HEALTH_INTERVAL_CRITICAL'),
         ]),
+
+        // Host CPU diagnoses: CPU_HIGH (warning) above cpu_high_pct and
+        // CPU_SATURATION (critical) above cpu_critical_pct, judged on the
+        // average over the last cpu_sustain_seconds so a short burst (the
+        // scheduler at the top of the hour) does not page. 0 judges each
+        // 10-second sample on its own. Capped at 600.
+        'cpu_high_pct' => env('NIGHTOWL_CPU_HIGH_PCT', 70),
+        'cpu_critical_pct' => env('NIGHTOWL_CPU_CRITICAL_PCT', 90),
+        'cpu_sustain_seconds' => env('NIGHTOWL_CPU_SUSTAIN_SECONDS', 60),
     ],
 
     /*

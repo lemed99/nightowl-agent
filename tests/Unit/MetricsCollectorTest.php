@@ -9,12 +9,28 @@ class MetricsCollectorTest extends TestCase
 {
     private MetricsCollector $collector;
 
+    private string $procStat;
+
+    private int $cpuTotal = 0;
+
+    private int $cpuIdle = 0;
+
     protected function setUp(): void
     {
         $this->collector = new MetricsCollector(
             maxPendingRows: 100_000,
             maxBufferMemory: 256 * 1024 * 1024,
         );
+
+        // Never the host's own /proc/stat: on a busy Linux CI runner it would raise
+        // CPU diagnoses in unrelated tests. Absent until a CPU test writes to it.
+        $this->procStat = sys_get_temp_dir().'/nightowl-proc-stat-'.bin2hex(random_bytes(4));
+        (new \ReflectionProperty($this->collector, 'procStatPath'))->setValue($this->collector, $this->procStat);
+    }
+
+    protected function tearDown(): void
+    {
+        @unlink($this->procStat);
     }
 
     // --- Ring buffer & tick tests ---
@@ -1009,6 +1025,186 @@ class MetricsCollectorTest extends TestCase
         $codes = array_column($status['diagnoses'], 'code');
 
         $this->assertContains('MEMORY_HIGH', $codes);
+    }
+
+    // --- CPU sustain window (github#10) ---
+
+    /**
+     * One diagnosis tick in which the host's CPUs were $busyPct busy: 10 s of a
+     * 2 vCPU host at 100 Hz, written as /proc/stat and read through the real
+     * parser. The first call also lays down the baseline reading.
+     */
+    private function cpuTick(float $busyPct): void
+    {
+        if ($this->cpuTotal === 0) {
+            $this->cpuTotal = $this->cpuIdle = 1_000_000;
+            $this->writeProcStat();
+            $this->collector->runDiagnosis(false, 0, 0, 0);
+        }
+
+        $jiffies = 2000;
+        $this->cpuTotal += $jiffies;
+        $this->cpuIdle += (int) round($jiffies * (100 - $busyPct) / 100);
+        $this->writeProcStat();
+        $this->collector->runDiagnosis(false, 0, 0, 0);
+    }
+
+    private function writeProcStat(): void
+    {
+        $busy = $this->cpuTotal - $this->cpuIdle;
+        file_put_contents($this->procStat, sprintf("cpu  %d 0 0 %d 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\n", $busy, $this->cpuIdle));
+    }
+
+    private function cpuDiagnosis(): array|false
+    {
+        $status = $this->collector->getFullStatus(microtime(true) - 60, false, 0, 0, 0);
+        foreach (['CPU_SATURATION', 'CPU_HIGH'] as $code) {
+            $d = $this->activeDiagnosis($status, $code);
+            if ($d !== false) {
+                return $d;
+            }
+        }
+
+        return false;
+    }
+
+    public function testTheHourlySchedulerBurstOnAnIdleHostRaisesNothing(): void
+    {
+        // The report: ~9% average, then the top-of-the-hour scheduler pins both
+        // vCPUs for half a minute. Under the old single-sample rule that was a
+        // critical CPU_SATURATION; over a 60 s window it averages ~54%.
+        foreach ([8, 8, 8, 8, 8, 8, 100, 100, 100, 9, 8, 9, 8, 8, 8] as $pct) {
+            $this->cpuTick($pct);
+            $this->assertFalse($this->cpuDiagnosis(), "CPU diagnosis raised at a {$pct}% tick");
+        }
+    }
+
+    public function testTheSameBurstStillRaisesWithTheWindowTurnedOff(): void
+    {
+        $this->collector->setCpuThresholds(70, 90, 0);
+        foreach ([8, 8, 8, 100, 100, 100] as $pct) {
+            $this->cpuTick($pct);
+        }
+
+        $d = $this->cpuDiagnosis();
+        $this->assertNotFalse($d);
+        $this->assertSame('CPU_SATURATION', $d['code']);
+        $this->assertSame('Host CPU usage at 100.0%.', $d['message']);
+    }
+
+    public function testSustainedSaturationReportsTheWindowAverageAndPeak(): void
+    {
+        foreach ([95, 100, 95, 100, 95, 100, 95, 100] as $pct) {
+            $this->cpuTick($pct);
+        }
+
+        $d = $this->cpuDiagnosis();
+        $this->assertNotFalse($d);
+        $this->assertSame('CPU_SATURATION', $d['code']);
+        $this->assertSame('critical', $d['level']);
+        $this->assertSame(97.5, $d['value']);
+        $this->assertSame('Host CPU averaged 97.5% over the last 60s (peak 100.0%).', $d['message']);
+    }
+
+    public function testSustainedElevatedLoadIsAWarning(): void
+    {
+        foreach (array_fill(0, 8, 80) as $pct) {
+            $this->cpuTick($pct);
+        }
+
+        $d = $this->cpuDiagnosis();
+        $this->assertNotFalse($d);
+        $this->assertSame('CPU_HIGH', $d['code']);
+        $this->assertSame('warning', $d['level']);
+    }
+
+    public function testNothingIsRaisedBeforeTheWindowIsFull(): void
+    {
+        // 60 s = 6 ticks; the window fills on the sixth and the debounce reports
+        // it on the seventh.
+        for ($i = 1; $i <= 6; $i++) {
+            $this->cpuTick(100);
+            $this->assertFalse($this->cpuDiagnosis(), "raised after {$i} ticks");
+        }
+        $this->cpuTick(100);
+        $this->assertNotFalse($this->cpuDiagnosis());
+    }
+
+    public function testSaturationClearsOnceTheAverageDropsBack(): void
+    {
+        foreach (array_fill(0, 10, 100) as $pct) {
+            $this->cpuTick($pct);
+        }
+        $this->assertNotFalse($this->cpuDiagnosis());
+
+        foreach (array_fill(0, 6, 5) as $pct) {
+            $this->cpuTick($pct);
+        }
+
+        $this->assertFalse($this->cpuDiagnosis());
+        $status = $this->collector->getFullStatus(microtime(true) - 60, false, 0, 0, 0);
+        $this->assertContains('CPU_SATURATION', array_column($status['resolved_diagnoses'], 'code'));
+    }
+
+    public function testThresholdsAndWindowAreConfigurable(): void
+    {
+        $this->collector->setCpuThresholds(40, 50, 30);
+        foreach (array_fill(0, 5, 45) as $pct) {
+            $this->cpuTick($pct);
+        }
+
+        $d = $this->cpuDiagnosis();
+        $this->assertNotFalse($d);
+        $this->assertSame('CPU_HIGH', $d['code']);
+        $this->assertSame('Host CPU averaged 45.0% over the last 30s (peak 45.0%).', $d['message']);
+    }
+
+    public function testOutOfRangeCpuSettingsAreClamped(): void
+    {
+        $previous = ini_set('error_log', '/dev/null');
+        try {
+            $this->collector->setCpuThresholds(80, 60, 100_000);
+        } finally {
+            ini_set('error_log', (string) $previous);
+        }
+
+        $get = fn (string $prop) => (new \ReflectionProperty($this->collector, $prop))->getValue($this->collector);
+        $this->assertSame(80.0, $get('cpuCriticalPct'), 'a critical below the warning is raised to it');
+        $this->assertSame(60, $get('cpuWindowTicks'), 'the window is capped at 600 s');
+
+        $this->collector->setCpuThresholds(-5, 250, 15);
+        $this->assertSame(0.0, $get('cpuHighPct'));
+        $this->assertSame(100.0, $get('cpuCriticalPct'));
+        $this->assertSame(2, $get('cpuWindowTicks'), 'rounded up to whole 10 s ticks');
+    }
+
+    public function testThePayloadStillReportsTheLatestTick(): void
+    {
+        foreach ([10, 10, 10, 10, 10, 10, 100] as $pct) {
+            $this->cpuTick($pct);
+        }
+
+        $status = $this->collector->getFullStatus(microtime(true) - 60, false, 0, 0, 0);
+        $this->assertSame(100.0, $status['system']['cpu_usage_pct']);
+    }
+
+    public function testCountersGoingBackwardsRestartTheWindow(): void
+    {
+        foreach (array_fill(0, 8, 100) as $pct) {
+            $this->cpuTick($pct);
+        }
+        $this->assertNotFalse($this->cpuDiagnosis());
+
+        // A restored VM/container snapshot: the counters jump back. Measuring
+        // across the jump would give nonsense, so the window starts over.
+        $this->cpuTotal = $this->cpuIdle = 500_000;
+        $this->writeProcStat();
+        $this->collector->runDiagnosis(false, 0, 0, 0);
+        foreach (array_fill(0, 3, 100) as $pct) {
+            $this->cpuTick($pct);
+        }
+
+        $this->assertFalse($this->cpuDiagnosis());
     }
 
     // --- Health score tests ---

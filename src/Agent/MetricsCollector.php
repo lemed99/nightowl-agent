@@ -147,10 +147,23 @@ final class MetricsCollector
 
     private const MEMORY_HIGH_PCT = 0.7;
 
-    // System metrics thresholds
+    // System metrics thresholds. The CPU ones are defaults for
+    // NIGHTOWL_CPU_HIGH_PCT / NIGHTOWL_CPU_CRITICAL_PCT (see setCpuThresholds()).
     private const CPU_HIGH_PCT = 70.0;
 
     private const CPU_CRITICAL_PCT = 90.0;
+
+    // CPU is judged on its average over this many seconds, not on one tick: one
+    // 10 s sample (two, after the debounce) turned the hourly scheduler burst on a
+    // 2 vCPU host that sar showed 90% idle into a critical CPU_SATURATION
+    // (github#10). 0 = the latest tick alone, as before.
+    private const CPU_SUSTAIN_SECONDS = 60;
+
+    // Ten minutes of 10 s ticks is the longest window kept.
+    private const CPU_SUSTAIN_MAX_SECONDS = 600;
+
+    // runDiagnosis() runs on AsyncServer's 10-second timer.
+    private const DIAGNOSIS_TICK_SECONDS = 10;
 
     private const SYS_MEMORY_HIGH_PCT = 75.0;
 
@@ -332,10 +345,24 @@ final class MetricsCollector
     /** @var float[] */
     private array $loadAvg = [0.0, 0.0, 0.0];
 
-    // Previous CPU jiffies for delta calculation
-    private int $prevCpuTotal = 0;
+    private float $cpuHighPct = self::CPU_HIGH_PCT;
 
-    private int $prevCpuIdle = 0;
+    private float $cpuCriticalPct = self::CPU_CRITICAL_PCT;
+
+    // Ticks the CPU window spans; 1 = the latest tick alone. Set by the
+    // constructor through setCpuThresholds().
+    private int $cpuWindowTicks = 1;
+
+    // /proc/stat snapshots, oldest first, at most $cpuWindowTicks + 1: the window
+    // average is the jiffies delta from the first to the last, so a burst counts
+    // for exactly the time it ran. Each carries the usage of the tick it closed
+    // (null on the first), for the peak.
+    /** @var array<int, array{total: int, idle: int, pct: ?float}> */
+    private array $cpuSnapshots = [];
+
+    // Where CPU jiffies are read from. A property so a test can feed readings
+    // through the real parser instead of the host's own counters.
+    private string $procStatPath = '/proc/stat';
 
     // Diagnosis results
     /** @var array<int, array{code: string, level: string, message: string, recommendation: string, value: float|int}> */
@@ -370,6 +397,7 @@ final class MetricsCollector
         $this->rejectRing = array_fill(0, self::RING_SIZE, 0);
         $this->drainRing = array_fill(0, self::RING_SIZE, 0);
         $this->lagRing = array_fill(0, self::RING_SIZE, 0.0);
+        $this->setCpuThresholds(self::CPU_HIGH_PCT, self::CPU_CRITICAL_PCT, self::CPU_SUSTAIN_SECONDS);
     }
 
     /**
@@ -516,6 +544,29 @@ final class MetricsCollector
     public function setDrainWedgeSeconds(float $seconds): void
     {
         $this->drainWedgeSeconds = $seconds;
+    }
+
+    /**
+     * NIGHTOWL_CPU_HIGH_PCT / NIGHTOWL_CPU_CRITICAL_PCT / NIGHTOWL_CPU_SUSTAIN_SECONDS.
+     * Percentages are clamped to 0..100 and a critical below the warning is
+     * raised to it. The window is rounded up to whole diagnosis ticks and capped
+     * at CPU_SUSTAIN_MAX_SECONDS; 0 judges the latest tick alone.
+     */
+    public function setCpuThresholds(float $highPct, float $criticalPct, int $sustainSeconds): void
+    {
+        $highPct = max(0.0, min(100.0, $highPct));
+        $criticalPct = max(0.0, min(100.0, $criticalPct));
+        if ($criticalPct < $highPct) {
+            error_log(sprintf('[NightOwl Agent] NIGHTOWL_CPU_CRITICAL_PCT=%s is below NIGHTOWL_CPU_HIGH_PCT=%s; using %s for both.',
+                $criticalPct, $highPct, $highPct));
+            $criticalPct = $highPct;
+        }
+        $sustainSeconds = max(0, min(self::CPU_SUSTAIN_MAX_SECONDS, $sustainSeconds));
+
+        $this->cpuHighPct = $highPct;
+        $this->cpuCriticalPct = $criticalPct;
+        $this->cpuWindowTicks = max(1, (int) ceil($sustainSeconds / self::DIAGNOSIS_TICK_SECONDS));
+        $this->cpuSnapshots = array_slice($this->cpuSnapshots, -($this->cpuWindowTicks + 1));
     }
 
     public function readDrainMetrics(string $path, int $workerCount = 1): void
@@ -1178,23 +1229,30 @@ final class MetricsCollector
             ];
         }
 
-        // CPU_SATURATION (Linux only — /proc/stat)
-        if ($this->cpuUsagePct > self::CPU_CRITICAL_PCT) {
-            $diagnoses[] = [
-                'code' => 'CPU_SATURATION',
-                'level' => 'critical',
-                'message' => sprintf('Host CPU usage at %.1f%%.', $this->cpuUsagePct),
-                'recommendation' => 'Server is CPU-saturated. Reduce traffic, add agent instances, or upgrade hardware.',
-                'value' => round($this->cpuUsagePct, 1),
-            ];
-        } elseif ($this->cpuUsagePct > self::CPU_HIGH_PCT) {
-            $diagnoses[] = [
-                'code' => 'CPU_HIGH',
-                'level' => 'warning',
-                'message' => sprintf('Host CPU usage at %.1f%%.', $this->cpuUsagePct),
-                'recommendation' => 'CPU usage is elevated. Monitor for further degradation.',
-                'value' => round($this->cpuUsagePct, 1),
-            ];
+        // CPU_SATURATION / CPU_HIGH (Linux only — /proc/stat), on the average over
+        // the whole sustain window. Silent until the window is full, and clears the
+        // same way: once the average drops back under the threshold.
+        $cpu = $this->cpuWindow();
+        if ($cpu !== null && $cpu['avg'] > $this->cpuHighPct) {
+            $message = $this->cpuWindowTicks === 1
+                ? sprintf('Host CPU usage at %.1f%%.', $cpu['avg'])
+                : sprintf('Host CPU averaged %.1f%% over the last %ds (peak %.1f%%).',
+                    $cpu['avg'], $this->cpuWindowTicks * self::DIAGNOSIS_TICK_SECONDS, $cpu['peak']);
+            $diagnoses[] = $cpu['avg'] > $this->cpuCriticalPct
+                ? [
+                    'code' => 'CPU_SATURATION',
+                    'level' => 'critical',
+                    'message' => $message,
+                    'recommendation' => 'Server is CPU-saturated. Reduce traffic, add agent instances, or upgrade hardware.',
+                    'value' => $cpu['avg'],
+                ]
+                : [
+                    'code' => 'CPU_HIGH',
+                    'level' => 'warning',
+                    'message' => $message,
+                    'recommendation' => 'CPU usage is elevated. Monitor for further degradation.',
+                    'value' => $cpu['avg'],
+                ];
         }
 
         // SYSTEM_MEMORY (Linux only — /proc/meminfo)
@@ -1613,28 +1671,68 @@ final class MetricsCollector
     }
 
     /**
+     * Add one /proc/stat reading (cumulative jiffies) to the CPU window and set
+     * cpuUsagePct, the latest tick's usage the health payload reports.
+     */
+    private function recordCpuSample(int $total, int $idle): void
+    {
+        $last = $this->cpuSnapshots === [] ? null : $this->cpuSnapshots[array_key_last($this->cpuSnapshots)];
+        if ($last !== null && $total <= $last['total']) {
+            // No time elapsed, or the counters went backwards (a restored VM or
+            // container snapshot): nothing before this reading can be compared.
+            if ($total < $last['total']) {
+                $this->cpuSnapshots = [['total' => $total, 'idle' => $idle, 'pct' => null]];
+            }
+
+            return;
+        }
+
+        $pct = null;
+        if ($last !== null) {
+            $pct = round((1 - ($idle - $last['idle']) / ($total - $last['total'])) * 100, 1);
+            $this->cpuUsagePct = $pct;
+        }
+
+        $this->cpuSnapshots[] = ['total' => $total, 'idle' => $idle, 'pct' => $pct];
+        if (count($this->cpuSnapshots) > $this->cpuWindowTicks + 1) {
+            array_shift($this->cpuSnapshots);
+        }
+    }
+
+    /**
+     * Average and peak CPU usage over the sustain window, or null until it holds
+     * a full window of ticks.
+     *
+     * @return array{avg: float, peak: float}|null
+     */
+    private function cpuWindow(): ?array
+    {
+        if (count($this->cpuSnapshots) < $this->cpuWindowTicks + 1) {
+            return null;
+        }
+
+        $first = $this->cpuSnapshots[0];
+        $last = $this->cpuSnapshots[array_key_last($this->cpuSnapshots)];
+
+        return [
+            'avg' => round((1 - ($last['idle'] - $first['idle']) / ($last['total'] - $first['total'])) * 100, 1),
+            'peak' => max(array_column(array_slice($this->cpuSnapshots, 1), 'pct')),
+        ];
+    }
+
+    /**
      * Collect system-level metrics from /proc (Linux) or fallbacks.
      * Called every 10s during diagnosis tick. Sub-millisecond overhead.
      */
     private function collectSystemMetrics(): void
     {
         // CPU usage from /proc/stat (Linux only)
-        if (is_readable('/proc/stat')) {
-            $line = @file_get_contents('/proc/stat', false, null, 0, 256);
+        if (is_readable($this->procStatPath)) {
+            $line = @file_get_contents($this->procStatPath, false, null, 0, 256);
             if ($line !== false && preg_match('/^cpu\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m', $line, $m)) {
                 $idle = (int) $m[4];
                 $total = (int) $m[1] + (int) $m[2] + (int) $m[3] + $idle + (int) $m[5] + (int) $m[6] + (int) $m[7];
-
-                if ($this->prevCpuTotal > 0) {
-                    $totalDelta = $total - $this->prevCpuTotal;
-                    $idleDelta = $idle - $this->prevCpuIdle;
-                    $this->cpuUsagePct = $totalDelta > 0
-                        ? round((1 - $idleDelta / $totalDelta) * 100, 1)
-                        : 0.0;
-                }
-
-                $this->prevCpuTotal = $total;
-                $this->prevCpuIdle = $idle;
+                $this->recordCpuSample($total, $idle);
             }
         }
 

@@ -140,6 +140,9 @@ class NightOwlAgentServiceProvider extends ServiceProvider
                 drainWedgeSeconds: (float) config('nightowl.drain_connection.wedge_warn_seconds', 180),
                 driftWatcher: $this->makeDriftWatcher(),
                 backfillMarkerPath: MigrateCommand::backfillMarkerPath(),
+                cpuHighPct: (float) config('nightowl.agent.cpu_high_pct', 70),
+                cpuCriticalPct: (float) config('nightowl.agent.cpu_critical_pct', 90),
+                cpuSustainSeconds: (int) config('nightowl.agent.cpu_sustain_seconds', 60),
             );
         });
     }

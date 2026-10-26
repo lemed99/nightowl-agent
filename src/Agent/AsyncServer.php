@@ -138,6 +138,12 @@ final class AsyncServer
         // class touches no Laravel helpers, so the standalone harness works
         // without an app. null = feature off. Appended LAST (see above).
         private ?string $backfillMarkerPath = null,
+        // CPU_HIGH / CPU_SATURATION thresholds and the window their average is
+        // taken over (MetricsCollector::setCpuThresholds()). Appended LAST (see
+        // above).
+        float $cpuHighPct = 70.0,
+        float $cpuCriticalPct = 90.0,
+        int $cpuSustainSeconds = 60,
     ) {
         $this->expectedTokenHash = $token !== null
             ? substr(hash('xxh128', $token), 0, 7)
@@ -166,6 +172,7 @@ final class AsyncServer
         $this->loop = $loop;
         $this->metrics = new MetricsCollector($maxPendingRows, $maxBufferMemory);
         $this->metrics->setDrainWedgeSeconds($drainWedgeSeconds);
+        $this->metrics->setCpuThresholds($cpuHighPct, $cpuCriticalPct, $cpuSustainSeconds);
     }
 
     /**
