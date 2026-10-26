@@ -165,7 +165,9 @@ final class BootTimeRecordsTest extends TestCase
 
         $this->assertSame(0, $this->markerCount($nightowl, 'log'), 'NightOwl stayed attached after boot() disabled it');
         $this->assertSame(0, $this->recordCount($nightowl, 'request'));
-        $this->assertSame(1, $this->markerCount($nightwatch, 'log'), 'the SDK must send what it would have without NightOwl, once');
+        if (self::canHandOver()) {
+            $this->assertSame(1, $this->markerCount($nightwatch, 'log'), 'the SDK must send what it would have without NightOwl, once');
+        }
         $this->assertSame(1, $this->recordCount($nightwatch, 'request'));
     }
 
@@ -201,7 +203,9 @@ final class BootTimeRecordsTest extends TestCase
 
         $this->handleRequest(nightowlPort: $fromEnv->port, nightwatchPort: null);
 
-        $this->assertSame(1, $this->markerCount($fromBoot, 'log'), 'the record must reach the target set in boot(), once');
+        if (self::canHandOver()) {
+            $this->assertSame(1, $this->markerCount($fromBoot, 'log'), 'the record must reach the target set in boot(), once');
+        }
         $this->assertSame(1, $this->recordCount($fromBoot, 'request'));
         $this->assertSame(0, $this->markerCount($fromEnv, 'log'));
         $this->assertSame(0, $this->recordCount($fromEnv, 'request'));
@@ -218,9 +222,11 @@ final class BootTimeRecordsTest extends TestCase
 
         $this->handleRequest(nightowlPort: $nightowl->port, nightwatchPort: $nightwatch->port, parallel: false);
 
-        $this->assertSame(1, $this->markerCount($nightowl, 'log'));
+        if (self::canHandOver()) {
+            $this->assertSame(1, $this->markerCount($nightowl, 'log'));
+            $this->assertSame(1, $this->markerCount($nightwatch, 'log'));
+        }
         $this->assertSame(1, $this->recordCount($nightowl, 'request'));
-        $this->assertSame(1, $this->markerCount($nightwatch, 'log'));
         $this->assertSame(1, $this->recordCount($nightwatch, 'request'));
     }
 
@@ -261,11 +267,25 @@ final class BootTimeRecordsTest extends TestCase
 
         $this->handleRequest(nightowlPort: $nightowl->port, nightwatchPort: null);
 
-        $this->assertSame(1, $this->markerCount($nightowl, 'log'), 'the record written before NightOwl attached must be handed over, once');
+        if (self::canHandOver()) {
+            $this->assertSame(1, $this->markerCount($nightowl, 'log'), 'the record written before NightOwl attached must be handed over, once');
+        }
         $this->assertSame(1, $this->recordCount($nightowl, 'request'));
     }
 
     // ─── Harness ───────────────────────────────────────────────
+
+    /**
+     * Whether this Nightwatch lets a buffered record move from one ingest to
+     * another. A setting changed in boot() re-wires the ingest in booted(), and
+     * the boot-time records written before it move only through
+     * RecordsBuffer::all(), which Nightwatch before about 1.29 lacks: there they are dropped
+     * by design, and only the request records that follow can be asserted.
+     */
+    private static function canHandOver(): bool
+    {
+        return method_exists(RecordsBuffer::class, 'all');
+    }
 
     private function startAgent(): ScriptedServer
     {

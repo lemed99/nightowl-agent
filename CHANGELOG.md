@@ -69,7 +69,10 @@ in the git tags.
   checkpoint.
 - The ingest is swapped in before any provider's `boot()`, so logs, queries,
   cache calls and outgoing requests made during boot reach NightOwl, and
-  records the SDK buffered earlier are handed over.
+  records the SDK buffered earlier are handed over (Nightwatch 1.29 and later;
+  older versions lack the `RecordsBuffer::all()` the hand-over reads, so
+  there a record written before the swap, or before a `boot()` changed a
+  NightOwl setting, is dropped).
 
 ### Fixed
 
