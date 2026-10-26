@@ -3,6 +3,7 @@
 namespace NightOwl\Agent;
 
 use Composer\InstalledVersions;
+use NightOwl\Support\SqliteFailure;
 
 /**
  * In-memory metrics collector for the agent parent process.
@@ -110,6 +111,38 @@ final class MetricsCollector
     // failed batch, so this window only governs the post-last-failure decay.
     private const DRAIN_CONN_FAIL_FRESH_SECONDS = 45;
 
+    // The drain retries a failing buffer operation every loop and re-stamps its
+    // clock each time, so this only governs how long the signal outlives a worker
+    // that stopped reporting. Same reasoning as DRAIN_CONN_FAIL_FRESH_SECONDS.
+    private const DRAIN_BUFFER_FAIL_FRESH_SECONDS = 45;
+
+    // How long BUFFER_REPAIRED stays up after the agent repaired or replaced a
+    // corrupt buffer. Long enough to be seen on the health page and to reach a
+    // health alert, not so long that it reads as an outage still going on.
+    private const BUFFER_REPAIRED_VISIBLE_SECONDS = 3600;
+
+    // The ingest side calls the buffer unwritable when, over the last minute, at
+    // least this many payloads were refused by it AND they are more than
+    // REJECT_RATE_HIGH_PCT of everything that arrived (critical past
+    // REJECT_RATE_CRITICAL_PCT). A window, not a streak of the latest events: a
+    // streak flapped on a buffer refusing most-but-not-all appends (on and off
+    // every tick, so neither this nor REJECT_RATE survived the debounce), and
+    // latched forever on a quiet app whose last payloads failed.
+    private const INGEST_BUFFER_FAIL_MIN = 3;
+
+    // The window alone kept the card up for most of a minute after a fix, still
+    // saying payloads are being lost. It counts as recovered once the buffer has
+    // accepted a payload and gone this many seconds without a refusal, or three
+    // times the window's average gap between refusals if that is longer: a buffer
+    // refusing one payload in twenty on a slow app is not recovered by a quiet
+    // quarter minute.
+    private const INGEST_BUFFER_RECOVERED_SECONDS = 15;
+
+    // At most one ingest-side "SQLite buffer error" log line per this many seconds.
+    // The common cause is a full disk, and one line per refused payload — thousands
+    // a second on a busy app — is exactly what fills the rest of it.
+    private const BUFFER_FAIL_LOG_INTERVAL_SECONDS = 60;
+
     // A boot backfill that is still owed this long after it was recorded is no
     // longer "in progress" — it is either much bigger than the tenant expected
     // or nobody is going to run it (NIGHTOWL_AUTO_BACKFILL=false). Six hours,
@@ -181,6 +214,51 @@ final class MetricsCollector
     private int $ingestThisSecond = 0;
 
     private int $rejectsThisSecond = 0;
+
+    // Payloads the local buffer refused, per second over the last minute — a
+    // subset of the reject ring, kept apart so REJECT_RATE can describe only the
+    // OTHER rejects (bad token, back-pressure) and BUFFER_UNWRITABLE these.
+    private int $bufferFailsThisSecond = 0;
+
+    /** @var int[] */
+    private array $bufferFailRing = [];
+
+    private int $bufferFailRingIdx = 0;
+
+    private int $ingestBufferFailCode = 0;
+
+    private float $ingestBufferFailAt = 0.0;
+
+    // Last time the agent checked a corrupt buffer (AsyncServer::recoverBuffer()),
+    // and what came of it. Buffer failures stamped before it are history: they
+    // must not keep BUFFER_UNWRITABLE up or start another recovery.
+    private float $bufferRecoveredAt = 0.0;
+
+    /** @var array{outcome: string, pending_rows: ?int, moved_to: ?string}|null */
+    private ?array $bufferRecovery = null;
+
+    // When the agent last repaired or replaced the buffer: BUFFER_REPAIRED's own
+    // clock. Not $bufferRecoveredAt, which every check moves, so a clean check
+    // after a repair kept the hour-old card up for another hour.
+    private float $bufferRepairedAt = 0.0;
+
+    /** Whole seconds ticked since the last one with a refused append. */
+    private int $secondsSinceBufferFail = PHP_INT_MAX;
+
+    private bool $acceptedSinceBufferFail = false;
+
+    private float $lastBufferFailLogAt = 0.0;
+
+    private int $bufferFailsSinceLog = 0;
+
+    // Local buffer failing on the drain side: the claim/fetch/mark that has to
+    // succeed before, and after, any Postgres write. The most recent failure of
+    // any worker whose OWN last buffer outcome is a failure — judged per worker,
+    // because an idle worker's empty claim succeeds even on a full disk (it
+    // writes nothing) and would otherwise mask a peer stuck on its mark.
+    private float $drainBufferFailAt = 0.0;
+
+    private int $drainBufferFailCode = 0;
 
     // Drain metrics (read from temp file written by DrainWorker)
     private int $drainTotal = 0;
@@ -395,6 +473,7 @@ final class MetricsCollector
         $this->startedAt = microtime(true);
         $this->ingestRing = array_fill(0, self::RING_SIZE, 0);
         $this->rejectRing = array_fill(0, self::RING_SIZE, 0);
+        $this->bufferFailRing = array_fill(0, self::RING_SIZE, 0);
         $this->drainRing = array_fill(0, self::RING_SIZE, 0);
         $this->lagRing = array_fill(0, self::RING_SIZE, 0.0);
         $this->setCpuThresholds(self::CPU_HIGH_PCT, self::CPU_CRITICAL_PCT, self::CPU_SUSTAIN_SECONDS);
@@ -407,6 +486,7 @@ final class MetricsCollector
     {
         $this->ingestTotal++;
         $this->ingestThisSecond++;
+        $this->acceptedSinceBufferFail = true;
     }
 
     /**
@@ -416,6 +496,42 @@ final class MetricsCollector
     {
         $this->ingestRejected++;
         $this->rejectsThisSecond++;
+    }
+
+    /**
+     * Called when a payload could not be appended to the local SQLite buffer.
+     *
+     * Counted as a reject — the sender got 5:ERROR (UDP: the datagram is gone) and
+     * that telemetry is lost. It used to count as nothing, so an agent whose
+     * buffer refused every write reported ingest 0 and rejects 0: an idle app, not
+     * a broken agent (Yomoney, 2026-10-15, 19 hours).
+     *
+     * Returns how many failures the caller should report in a log line now, or 0
+     * to stay quiet: at most one line per BUFFER_FAIL_LOG_INTERVAL_SECONDS, carrying
+     * the count since the last one. Throttled by time alone, not by streak — a
+     * buffer that fails every other append would otherwise log every failure.
+     *
+     * @param  int  $sqliteCode  SQLite primary result code (SqliteFailure::code()), 0 if unknown.
+     */
+    public function recordBufferWriteFailure(int $sqliteCode): int
+    {
+        $this->recordReject();
+        $this->bufferFailsThisSecond++;
+        $this->ingestBufferFailCode = $sqliteCode;
+        $this->ingestBufferFailAt = microtime(true);
+        $this->acceptedSinceBufferFail = false;
+        $this->bufferFailsSinceLog++;
+
+        $now = microtime(true);
+        if (($now - $this->lastBufferFailLogAt) >= self::BUFFER_FAIL_LOG_INTERVAL_SECONDS) {
+            $count = $this->bufferFailsSinceLog;
+            $this->bufferFailsSinceLog = 0;
+            $this->lastBufferFailLogAt = $now;
+
+            return $count;
+        }
+
+        return 0;
     }
 
     /**
@@ -446,6 +562,15 @@ final class MetricsCollector
         $this->rejectRing[$this->rejectRingIdx] = $this->rejectsThisSecond;
         $this->rejectRingIdx = ($this->rejectRingIdx + 1) % self::RING_SIZE;
         $this->rejectsThisSecond = 0;
+
+        $this->bufferFailRing[$this->bufferFailRingIdx] = $this->bufferFailsThisSecond;
+        $this->bufferFailRingIdx = ($this->bufferFailRingIdx + 1) % self::RING_SIZE;
+        if ($this->bufferFailsThisSecond > 0) {
+            $this->secondsSinceBufferFail = 0;
+        } elseif ($this->secondsSinceBufferFail < PHP_INT_MAX) {
+            $this->secondsSinceBufferFail++;
+        }
+        $this->bufferFailsThisSecond = 0;
 
         // Zero out the next drain ring slot so stale data doesn't persist.
         // Actual drain values are backfilled by readDrainMetrics() every 5s.
@@ -593,6 +718,8 @@ final class MetricsCollector
         $mostRecentOkAt = 0.0;
         $mostRecentConnFailAt = 0.0;
         $quarantinedTotal = 0;
+        $mostRecentBufErrAt = 0.0;
+        $mostRecentBufErrCode = 0;
         $mostRecentQuarAt = 0.0;
         $mostRecentQuarSqlstate = null;
         $mostRecentQuarTable = null;
@@ -661,6 +788,21 @@ final class MetricsCollector
             // one worker drained successfully more recently than its connection blip,
             // the shared PG is reachable, so the newer lastDrainOkAt suppresses the alarm.
             $mostRecentConnFailAt = max($mostRecentConnFailAt, (float) ($data['last_conn_fail_at'] ?? 0.0));
+
+            // Local buffer failure, judged PER WORKER: this worker's last buffer
+            // outcome was a failure. NOT max-error vs max-ok across workers — an
+            // idle worker's empty claim writes nothing, so it succeeds on a full
+            // disk every loop and would mask a peer whose mark keeps failing
+            // (found by review on a real full disk image). Only files THIS run
+            // wrote count: a previous run's failure must not greet the restart
+            // that fixed it.
+            $bufErrAt = (float) ($data['buffer_error_at'] ?? 0.0);
+            if ($bufErrAt > (float) ($data['buffer_ok_at'] ?? 0.0)
+                && (float) ($data['updated_at'] ?? 0.0) >= $this->startedAt
+                && $bufErrAt > $mostRecentBufErrAt) {
+                $mostRecentBufErrAt = $bufErrAt;
+                $mostRecentBufErrCode = (int) ($data['buffer_error_code'] ?? 0);
+            }
 
             // Quarantine: quarantined_total is a per-worker cumulative counter (each
             // worker counts the rows IT dead-lettered), so SUM across workers. It is
@@ -781,6 +923,8 @@ final class MetricsCollector
         $this->lastDrainErrorTable = $mostRecentErrTable;
         $this->lastDrainOkAt = $mostRecentOkAt;
         $this->lastConnFailAt = $mostRecentConnFailAt;
+        $this->drainBufferFailAt = $mostRecentBufErrAt;
+        $this->drainBufferFailCode = $mostRecentBufErrCode;
         $this->drainQuarantinedTotal = $quarantinedTotal;
         $this->lastQuarantineSqlstate = $mostRecentQuarSqlstate;
         $this->lastQuarantineTable = $mostRecentQuarTable;
@@ -809,6 +953,46 @@ final class MetricsCollector
     }
 
     /**
+     * When the buffer last said it is corrupt (SQLite 11, or 26 "not a
+     * database"), on the drain side or the ingest side, or 0.0. A failure from
+     * before the last recovery does not count.
+     */
+    public function bufferCorruptionSignalAt(): float
+    {
+        $at = 0.0;
+        if (SqliteFailure::isCorruption($this->drainBufferFailCode)) {
+            $at = $this->drainBufferFailAt;
+        }
+        if (SqliteFailure::isCorruption($this->ingestBufferFailCode)) {
+            $at = max($at, $this->ingestBufferFailAt);
+        }
+
+        return $at > $this->bufferRecoveredAt ? $at : 0.0;
+    }
+
+    /**
+     * Record what AsyncServer::recoverBuffer() did. A repair (REINDEXED) or a
+     * replacement (MOVED_ASIDE) raises BUFFER_REPAIRED for an hour; a clean or
+     * failed check leaves it as it was. Every buffer failure stamped before
+     * now is set aside, so the errors that started the recovery do not keep
+     * BUFFER_UNWRITABLE up afterwards.
+     *
+     * @param  string  $outcome  a BufferRecovery outcome constant
+     * @param  ?string  $movedTo  file name (not the path) of the copy set aside
+     */
+    public function recordBufferRecovery(string $outcome, ?int $pendingRows = null, ?string $movedTo = null): void
+    {
+        $this->bufferRecoveredAt = microtime(true);
+        $this->drainBufferFailAt = 0.0;
+        $this->drainBufferFailCode = 0;
+
+        if ($outcome === BufferRecovery::REINDEXED || $outcome === BufferRecovery::MOVED_ASIDE) {
+            $this->bufferRecovery = ['outcome' => $outcome, 'pending_rows' => $pendingRows, 'moved_to' => $movedTo];
+            $this->bufferRepairedAt = $this->bufferRecoveredAt;
+        }
+    }
+
+    /**
      * Run diagnosis rules every 10 seconds.
      */
     public function runDiagnosis(bool $backPressure, int $pendingRows, int $walSize, int $rss): void
@@ -825,9 +1009,15 @@ final class MetricsCollector
         $drainMetricsStale = $this->drainMetricsUpdatedAt > 0
             && (microtime(true) - $this->drainMetricsUpdatedAt) > self::DRAIN_METRICS_STALE_SECONDS;
 
-        // Compute reject rate as percentage of total traffic
-        $totalTraffic = $ingestRate + $rejectRate;
-        $rejectPct = $totalTraffic > 0 ? ($rejectRate / $totalTraffic) * 100 : 0.0;
+        // Compute reject rate as percentage of traffic. Payloads the buffer refused
+        // are left out of the diagnosis rate (not of the reported one), on both
+        // sides of the fraction: BUFFER_UNWRITABLE describes them, and keeping them
+        // here raised "consider scaling" for a minute after the buffer was fixed,
+        // while the ring still held them. Left in the denominator only, they would
+        // dilute bad-token and back-pressure rejects, which still show alongside it.
+        $otherRejectRate = max(0.0, $rejectRate - $this->ringAvg($this->bufferFailRing));
+        $otherTraffic = $ingestRate + $otherRejectRate;
+        $rejectPct = $otherTraffic > 0 ? ($otherRejectRate / $otherTraffic) * 100 : 0.0;
 
         // Postgres is UNREACHABLE — the drain can't connect — when there's a recent
         // connection failure that is the MOST RECENT drain outcome (newer than the last
@@ -854,6 +1044,36 @@ final class MetricsCollector
             && $this->lastDrainErrorAt > $this->lastDrainOkAt
             && $this->lastDrainErrorAt >= $this->lastConnFailAt;
 
+        // The agent's OWN buffer is refusing writes — nothing to do with Postgres.
+        // Ingest side: over the last minute, enough refused appends to be more than
+        // a blip (see INGEST_BUFFER_FAIL_MIN). Drain side: a worker whose claim/
+        // fetch/mark keeps failing, fresh enough that it is still trying — or whose
+        // metrics file stopped updating since, which on a filling disk is the same
+        // failure reaching the file the signal travels in. Either alone is the
+        // outage; DRAIN_STOPPED's "check PostgreSQL" advice is the wrong machine
+        // for both.
+        $ingestBufferFails = array_sum($this->bufferFailRing);
+        $ingestAccepted = array_sum($this->ingestRing);
+        $ingestBufferFailPct = $ingestBufferFails > 0
+            ? ($ingestBufferFails / ($ingestBufferFails + $ingestAccepted)) * 100
+            : 0.0;
+        $ingestBufferRecovered = $this->acceptedSinceBufferFail
+            && $this->bufferFailsThisSecond === 0
+            && $this->secondsSinceBufferFail >= max(
+                self::INGEST_BUFFER_RECOVERED_SECONDS,
+                $ingestBufferFails > 0 ? (int) ceil(3 * self::RING_SIZE / $ingestBufferFails) : 0,
+            );
+        // The refusals that started a recovery stay in the ring for a minute
+        // after it; only one since says the buffer is still refusing.
+        $ingestBufferFailing = $ingestBufferFails >= self::INGEST_BUFFER_FAIL_MIN
+            && $ingestBufferFailPct > self::REJECT_RATE_HIGH_PCT
+            && ! $ingestBufferRecovered
+            && $this->ingestBufferFailAt > $this->bufferRecoveredAt;
+        $drainBufferFailing = $this->drainBufferFailAt > $this->bufferRecoveredAt
+            && ((microtime(true) - $this->drainBufferFailAt) < self::DRAIN_BUFFER_FAIL_FRESH_SECONDS
+                || $drainMetricsStale);
+        $bufferUnwritable = $ingestBufferFailing || $drainBufferFailing;
+
         // DRAIN_UNREACHABLE — critical; owns the connectivity story and suppresses both
         // DRAIN_STOPPED ("may be unreachable") and the DRAIN_ERRORS warning.
         if ($connUnreachable) {
@@ -863,6 +1083,49 @@ final class MetricsCollector
                 'message' => 'The drain cannot connect to PostgreSQL.',
                 'recommendation' => 'Check that PostgreSQL is running and reachable from the agent (host/port/credentials/network/firewall). Telemetry is buffered and drains automatically once the connection recovers.',
                 'value' => $pendingRows,
+            ];
+        }
+
+        // BUFFER_UNWRITABLE — the local SQLite buffer refuses writes. Keyed by
+        // SQLite's result code, because a full disk, a read-only file, a corrupt
+        // file and a lock held by another process each have a different fix.
+        if ($bufferUnwritable) {
+            // Ingest's code first (it is the side losing data), unless it says nothing
+            // about the file and the drain's does.
+            $code = $ingestBufferFailing ? $this->ingestBufferFailCode : $this->drainBufferFailCode;
+            if (! SqliteFailure::isInformative($code) && $drainBufferFailing
+                && SqliteFailure::isInformative($this->drainBufferFailCode)) {
+                $code = $this->drainBufferFailCode;
+            }
+            [$message, $recommendation] = $this->bufferUnwritableAdvice($code, $ingestBufferFailing);
+            $diagnoses[] = [
+                'code' => 'BUFFER_UNWRITABLE',
+                // Same bands as REJECT_RATE for the ingest side. A drain that cannot
+                // touch the buffer moves nothing at all, so that side is critical.
+                'level' => $drainBufferFailing || $ingestBufferFailPct > self::REJECT_RATE_CRITICAL_PCT
+                    ? 'critical'
+                    : 'warning',
+                'message' => $message,
+                'recommendation' => $recommendation,
+                // Ingest side: payloads refused in the last minute. Drain side: rows
+                // waiting in the buffer.
+                'value' => $ingestBufferFailing ? $ingestBufferFails : $pendingRows,
+            ];
+        }
+
+        // BUFFER_REPAIRED — the buffer was corrupt and the agent repaired or
+        // replaced it. A warning, not critical: it is over. It stays up for an
+        // hour because a corrupt buffer is rare enough that it should be seen,
+        // and because a second one soon after says something about the host.
+        if ($this->bufferRecovery !== null
+            && microtime(true) - $this->bufferRepairedAt < self::BUFFER_REPAIRED_VISIBLE_SECONDS) {
+            [$message, $recommendation] = $this->bufferRepairedAdvice($this->bufferRecovery);
+            $diagnoses[] = [
+                'code' => 'BUFFER_REPAIRED',
+                'level' => 'warning',
+                'message' => $message,
+                'recommendation' => $recommendation,
+                'value' => $this->bufferRecovery['pending_rows'] ?? 0,
             ];
         }
 
@@ -877,9 +1140,10 @@ final class MetricsCollector
 
         // DRAIN_STOPPED — suppressed when writes are being rejected (DRAIN_WRITE_FAILING
         // names the real cause), when DRAIN_UNREACHABLE already owns the connectivity
-        // story, or when DRAIN_WEDGED has named the exact blocking call; what's left is
-        // the worker-crash / stuck case.
-        $drainStopped = $drainRate == 0 && $pendingRows > 100 && ! $writeFailing && ! $connUnreachable && ! $wedged;
+        // story, when DRAIN_WEDGED has named the exact blocking call, or when
+        // BUFFER_UNWRITABLE has (its "check PostgreSQL" advice sent an operator to a
+        // healthy database for 19 hours); what's left is the worker-crash / stuck case.
+        $drainStopped = $drainRate == 0 && $pendingRows > 100 && ! $writeFailing && ! $connUnreachable && ! $wedged && ! $bufferUnwritable;
         if ($drainStopped) {
             $diagnoses[] = [
                 'code' => 'DRAIN_STOPPED',
@@ -1108,7 +1372,7 @@ final class MetricsCollector
             $windowDrained += $drained;
             $windowTransient += $transient;
         }
-        if ($windowFailed > 0 && ! $writeFailing && ! $drainStopped && ! $connUnreachable) {
+        if ($windowFailed > 0 && ! $writeFailing && ! $drainStopped && ! $connUnreachable && ! $bufferUnwritable) {
             $failRate = ($windowFailed / ($windowFailed + $windowDrained)) * 100;
             if ($failRate > self::DRAIN_ERROR_RATE_PCT) {
                 $diagnoses[] = [
@@ -1210,7 +1474,7 @@ final class MetricsCollector
             ];
         }
 
-        // REJECT_RATE
+        // REJECT_RATE — rejects other than the buffer's own refusals (see $rejectPct).
         if ($rejectPct > self::REJECT_RATE_CRITICAL_PCT) {
             $diagnoses[] = [
                 'code' => 'REJECT_RATE_CRITICAL',
@@ -1510,6 +1774,91 @@ final class MetricsCollector
         }
 
         return implode(', ', $parts);
+    }
+
+    /**
+     * Operator-facing message + recommendation for a local buffer that refuses
+     * writes, keyed by SQLite result code. Templated like drainWriteAdvice() —
+     * never the raw SQLite text or the buffer's path on the host — and within
+     * the platform's 1KB diagnosis-message cap.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private function bufferUnwritableAdvice(int $sqliteCode, bool $ingestFailing): array
+    {
+        $message = $ingestFailing
+            ? sprintf('The agent cannot write to its local buffer, so incoming telemetry is being refused and lost (SQLite: %s).', SqliteFailure::describe($sqliteCode))
+            : sprintf('The agent cannot update its local buffer, so buffered telemetry is not reaching PostgreSQL (SQLite: %s).', SqliteFailure::describe($sqliteCode));
+
+        // Where the file lives, without shipping a path off the host.
+        $where = 'The buffer is NIGHTOWL_AGENT_SQLITE_PATH (storage/nightowl/agent-buffer.sqlite by default) '
+            .'with its -wal and -shm files. ';
+
+        // Each arm describes how that code actually arises on a RUNNING agent, whose
+        // buffer handles stay open: permissions only bite when a file is (re)opened —
+        // a drain worker starting, or the agent restarting — and a read-only remount
+        // under an open handle surfaces as an I/O error, not as READONLY (both
+        // checked by review).
+        $fix = match ($sqliteCode) {
+            SqliteFailure::FULL => 'The volume holding it is full: check `df -h` on that directory and free '
+                .'space (log files are the usual culprit).',
+            SqliteFailure::READONLY => 'It is not writable by the user the agent runs as: the files or their '
+                .'directory are owned by another user (a command run with sudo is the usual cause). Give them '
+                .'back to the agent\'s user.',
+            SqliteFailure::IOERR => 'The operating system returned an I/O error: a failing disk, a filesystem the '
+                .'kernel remounted read-only after an error (check `dmesg` and `findmnt`), or a network '
+                .'filesystem dropping out. Keep the buffer on a local disk.',
+            SqliteFailure::CORRUPT, SqliteFailure::NOTADB => 'The file is corrupt. The agent checks it by itself '
+                .'within a minute: it rebuilds damaged indexes, or sets the file aside and starts a fresh buffer. '
+                .'If this does not clear within a few minutes, stop the agent, move the three files aside (do not '
+                .'delete them: rows not yet drained are in there) and start it again.',
+            SqliteFailure::CANTOPEN => 'SQLite cannot open the files: the directory was removed or renamed or is '
+                .'not writable by the agent\'s user, or the host is out of inodes (`df -i`) or file descriptors.',
+            SqliteFailure::BUSY => 'Another process holds it locked past the 5s busy timeout, usually a tool '
+                .'outside the agent (an sqlite3 shell, a backup or sync job) keeping the file open. Close it.',
+            SqliteFailure::NOMEM => 'SQLite ran out of memory. Check the host\'s free memory.',
+            default => 'Check the agent log for "SQLite buffer error" or "[NightOwl Drain] Buffer error": free '
+                .'space, ownership and write permission on the buffer directory are the usual causes.',
+        };
+
+        $impact = $ingestFailing
+            ? ' Until it can write, every payload is answered with an error and that telemetry is lost.'
+            : ' Telemetry already buffered is safe and drains once the buffer is writable again.';
+
+        // A corrupt file's fix already includes the restart.
+        $resume = in_array($sqliteCode, [SqliteFailure::CORRUPT, SqliteFailure::NOTADB], true)
+            ? ''
+            : ' Once fixed the agent normally resumes by itself; restart it if this has not cleared within a few minutes.';
+
+        return [$message, $where.$fix.$impact.$resume];
+    }
+
+    /**
+     * Message + recommendation for BUFFER_REPAIRED. Names the set-aside copy by
+     * its file name only, never its directory: the path stays on the host.
+     *
+     * @param  array{outcome: string, pending_rows: ?int, moved_to: ?string}  $recovery
+     * @return array{0: string, 1: string}
+     */
+    private function bufferRepairedAdvice(array $recovery): array
+    {
+        if ($recovery['outcome'] === BufferRecovery::REINDEXED) {
+            return [
+                'The local buffer was corrupt: one of its indexes no longer matched its rows. The agent rebuilt the index and no buffered telemetry was lost.',
+                'Nothing to do. Some telemetry from just before the corruption may have been written to PostgreSQL twice. If this happens again, check the host for disk or memory errors (`dmesg`).',
+            ];
+        }
+
+        $copy = $recovery['moved_to'] !== null ? $recovery['moved_to'] : 'a .corrupt- copy next to it';
+        $rows = $recovery['pending_rows'];
+        $lost = $rows === null
+            ? 'Telemetry that had not reached PostgreSQL yet could not be counted and is not in the new buffer.'
+            : sprintf('%s that had not reached PostgreSQL %s left in that copy and will not be drained.', number_format($rows).($rows === 1 ? ' payload' : ' payloads'), $rows === 1 ? 'was' : 'were');
+
+        return [
+            sprintf('The local buffer was corrupt beyond repair. The agent set it aside as %s and started a fresh buffer. %s', $copy, $lost),
+            'Ingest and the drain have resumed on their own. The agent keeps the two newest corrupt copies for investigation and deletes older ones. If this happens again, check the host for disk or memory errors (`dmesg`).',
+        ];
     }
 
     /**

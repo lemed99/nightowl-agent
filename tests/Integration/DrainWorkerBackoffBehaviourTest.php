@@ -106,7 +106,7 @@ class DrainWorkerBackoffBehaviourTest extends TestCase
             $this->priorErrorLog = null;
         }
 
-        foreach (['', '-wal', '-shm'] as $suffix) {
+        foreach (['', '-wal', '-shm', '.ckpt', '.ckpt-gate'] as $suffix) {
             $f = $this->bufferPath.$suffix;
             if (file_exists($f)) {
                 @unlink($f);

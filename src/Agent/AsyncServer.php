@@ -3,6 +3,7 @@
 namespace NightOwl\Agent;
 
 use NightOwl\Support\AgentInstanceId;
+use NightOwl\Support\SqliteFailure;
 use React\Datagram\Socket as DatagramSocket;
 use React\EventLoop\Loop;
 use React\EventLoop\LoopInterface;
@@ -18,6 +19,59 @@ final class AsyncServer
     private const MAX_PAYLOAD_BYTES = 10 * 1024 * 1024; // 10 MB per connection
     private const CHILD_SHUTDOWN_TIMEOUT = 10; // seconds
     private const RESTART_COOLDOWN = 2.0; // seconds — suppress rapid restart loops
+
+    // A corruption error older than this does not start a buffer recovery: the
+    // drain re-stamps its error every loop while the file stays broken, so an
+    // old one means the failure has stopped.
+    private const BUFFER_CORRUPTION_FRESH_SECONDS = 60;
+
+    // At most one buffer recovery per this many seconds. It stops the drain and
+    // reads the whole file, so a check that finds nothing wrong (a corruption
+    // error SQLite raised without the file being damaged) must not repeat every
+    // tick.
+    private const BUFFER_RECOVERY_COOLDOWN_SECONDS = 300;
+
+    // WAL size past which the parent checkpoints. The buffer runs with
+    // wal_autocheckpoint=0 (see SqliteBuffer's constructor), so this takes over
+    // from SQLite's own checkpoint, which ran inside the parent's commits at
+    // 1000 pages: 4 MB at the 4 KB page size. The parent, not a drain worker:
+    // a worker can spend minutes inside one PostgreSQL write, and in a
+    // benchmark at ~9k payloads/s the WAL reached 424 MB while worker 0 was
+    // busy (2026-10-22).
+    private const WAL_CHECKPOINT_BYTES = 4 * 1024 * 1024;
+
+    // How often the parent looks. Each append is its own commit and rewrites
+    // whole pages (the table leaf, the index, the AUTOINCREMENT counter), so
+    // ~9k payloads/s put 50-60k frames a second into the WAL, ~240 MB. Once a
+    // second let the WAL reach 470 MB in that benchmark; SQLite's own
+    // checkpoint ran every ~20ms at that rate.
+    private const WAL_CHECKPOINT_INTERVAL_SECONDS = 0.1;
+
+    // How long that checkpoint waits for the writes already running in drain
+    // workers, so how long it can hold up the event loop. About what an append
+    // already waits behind a worker's write.
+    private const WAL_CHECKPOINT_LOCK_WAIT_MS = 100;
+
+    // After a pass that did not get its turn, the next waits this long: a
+    // worker's long write (a VACUUM holds the lock for its whole length) must
+    // not cost the event loop 100ms of every 100ms.
+    private const WAL_CHECKPOINT_RETRY_SECONDS = 1.0;
+
+    // Past 4 MB the -wal file stays that size (SQLite reuses it from the start
+    // after a checkpoint), so its size cannot say when the next one is due.
+    // Keyed on size alone, it ran every pass with anything written: at 5
+    // payloads/s that was ten checkpoints a second, each two fsyncs inside the
+    // event loop, where SQLite's own ran about every 30s. What says it is the
+    // WAL not yet copied back, by any process (SqliteBuffer::
+    // uncheckpointedWalBytes()): a drain worker catching up on a backlog writes
+    // ~20 MB of WAL per 5,000-row claim and mark, which the parent's own writes
+    // never show. When that cannot be read, the parent counts its own writes at
+    // this much each (an append commits 3-7 whole pages, 13-29 KB of WAL at the
+    // 4 KB page size, measured on payloads of 0.2-8 KB).
+    private const WAL_BYTES_PER_WRITE = 16 * 1024;
+
+    // Anything written at all is checkpointed at least this often.
+    private const WAL_CHECKPOINT_MAX_INTERVAL_SECONDS = 10.0;
     private const BACK_PRESSURE_CHECK_INTERVAL = 5.0; // seconds
 
     /**
@@ -62,6 +116,9 @@ final class AsyncServer
     /** ALERT_CHILD_MAX_SECONDS, as a property so a test can shorten it. */
     private int $alertChildMaxSeconds = self::ALERT_CHILD_MAX_SECONDS;
     private bool $shuttingDown = false;
+
+    // A SIGTERM/SIGINT arrived; shutdown() runs on the next tick (see serve()).
+    private bool $shutdownRequested = false;
     /** Pid of the process that called listen(). Only it stops the workers; a forked child never does. */
     private int $ownerPid = 0;
     /**
@@ -84,6 +141,27 @@ final class AsyncServer
 
     // Back-pressure state
     private bool $backPressure = false;
+
+    // Last pending-row count the buffer answered — see backlogCount().
+    private int $lastBacklogCount = 0;
+
+    /** Why the parent's buffer handle is closed, when reopening it failed. */
+    private ?\Throwable $bufferOpenError = null;
+
+    private float $lastBufferOpenAttempt = 0.0;
+
+    // Set while recoverBuffer() has the drain workers stopped, so reapChildren()
+    // does not restart them under it.
+    private bool $recoveringBuffer = false;
+
+    private float $lastWalCheckpointErrorLogAt = 0.0;
+
+    private float $walCheckpointRetryAt = 0.0;
+
+    private float $lastBufferRecoveryAt = 0.0;
+
+    // The parent's own reads of the buffer failing as corrupt (backlogCount()).
+    private float $parentBufferCorruptAt = 0.0;
     private int $totalBufferBytes = 0;
 
     // Telemetry
@@ -425,13 +503,17 @@ final class AsyncServer
             $this->metrics->tick();
         });
 
+        $this->loop->addPeriodicTimer(self::WAL_CHECKPOINT_INTERVAL_SECONDS, function () {
+            $this->checkpointIfWalLarge();
+        });
+
         // Back-pressure monitor — check pending row count and process RSS periodically.
         // Pending count (not WAL file size) because SQLite never shrinks the WAL
         // file during operation — filesize() would never decrease after a surge.
         // RSS check because PHP's Zend Memory Manager doesn't return freed memory
         // to the OS — totalBufferBytes can't detect the RSS staircase.
         $this->loop->addPeriodicTimer(self::BACK_PRESSURE_CHECK_INTERVAL, function () {
-            $pending = $this->buffer?->backlogCount() ?? 0;
+            $pending = $this->backlogCount();
             $rss = memory_get_usage(true);
             $wasActive = $this->backPressure;
 
@@ -462,7 +544,9 @@ final class AsyncServer
 
         // 10-second diagnosis — run health checks and update score
         $this->loop->addPeriodicTimer(10.0, function () {
-            $pending = $this->buffer?->backlogCount() ?? 0;
+            $this->recoverBufferIfCorrupt();
+
+            $pending = $this->backlogCount();
             $walSize = $this->buffer?->walSize() ?? 0;
             $rss = memory_get_usage(true);
             // Read liveness immediately before diagnosing, so read -> diagnose is one
@@ -509,11 +593,20 @@ final class AsyncServer
         }
 
         // Restart drain workers if they die unexpectedly
-        $this->loop->addSignal(SIGCHLD, fn () => $this->reapChildren());
+        // Reaped on the next loop tick, not inside the handler. ReactPHP turns
+        // on async signals, so the handler runs between any two statements,
+        // including in the middle of a buffer write or checkpoint. There, the
+        // reaper's own buffer write would take the checkpoint lock through the
+        // same handle, which converts the checkpoint's exclusive hold to shared
+        // and then drops it; and a respawn would fork with the buffer open.
+        $this->loop->addSignal(SIGCHLD, fn () => $this->loop->futureTick(fn () => $this->reapChildren()));
 
-        // Graceful shutdown
-        $this->loop->addSignal(SIGINT, fn () => $this->shutdown());
-        $this->loop->addSignal(SIGTERM, fn () => $this->shutdown());
+        // Graceful shutdown, on the next tick for the same reason as SIGCHLD:
+        // run inside the handler, it could start in the middle of a checkpoint
+        // and wait up to CHILD_SHUTDOWN_TIMEOUT for the workers while holding
+        // the checkpoint lock, which every final write of theirs then waits on.
+        $this->loop->addSignal(SIGINT, fn () => $this->requestShutdown());
+        $this->loop->addSignal(SIGTERM, fn () => $this->requestShutdown());
 
         // Remote health reporting to api
         if ($this->healthReportEnabled && $this->apiUrl !== '' && $this->healthReportToken !== '') {
@@ -542,6 +635,15 @@ final class AsyncServer
     /**
      * Free rows a previous run's drain workers claimed and never finished.
      *
+     * First marks synced the rows those workers had written to PostgreSQL but
+     * could not mark (markRowsWorkersCommitted()), so they are not drained a
+     * second time, and deletes every such list either way. A list left in
+     * place could outlive its file: a buffer deleted by hand and recreated
+     * can get the same inode back, and a recovery much later would then mark
+     * the new file's rows with those ids synced without draining them. At
+     * startup nothing has written to a recreated file yet, so a stale list
+     * matches no row.
+     *
      * Runs before the first fork, on a connection that is closed again before
      * it (the fork-safety rule in forkDrainWorker()). A failure is logged, not
      * fatal: the rows stay in the buffer and the next start tries again.
@@ -550,6 +652,7 @@ final class AsyncServer
     {
         try {
             $buffer = new SqliteBuffer($this->sqlitePath);
+            $this->markRowsWorkersCommitted($buffer, true);
             $released = $buffer->releaseAllClaimed();
             unset($buffer);
 
@@ -821,13 +924,22 @@ final class AsyncServer
 
             unset($this->drainChildPids[$deadWorkerId]);
 
-            // Release any rows claimed by the dead worker back to pending
+            // Release any rows claimed by the dead worker back to pending. A buffer
+            // that refuses this (corrupt, read-only) must not throw out of the
+            // SIGCHLD handler: that ends the event loop, health reports included.
+            // The rows stay claimed and the next start releases them.
             if ($this->buffer !== null) {
-                $this->buffer->releaseClaimed($deadWorkerId);
+                try {
+                    $this->buffer->releaseClaimed($deadWorkerId);
+                } catch (\Throwable $e) {
+                    error_log("[NightOwl Agent] Could not release the rows drain worker #{$deadWorkerId} had claimed: {$e->getMessage()}");
+                }
             }
 
-            // Don't restart during shutdown — but keep reaping other dead children
-            if ($this->shuttingDown) {
+            // Don't restart during shutdown — but keep reaping other dead children.
+            // Nor during a buffer recovery, which stopped them and restarts them
+            // itself once the file is fixed.
+            if ($this->shuttingDown || $this->recoveringBuffer) {
                 continue;
             }
 
@@ -837,7 +949,7 @@ final class AsyncServer
                 $delay = self::RESTART_COOLDOWN - $elapsed;
                 error_log("[NightOwl Agent] Drain worker #{$deadWorkerId} died, restarting in {$delay}s...");
                 $this->loop->addTimer($delay, function () use ($deadWorkerId) {
-                    if (! $this->shuttingDown && ! isset($this->drainChildPids[$deadWorkerId])) {
+                    if (! $this->shuttingDown && ! $this->recoveringBuffer && ! isset($this->drainChildPids[$deadWorkerId])) {
                         $this->forkDrainWorker($deadWorkerId);
                     }
                 });
@@ -867,7 +979,7 @@ final class AsyncServer
 
         if ($pid === -1) {
             // Re-create buffer before throwing so the parent can continue
-            $this->buffer = new SqliteBuffer($this->sqlitePath);
+            $this->openBuffer();
             throw new RuntimeException('Failed to fork drain worker process');
         }
 
@@ -905,7 +1017,7 @@ final class AsyncServer
 
         // === Parent process ===
         // Re-create SQLite buffer with a fresh connection
-        $this->buffer = new SqliteBuffer($this->sqlitePath);
+        $this->openBuffer();
 
         $this->drainChildPids[$workerId] = $pid;
         $this->lastChildSpawns[$workerId] = microtime(true);
@@ -950,16 +1062,101 @@ final class AsyncServer
 
         if ($result['type'] === 'json') {
             try {
-                $this->buffer->appendRaw($result['rawPayload']);
+                $this->appendToBuffer($result['rawPayload']);
                 $this->metrics->recordIngest();
                 $conn->write('2:OK');
             } catch (\Throwable $e) {
-                error_log("[NightOwl Agent] SQLite buffer error: {$e->getMessage()}");
+                $this->recordBufferWriteFailure($e);
                 $conn->write('5:ERROR');
             }
         }
 
         $conn->end();
+    }
+
+    /**
+     * (Re)open the parent's buffer handle after a fork.
+     *
+     * A buffer that can no longer be opened (chowned or made read-only under the
+     * running agent, corrupt, its directory gone) leaves the handle closed rather
+     * than throwing: this runs in the SIGCHLD handler and the restart timer, and
+     * an exception there ends the event loop, so the agent exited before any
+     * health report could say why. Appends retry the open and count as refused
+     * meanwhile, which is what raises BUFFER_UNWRITABLE.
+     */
+    private function openBuffer(): void
+    {
+        $this->lastBufferOpenAttempt = microtime(true);
+
+        try {
+            $this->buffer = new SqliteBuffer($this->sqlitePath);
+            $this->bufferOpenError = null;
+        } catch (\Throwable $e) {
+            $this->buffer = null;
+            if ($this->bufferOpenError === null) {
+                error_log("[NightOwl Agent] Cannot open the SQLite buffer at {$this->sqlitePath}: {$e->getMessage()}");
+            }
+            $this->bufferOpenError = $e;
+        }
+    }
+
+    /** Append one payload, retrying a failed open at most once a second. */
+    private function appendToBuffer(string $rawPayload): void
+    {
+        if ($this->buffer === null && $this->bufferOpenError !== null
+            && microtime(true) - $this->lastBufferOpenAttempt >= 1.0) {
+            $this->openBuffer();
+        }
+
+        if ($this->buffer === null) {
+            throw $this->bufferOpenError ?? new RuntimeException('The SQLite buffer is not open.');
+        }
+
+        $this->buffer->appendRaw($rawPayload);
+    }
+
+    /**
+     * Pending rows for the back-pressure check, the diagnosis tick and /status.
+     *
+     * A buffer that cannot answer (a corrupt page under the COUNT) must not throw
+     * out of a loop timer: an exception there ends the event loop, and with it the
+     * health reports that carry BUFFER_UNWRITABLE. Falls back to the last count it
+     * did answer — the refused appends and the drain report the failure itself.
+     */
+    private function backlogCount(): int
+    {
+        if ($this->buffer === null) {
+            return 0;
+        }
+
+        try {
+            return $this->lastBacklogCount = $this->buffer->backlogCount();
+        } catch (\Throwable $e) {
+            if (SqliteFailure::isCorruption(SqliteFailure::code($e))) {
+                $this->parentBufferCorruptAt = microtime(true);
+            }
+
+            return $this->lastBacklogCount;
+        }
+    }
+
+    /**
+     * A payload the buffer refused: counted (BUFFER_UNWRITABLE, and as a reject)
+     * and logged at most once a minute. It was one line per payload, and the usual
+     * cause is a full disk that those lines were filling further.
+     */
+    private function recordBufferWriteFailure(\Throwable $e): void
+    {
+        $report = $this->metrics->recordBufferWriteFailure(SqliteFailure::code($e));
+        if ($report > 0) {
+            error_log("[NightOwl Agent] SQLite buffer error ({$report} payload(s) refused since the last report): {$e->getMessage()}");
+        }
+    }
+
+    private function requestShutdown(): void
+    {
+        $this->shutdownRequested = true;
+        $this->loop->futureTick(fn () => $this->shutdown());
     }
 
     private function shutdown(): void
@@ -996,7 +1193,18 @@ final class AsyncServer
             $this->stopAlertChild();
         }
 
-        // Signal all drain workers to finish and wait
+        $this->stopDrainWorkers();
+
+        $this->loop->stop();
+    }
+
+    /**
+     * Stop every drain worker and wait for it: SIGTERM, then SIGKILL for any
+     * still running after CHILD_SHUTDOWN_TIMEOUT. Blocks the event loop while it
+     * waits.
+     */
+    private function stopDrainWorkers(): void
+    {
         foreach ($this->drainChildPids as $workerId => $pid) {
             posix_kill($pid, SIGTERM);
         }
@@ -1004,6 +1212,8 @@ final class AsyncServer
         $deadline = time() + self::CHILD_SHUTDOWN_TIMEOUT;
         while (! empty($this->drainChildPids) && time() < $deadline) {
             foreach ($this->drainChildPids as $workerId => $pid) {
+                // Not 0 = gone: reaped here, or already by the SIGCHLD handler
+                // (-1), which async signals can run in the middle of this loop.
                 $result = pcntl_waitpid($pid, $status, WNOHANG);
                 if ($result !== 0) {
                     unset($this->drainChildPids[$workerId]);
@@ -1021,8 +1231,192 @@ final class AsyncServer
             pcntl_waitpid($pid, $status);
         }
         $this->drainChildPids = [];
+    }
 
-        $this->loop->stop();
+    /**
+     * Report a recovery nightowl:agent ran on a buffer that was corrupt at
+     * startup, before this server existed: BUFFER_REPAIRED, as for one run
+     * here, and the cooldown starts from it.
+     *
+     * @param  array{outcome: string, problems: list<string>, pending_rows: ?int, moved_to: ?string}  $result
+     */
+    public function recordStartupBufferRecovery(array $result): void
+    {
+        $this->lastBufferRecoveryAt = microtime(true);
+        $this->metrics->recordBufferRecovery(
+            $result['outcome'],
+            $result['pending_rows'],
+            $result['moved_to'] !== null ? basename($result['moved_to']) : null,
+        );
+    }
+
+    /**
+     * Start a buffer recovery when the buffer has recently said it is corrupt.
+     *
+     * The signal comes from the drain (its claim/fetch/mark, via the metrics
+     * file), from refused appends, or from the parent's own backlog count. Only
+     * a signal newer than the last recovery counts, at most one recovery per
+     * BUFFER_RECOVERY_COOLDOWN_SECONDS.
+     */
+    private function recoverBufferIfCorrupt(): void
+    {
+        $now = microtime(true);
+        $signalAt = max($this->metrics->bufferCorruptionSignalAt(), $this->parentBufferCorruptAt);
+
+        if ($signalAt <= $this->lastBufferRecoveryAt
+            || $now - $signalAt > self::BUFFER_CORRUPTION_FRESH_SECONDS
+            || $now - $this->lastBufferRecoveryAt < self::BUFFER_RECOVERY_COOLDOWN_SECONDS) {
+            return;
+        }
+
+        $this->recoverBuffer();
+    }
+
+    /**
+     * Repair a corrupt buffer, or set it aside and start a fresh one.
+     *
+     * Stops the drain workers and closes the parent's handle first, so nothing
+     * else has the file open while BufferRecovery reads, rebuilds or renames
+     * it. Blocks the event loop while the workers stop (up to
+     * CHILD_SHUTDOWN_TIMEOUT) and for the length of the check (about 2s on a
+     * 1 GB buffer on a fast disk, longer on a slow one). Payloads that arrive
+     * meanwhile wait in the socket backlog. Ingest is usually failing already,
+     * but not always: with only an index damaged, appends still succeed while
+     * the drain's mark fails.
+     */
+    private function recoverBuffer(): void
+    {
+        $this->lastBufferRecoveryAt = microtime(true);
+        $this->recoveringBuffer = true;
+        $workerIds = array_keys($this->drainChildPids);
+
+        error_log('[NightOwl Agent] The SQLite buffer reports corruption. Stopping the drain to check it.');
+
+        try {
+            $this->stopDrainWorkers();
+            $this->buffer = null;
+
+            $result = BufferRecovery::recover($this->sqlitePath);
+            $movedTo = $result['moved_to'] !== null ? basename($result['moved_to']) : null;
+
+            error_log('[NightOwl Agent] '.BufferRecovery::describe($result)
+                .($result['outcome'] === BufferRecovery::UNCHECKED ? ' Checking again in '.(self::BUFFER_RECOVERY_COOLDOWN_SECONDS / 60).' minutes.' : ''));
+
+            $this->metrics->recordBufferRecovery($result['outcome'], $result['pending_rows'], $movedTo);
+        } catch (\Throwable $e) {
+            error_log("[NightOwl Agent] Buffer recovery failed: {$e->getMessage()}");
+        } finally {
+            $this->openBuffer();
+
+            // Before the claims go: a released row is up for any worker to drain.
+            if ($this->buffer !== null) {
+                $this->markRowsWorkersCommitted($this->buffer, isset($result) && $result['outcome'] !== BufferRecovery::MOVED_ASIDE);
+            }
+
+            // The stopped workers' claims, released as at startup: no worker is
+            // running, so nothing else can hold one.
+            try {
+                $this->buffer?->releaseAllClaimed();
+            } catch (\Throwable) {
+                // A buffer still broken gets another recovery after the cooldown.
+            }
+
+            $this->recoveringBuffer = false;
+            $this->parentBufferCorruptAt = 0.0;
+
+            foreach ($workerIds as $workerId) {
+                // A SIGTERM that came during the recovery: the agent is
+                // stopping, and a worker started now would only be stopped again.
+                if ($this->shutdownRequested || $this->shuttingDown) {
+                    break;
+                }
+                if (isset($this->drainChildPids[$workerId])) {
+                    continue;
+                }
+
+                try {
+                    $this->forkDrainWorker($workerId);
+                } catch (\Throwable $e) {
+                    error_log("[NightOwl Agent] Could not restart drain worker #{$workerId} after the buffer recovery: {$e->getMessage()}");
+                }
+            }
+        }
+    }
+
+    /**
+     * Mark synced the rows the stopped workers had committed to PostgreSQL
+     * but could not mark (DrainWorker::unmarkedIdsPath()). The failure that
+     * starts a recovery is usually that very mark, so without this every
+     * recovery would drain up to a batch per worker into PostgreSQL twice.
+     *
+     * Only on the file the ids came from: a fresh buffer numbers its rows from
+     * 1 again, and marking those would drop new telemetry. Hence $sameFile
+     * (false after a move aside) and the inode each list was written with.
+     * Every worker's list, not only the stopped ones': one left by an earlier
+     * run with more workers is just as good.
+     */
+    private function markRowsWorkersCommitted(SqliteBuffer $buffer, bool $sameFile): void
+    {
+        $inode = @fileinode($this->sqlitePath);
+
+        foreach (glob(DrainWorker::unmarkedIdsPattern($this->sqlitePath)) ?: [] as $path) {
+            $workerId = (int) substr(basename($path, '.json'), strrpos(basename($path, '.json'), '-') + 1);
+            $saved = json_decode((string) @file_get_contents($path), true);
+            @unlink($path);
+
+            if (! $sameFile || ! is_array($saved)
+                || ($saved['inode'] ?? null) !== $inode || ! is_array($saved['ids'] ?? null)) {
+                continue;
+            }
+
+            $ids = array_values(array_filter($saved['ids'], 'is_int'));
+            try {
+                $buffer->markSynced($ids);
+                error_log('[NightOwl Agent] Marked '.count($ids)." rows drain worker #{$workerId} had already written to PostgreSQL, so they are not drained twice.");
+            } catch (\Throwable $e) {
+                error_log("[NightOwl Agent] Could not mark the rows drain worker #{$workerId} had already written; they may reach PostgreSQL twice: {$e->getMessage()}");
+            }
+        }
+    }
+
+    /**
+     * Checkpoint once the WAL passes WAL_CHECKPOINT_BYTES, waiting at most
+     * WAL_CHECKPOINT_LOCK_WAIT_MS for its turn; when a worker's write runs
+     * longer, a pass WAL_CHECKPOINT_RETRY_SECONDS later tries again. The -wal
+     * file keeps its size after a checkpoint (SQLite rewrites it from the
+     * start), so past 4 MB the size is always over. From then on a checkpoint
+     * is due once WAL_CHECKPOINT_BYTES of WAL wait to be copied back (see
+     * WAL_BYTES_PER_WRITE), or when anything at all was written and the last
+     * checkpoint is WAL_CHECKPOINT_MAX_INTERVAL_SECONDS old.
+     */
+    private function checkpointIfWalLarge(): void
+    {
+        if ($this->buffer === null || microtime(true) < $this->walCheckpointRetryAt
+            || $this->buffer->walSize() <= self::WAL_CHECKPOINT_BYTES) {
+            return;
+        }
+
+        try {
+            $waiting = $this->buffer->uncheckpointedWalBytes()
+                ?? $this->buffer->writesSinceCheckpoint() * self::WAL_BYTES_PER_WRITE;
+            // Changed since, too: a reader can keep a checkpoint from copying
+            // everything back, and retrying with nothing new written gains nothing.
+            $due = $this->buffer->changedSinceCheckpoint()
+                && ($waiting >= self::WAL_CHECKPOINT_BYTES
+                    || microtime(true) - $this->buffer->lastCheckpointAt() >= self::WAL_CHECKPOINT_MAX_INTERVAL_SECONDS);
+            if (! $due) {
+                return;
+            }
+            if (! $this->buffer->checkpoint(lockWaitMs: self::WAL_CHECKPOINT_LOCK_WAIT_MS)) {
+                $this->walCheckpointRetryAt = microtime(true) + self::WAL_CHECKPOINT_RETRY_SECONDS;
+            }
+        } catch (\Throwable $e) {
+            // Ten times a second while it lasts, so at most one line a minute.
+            if (microtime(true) - $this->lastWalCheckpointErrorLogAt >= 60) {
+                $this->lastWalCheckpointErrorLogAt = microtime(true);
+                error_log("[NightOwl Agent] WAL checkpoint failed (will retry): {$e->getMessage()}");
+            }
+        }
     }
 
     private function listenUdp(string $host, int $udpPort): void
@@ -1053,10 +1447,10 @@ final class AsyncServer
                     }
 
                     try {
-                        $this->buffer->appendRaw($result['rawPayload']);
+                        $this->appendToBuffer($result['rawPayload']);
                         $this->metrics->recordIngest();
                     } catch (\Throwable $e) {
-                        error_log("[NightOwl Agent] UDP buffer error: {$e->getMessage()}");
+                        $this->recordBufferWriteFailure($e);
                     }
                 });
             },
@@ -1074,7 +1468,7 @@ final class AsyncServer
         return $this->metrics->getFullStatus(
             $this->startTime,
             $this->backPressure,
-            $this->buffer?->backlogCount() ?? 0,
+            $this->backlogCount(),
             $this->buffer?->walSize() ?? 0,
             $this->drainChildPids[0] ?? -1,
         );

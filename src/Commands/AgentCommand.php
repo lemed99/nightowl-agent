@@ -5,10 +5,12 @@ namespace NightOwl\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Schema;
 use NightOwl\Agent\AsyncServer;
+use NightOwl\Agent\BufferRecovery;
 use NightOwl\Agent\PortInUseException;
 use NightOwl\Agent\Server;
 use NightOwl\Agent\SqliteBuffer;
 use NightOwl\Support\BufferDirectory;
+use NightOwl\Support\SqliteFailure;
 
 class AgentCommand extends Command
 {
@@ -30,6 +32,13 @@ class AgentCommand extends Command
      * @var resource|null
      */
     private $bufferLock = null;
+
+    /**
+     * What a startup recovery of a corrupt buffer did, for BUFFER_REPAIRED.
+     *
+     * @var array{outcome: string, problems: list<string>, pending_rows: ?int, moved_to: ?string}|null
+     */
+    private ?array $startupRecovery = null;
 
     public function handle(): int
     {
@@ -54,7 +63,7 @@ class AgentCommand extends Command
         // Read before the buffer is opened, which creates a missing directory.
         $bufferDirExisted = is_dir(dirname((string) config('nightowl.agent.sqlite_path')));
 
-        if (! $this->guardBufferWritable()) {
+        if (! $this->guardBufferWritable($driver)) {
             return self::FAILURE;
         }
 
@@ -88,7 +97,7 @@ class AgentCommand extends Command
      * obvious startup error. Constructing the buffer as the running user also
      * creates the file with the right ownership on a fresh install.
      */
-    private function guardBufferWritable(): bool
+    private function guardBufferWritable(string $driver): bool
     {
         $path = (string) config('nightowl.agent.sqlite_path');
 
@@ -99,6 +108,17 @@ class AgentCommand extends Command
 
             return true;
         } catch (\Throwable $e) {
+            // Closed before anything else: a recovery needs the file to itself.
+            unset($buffer);
+
+            $corrupt = SqliteFailure::isCorruption(SqliteFailure::code($e));
+            if ($corrupt && $driver === 'async') {
+                $recovered = $this->recoverCorruptBuffer($path, $e);
+                if ($recovered !== false) {
+                    return $recovered === true;
+                }
+            }
+
             $dir = dirname($path);
 
             $this->error('NightOwl agent cannot write its buffer database and will not start.');
@@ -110,14 +130,73 @@ class AgentCommand extends Command
             $this->line("    (check `ls -l {$dir}` — run the agent as the file's owner, or delete the buffer to recreate it)");
             $this->line('  • the disk or account quota is full, or inodes are exhausted (`df -h`, `df -i`, `quota`)');
             $this->line('  • the filesystem is mounted read-only');
+            if ($corrupt) {
+                $this->line('  • the buffer file is corrupt, and the agent could not repair it or set it aside');
+            }
             $this->newLine();
             $this->line('Starting anyway would let the drain re-send the same rows in a loop (duplicated telemetry),');
-            $this->line("so the agent is stopping instead. Fix the above and restart; to reset the buffer, delete {$path}*");
+            $this->line($corrupt
+                ? "so the agent is stopping instead. Fix the above and restart; to reset the buffer, move {$path}* aside (rows not yet drained are still in it)"
+                : "so the agent is stopping instead. Fix the above and restart; to reset the buffer, delete {$path}*");
 
             error_log('[NightOwl Agent] Refusing to start — buffer not writable at '.$path.': '.$e->getMessage());
 
             return false;
         }
+    }
+
+    /**
+     * Repair a buffer that is corrupt at startup, or set it aside.
+     *
+     * The running agent does this on its 10-second tick, but only a running
+     * agent: a restart, the usual answer to an agent in trouble, used to stop
+     * at guardBufferWritable() with advice to delete the buffer, rows not yet
+     * drained included. Takes the owner lock first, because BufferRecovery
+     * needs the file to itself.
+     *
+     * true: the buffer is writable now. false: it is not (the caller says
+     * why). null: another agent holds the buffer, and lockBuffer() has said so.
+     */
+    private function recoverCorruptBuffer(string $path, \Throwable $e): ?bool
+    {
+        $message = 'The buffer is corrupt ('.$e->getMessage().'). Checking it before starting.';
+        error_log('[NightOwl Agent] '.$message);
+        $this->warn($message);
+
+        if (! $this->lockBuffer()) {
+            return null;
+        }
+        if ($this->bufferLock === null) {
+            // The lock could not be taken at all, so another agent may have the
+            // file open. Repairing it under that agent is what must not happen.
+            return false;
+        }
+
+        $result = BufferRecovery::recover($path);
+        error_log('[NightOwl Agent] '.BufferRecovery::describe($result));
+        $this->line(BufferRecovery::describe($result));
+
+        if ($result['outcome'] === BufferRecovery::UNCHECKED) {
+            return false;
+        }
+
+        try {
+            $buffer = new SqliteBuffer($path);
+            $buffer->assertWritable();
+            unset($buffer);
+        } catch (\Throwable $again) {
+            $message = 'The buffer is still not writable after the check: '.$again->getMessage();
+            error_log('[NightOwl Agent] '.$message);
+            $this->line($message);
+
+            return false;
+        }
+
+        if ($result['outcome'] !== BufferRecovery::CLEAN) {
+            $this->startupRecovery = $result;
+        }
+
+        return true;
     }
 
     /**
@@ -161,6 +240,12 @@ class AgentCommand extends Command
      */
     private function lockBuffer(): bool
     {
+        // Already taken, by a startup recovery (recoverCorruptBuffer()). A
+        // second flock from this process on a new handle would wait on itself.
+        if ($this->bufferLock !== null) {
+            return true;
+        }
+
         $path = (string) config('nightowl.agent.sqlite_path');
         $wait = max(0, (int) config('nightowl.buffer_lock_wait', 30));
         $started = microtime(true);
@@ -578,6 +663,9 @@ class AgentCommand extends Command
 
         $server = app(AsyncServer::class);
         $server->setBufferLock($this->bufferLock);
+        if ($this->startupRecovery !== null) {
+            $server->recordStartupBufferRecovery($this->startupRecovery);
+        }
 
         $this->info("NightOwl agent (async) listening on {$host}:{$port}");
         $this->line('SQLite buffer: ' . config('nightowl.agent.sqlite_path'));

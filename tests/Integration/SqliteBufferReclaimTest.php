@@ -39,7 +39,7 @@ class SqliteBufferReclaimTest extends TestCase
 
     protected function tearDown(): void
     {
-        foreach (['', '-wal', '-shm'] as $suffix) {
+        foreach (['', '-wal', '-shm', '.ckpt', '.ckpt-gate'] as $suffix) {
             $f = $this->path.$suffix;
             if (file_exists($f)) {
                 @unlink($f);
@@ -62,6 +62,12 @@ class SqliteBufferReclaimTest extends TestCase
         for ($i = 0; $i < $rows; $i++) {
             $buffer->appendRaw($payload);
         }
+
+        // SQLite no longer checkpoints by itself (wal_autocheckpoint=0); on a
+        // live agent drain worker 0 does it once the WAL passes 4 MB. Without
+        // this the rows would still be in the -wal and the main file at its
+        // starting size.
+        $buffer->checkpointTruncate();
     }
 
     /** Mark everything drained and delete it, leaving a large freelist. */

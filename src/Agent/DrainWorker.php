@@ -2,6 +2,8 @@
 
 namespace NightOwl\Agent;
 
+use NightOwl\Support\SqliteFailure;
+
 /**
  * Drain worker that runs in a forked child process.
  *
@@ -155,7 +157,10 @@ final class DrainWorker
     // the ids and retry ONLY the mark (flushed at the top of drainBatch) — never
     // the write — until the buffer accepts it again. Held in memory: a hard kill
     // re-drains at most this one batch on restart (the documented
-    // at-most-one-batch-duplicate crash-safety tradeoff, unchanged).
+    // at-most-one-batch-duplicate crash-safety tradeoff, unchanged). Also
+    // written to unmarkedIdsPath(), for the agent's buffer recovery: it stops
+    // this worker because of the very error that failed the mark, and marks
+    // these rows itself once the file is repaired.
     /** @var int[] */
     private array $committedUnmarkedIds = [];
 
@@ -166,6 +171,26 @@ final class DrainWorker
     private int $bufferMarkStalls = 0;
 
     private float $bufferMarkStalledSince = 0.0;
+
+    // Outcome of the drain path's own buffer operations (claim/fetch/mark/
+    // quarantine) → BUFFER_UNWRITABLE. Housekeeping (checkpoint, reclaim, cleanup)
+    // is deliberately not counted: it swallows its own failures, a busy checkpoint
+    // is routine, and none of it stops a row from reaching Postgres.
+    private float $bufferErrorAt = 0.0;
+
+    private int $bufferErrorCode = 0;
+
+    private float $bufferOkAt = 0.0;
+
+    // Set by onBuffer() when the current batch failed on the local buffer, so the
+    // catch in drainBatch() can tell it apart from a Postgres failure.
+    private bool $batchFailedOnBuffer = false;
+
+    private float $lastBufferErrorLogAt = 0.0;
+
+    private int $bufferErrorsSinceLog = 0;
+
+    private const BUFFER_ERROR_LOG_INTERVAL_SECONDS = 60;
 
     private const EWMA_ALPHA = 0.3;
 
@@ -272,7 +297,7 @@ final class DrainWorker
         $this->heartbeat = $heartbeat;
 
         // Create own connections — NOT inherited from parent
-        $buffer = new SqliteBuffer($this->sqlitePath);
+        $buffer = $this->openBuffer();
         $writer = new RecordWriter(
             host: $this->pgHost,
             port: $this->pgPort,
@@ -421,12 +446,7 @@ final class DrainWorker
 
             // Write drain metrics for parent process every 5 seconds
             if ($now - $lastMetricsWrite >= self::METRICS_WRITE_INTERVAL) {
-                // Refresh the live dead-letter count off the buffer (durable across
-                // restart) so the DRAIN_QUARANTINE diagnosis survives a worker respawn.
-                if ($this->quarantineEnabled) {
-                    $this->quarantinedLive = $buffer->quarantinedCount();
-                }
-                $this->writeDrainMetrics();
+                $this->publishMetrics($buffer);
                 $lastMetricsWrite = $now;
             }
 
@@ -662,7 +682,9 @@ final class DrainWorker
             $this->truncateAttempts++;
             try {
                 $start = microtime(true);
-                $buffer->checkpointTruncate();
+                if (! $buffer->checkpointTruncate()) {
+                    throw new \RuntimeException('writes kept the checkpoint lock busy');
+                }
                 $elapsed = (int) round((microtime(true) - $start) * 1000);
                 $this->truncateSuccesses++;
                 $this->walSizeBytes = $buffer->walSize();
@@ -750,6 +772,7 @@ final class DrainWorker
         // misattributed to the previous batch's stale Postgres SQLSTATE. write()
         // re-clears this on entry, so this only matters for pre-write throws.
         $writer->lastWriteError = null;
+        $this->batchFailedOnBuffer = false;
 
         $this->heartbeat?->enter('buffer:claim');
 
@@ -762,16 +785,17 @@ final class DrainWorker
             // duplication storm while the disk is full. If the mark still fails it
             // throws to the catch below, the ids stay held, and the loop backs off.
             if (! empty($this->committedUnmarkedIds)) {
-                $buffer->markSynced($this->committedUnmarkedIds);
+                $this->onBuffer(fn () => $buffer->markSynced($this->committedUnmarkedIds));
                 $this->committedUnmarkedIds = [];
+                $this->persistCommittedUnmarked();
                 $this->bufferMarkStalledSince = 0.0;
 
                 return true;
             }
 
-            $rows = $this->totalWorkers > 1
+            $rows = $this->onBuffer(fn () => $this->totalWorkers > 1
                 ? $buffer->claimBatch($this->workerId, $this->batchSize)
-                : $buffer->fetchPending($this->batchSize);
+                : $buffer->fetchPending($this->batchSize));
 
             if (empty($rows)) {
                 return false;
@@ -798,7 +822,7 @@ final class DrainWorker
                 }
             }
             if (! empty($corruptIds)) {
-                $buffer->markSynced($corruptIds);
+                $this->onBuffer(fn () => $buffer->markSynced($corruptIds));
             }
             if (empty($units)) {
                 return true;
@@ -877,6 +901,26 @@ final class DrainWorker
             // or quarantined) as idle so the loop backs off instead of busy-looping.
             return ($result['drained'] + $result['quarantined']) > 0;
         } catch (\Throwable $e) {
+            // The local buffer refused the claim/fetch/mark — not a Postgres failure,
+            // so it stamps no Postgres clock (onBuffer() stamped the buffer one) and
+            // is NOT a failed batch: batches_failed feeds DRAIN_ERRORS' 15-minute
+            // window, and at ~10 retries a second an outage left it saying "check
+            // PostgreSQL" for a quarter of an hour after the buffer was fixed (found
+            // by review). Logged at most once a minute: this retries every loop, and
+            // a full disk is the common cause, so a line per loop was feeding the
+            // very thing that broke.
+            if ($this->batchFailedOnBuffer) {
+                $this->bufferErrorsSinceLog++;
+                $now = microtime(true);
+                if (($now - $this->lastBufferErrorLogAt) >= self::BUFFER_ERROR_LOG_INTERVAL_SECONDS) {
+                    error_log("[NightOwl Drain] Buffer error ({$this->bufferErrorsSinceLog} failed attempt(s) since the last report): {$e->getMessage()}");
+                    $this->bufferErrorsSinceLog = 0;
+                    $this->lastBufferErrorLogAt = $now;
+                }
+
+                return false;
+            }
+
             // A MOMENTARY conflict (deadlock 40P01, serialization 40001) is not a
             // failed batch. Postgres chose a victim among writers that were all
             // behaving, the rows are untouched in the buffer, and the next loop
@@ -1041,10 +1085,6 @@ final class DrainWorker
 
         try {
             $writer->writeForceInsert($unit['records']);
-            $this->markCommitted($buffer, $ids);
-            $this->onDrainSuccess($writer);
-
-            return ['drained' => 1, 'quarantined' => 0, 'deferred' => 0];
         } catch (\Throwable $e) {
             $err = $writer->lastWriteError;
 
@@ -1063,7 +1103,7 @@ final class DrainWorker
             }
 
             $sqlstate = is_array($err) && is_string($err['sqlstate'] ?? null) ? $err['sqlstate'] : null;
-            $buffer->quarantine($ids);
+            $this->onBuffer(fn () => $buffer->quarantine($ids));
             $this->quarantinedTotal++;
             $this->consecutiveQuarantines[$table] = ($this->consecutiveQuarantines[$table] ?? 0) + 1;
             $this->lastQuarantineSqlstate = $sqlstate;
@@ -1078,6 +1118,18 @@ final class DrainWorker
 
             return ['drained' => 0, 'quarantined' => 1, 'deferred' => 0];
         }
+
+        // Committed. The mark sits OUTSIDE the try, as in drainUnits(): inside it, a
+        // failed mark (lastWriteError null — the write succeeded) fell through to
+        // the quarantine branch and dead-lettered a row already in Postgres, counted
+        // it into the never-decaying DRAIN_QUARANTINE total, and left this batch's
+        // buffer-failure flag set for whatever failed next (found by review). Out
+        // here it propagates to drainBatch(), which holds the ids for a mark-only
+        // retry.
+        $this->markCommitted($buffer, $ids);
+        $this->onDrainSuccess($writer);
+
+        return ['drained' => 1, 'quarantined' => 0, 'deferred' => 0];
     }
 
     /**
@@ -1106,11 +1158,12 @@ final class DrainWorker
     private function markCommitted(SqliteBuffer $buffer, array $ids): void
     {
         try {
-            $buffer->markSynced($ids);
+            $this->onBuffer(fn () => $buffer->markSynced($ids));
         } catch (\Throwable $e) {
             $this->committedUnmarkedIds = array_values(
                 array_unique([...$this->committedUnmarkedIds, ...$ids])
             );
+            $this->persistCommittedUnmarked();
             $this->bufferMarkStalls++;
             if ($this->bufferMarkStalledSince === 0.0) {
                 $this->bufferMarkStalledSince = microtime(true);
@@ -1122,6 +1175,111 @@ final class DrainWorker
             );
             throw $e;
         }
+    }
+
+    /**
+     * Where a worker keeps the ids of rows committed to PostgreSQL but not yet
+     * marked synced, with the inode of the buffer they belong to.
+     */
+    public static function unmarkedIdsPath(string $sqlitePath, int $workerId): string
+    {
+        return $sqlitePath.".unmarked-{$workerId}.json";
+    }
+
+    /** A glob() pattern for every worker's unmarkedIdsPath(). */
+    public static function unmarkedIdsPattern(string $sqlitePath): string
+    {
+        return $sqlitePath.'.unmarked-*.json';
+    }
+
+    /**
+     * Write committedUnmarkedIds to unmarkedIdsPath(), or delete the file once
+     * the list is empty. Best effort: on a full disk the write fails and only
+     * the in-memory list is left, as before.
+     */
+    private function persistCommittedUnmarked(): void
+    {
+        $path = self::unmarkedIdsPath($this->sqlitePath, $this->workerId);
+        if ($this->committedUnmarkedIds === []) {
+            @unlink($path);
+
+            return;
+        }
+
+        $data = json_encode(['inode' => @fileinode($this->sqlitePath), 'ids' => $this->committedUnmarkedIds]);
+        if ($data !== false && @file_put_contents($path.'.tmp', $data) !== false) {
+            @rename($path.'.tmp', $path);
+        }
+    }
+
+    /**
+     * Open this worker's buffer connection, reporting a failure before rethrowing.
+     *
+     * Opening is where a buffer owned by another user actually fails: an open
+     * handle keeps writing through a chmod, a chown or even an unlink, so a running
+     * agent only meets a wrong-owner file when a worker (re)opens it (checked by
+     * review). The rethrow keeps the existing exit-and-respawn; each respawn
+     * re-stamps the failure, so BUFFER_UNWRITABLE stays lit instead of the parent
+     * seeing an anonymous crash loop.
+     */
+    private function openBuffer(): SqliteBuffer
+    {
+        try {
+            return new SqliteBuffer($this->sqlitePath);
+        } catch (\Throwable $e) {
+            $this->bufferErrorAt = microtime(true);
+            $this->bufferErrorCode = SqliteFailure::code($e);
+            $this->writeDrainMetrics();
+            error_log("[NightOwl Drain] Buffer error: cannot open {$this->sqlitePath}: {$e->getMessage()}");
+
+            throw $e;
+        }
+    }
+
+    /**
+     * Refresh the live dead-letter count off the buffer (durable across restart,
+     * so DRAIN_QUARANTINE survives a worker respawn) and write the metrics file.
+     *
+     * A buffer that cannot answer the count keeps the last one: throwing here
+     * killed the worker before writeDrainMetrics() could carry the buffer error,
+     * on every respawn. The batch itself reports the failure.
+     */
+    private function publishMetrics(SqliteBuffer $buffer): void
+    {
+        if ($this->quarantineEnabled) {
+            try {
+                $this->quarantinedLive = $buffer->quarantinedCount();
+            } catch (\Throwable) {
+            }
+        }
+        $this->writeDrainMetrics();
+    }
+
+    /**
+     * Run one drain-path operation on the local buffer and record its outcome for
+     * BUFFER_UNWRITABLE: the time and SQLite code of a failure, or the time of a
+     * success. The throwable is re-thrown untouched — callers keep their own
+     * handling (markCommitted still holds the committed ids).
+     *
+     * @template T
+     *
+     * @param  \Closure(): T  $op
+     * @return T
+     */
+    private function onBuffer(\Closure $op): mixed
+    {
+        try {
+            $result = $op();
+        } catch (\Throwable $e) {
+            $this->bufferErrorAt = microtime(true);
+            $this->bufferErrorCode = SqliteFailure::code($e);
+            $this->batchFailedOnBuffer = true;
+
+            throw $e;
+        }
+        $this->bufferOkAt = microtime(true);
+
+        return $result;
     }
 
     private function onDrainSuccess(RecordWriter $writer): void
@@ -1277,6 +1435,10 @@ final class DrainWorker
             'buffer_mark_stalls' => $this->bufferMarkStalls,
             'buffer_mark_stalled_since' => $this->bufferMarkStalledSince,
             'committed_unmarked' => count($this->committedUnmarkedIds),
+            // Drain-path buffer outcome → BUFFER_UNWRITABLE (error newer than ok).
+            'buffer_error_at' => $this->bufferErrorAt,
+            'buffer_error_code' => $this->bufferErrorCode,
+            'buffer_ok_at' => $this->bufferOkAt,
             'quarantined_live' => $this->quarantinedLive,
             // Cumulative since worker start (never decays). The DRAIN_QUARANTINE
             // diagnosis reads THIS, not quarantined_live (the prunable buffer gauge

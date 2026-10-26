@@ -77,7 +77,7 @@ class DrainWorkerMultiWorkerTest extends TestCase
     {
         ini_set('error_log', (string) $this->previousErrorLog);
         unset($this->buffer);
-        foreach ([$this->bufferPath, $this->bufferPath.'-wal', $this->bufferPath.'-shm'] as $f) {
+        foreach ([$this->bufferPath, $this->bufferPath.'-wal', $this->bufferPath.'-shm', $this->bufferPath.'.ckpt', $this->bufferPath.'.ckpt-gate'] as $f) {
             @unlink($f);
         }
     }

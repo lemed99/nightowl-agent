@@ -36,7 +36,7 @@ final class DrainWorkerBufferHousekeepingTest extends TestCase
     {
         ini_set('error_log', (string) $this->previousErrorLog);
 
-        foreach (['', '-wal', '-shm'] as $suffix) {
+        foreach (['', '-wal', '-shm', '.ckpt', '.ckpt-gate'] as $suffix) {
             @unlink($this->path.$suffix);
         }
     }

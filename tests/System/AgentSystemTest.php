@@ -233,6 +233,8 @@ class AgentSystemTest extends TestCase
             self::$sqlitePath,
             self::$sqlitePath.'-wal',
             self::$sqlitePath.'-shm',
+            self::$sqlitePath.'.ckpt',
+            self::$sqlitePath.'.ckpt-gate',
             self::$sqlitePath.'.drain-metrics.json',
             self::$sqlitePath.'.drain-metrics.json.tmp',
         ] as $f) {

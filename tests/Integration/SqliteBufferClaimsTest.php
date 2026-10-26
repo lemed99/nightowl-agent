@@ -28,7 +28,7 @@ final class SqliteBufferClaimsTest extends TestCase
     {
         unset($this->buffer);
 
-        foreach ([$this->dbPath, $this->dbPath.'-wal', $this->dbPath.'-shm'] as $file) {
+        foreach ([$this->dbPath, $this->dbPath.'-wal', $this->dbPath.'-shm', $this->dbPath.'.ckpt', $this->dbPath.'.ckpt-gate'] as $file) {
             @unlink($file);
         }
     }

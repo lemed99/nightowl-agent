@@ -13,6 +13,47 @@ final class SqliteBuffer
 
     private string $path;
 
+    /** @var resource|null Handle on the checkpoint lock file, see checkpointLockPath(). */
+    private $checkpointLock = null;
+
+    /** @var resource|null Handle on the gate in front of it, see checkpointGatePath(). */
+    private $checkpointGate = null;
+
+    // Nesting depth of shared holds, so a write inside another write keeps the hold.
+    private int $sharedDepth = 0;
+
+    // What changedSinceCheckpoint() compares: this connection's writes since its
+    // last checkpoint, and PRAGMA data_version (other connections' commits) then.
+    private int $writesSinceCheckpoint = 0;
+
+    private ?int $dataVersionAtCheckpoint = null;
+
+    // When this connection last checkpointed (microtime), 0.0 if never.
+    private float $lastCheckpointAt = 0.0;
+
+    // Bytes per WAL frame (page size plus the 24-byte frame header), for
+    // uncheckpointedWalBytes().
+    private ?int $walFrameBytes = null;
+
+    // A lock file could not be opened: writes and checkpoints run unguarded.
+    private bool $checkpointLockUnavailable = false;
+
+    private float $lastUnguardedWriteLogAt = 0.0;
+
+    /**
+     * How long a write waits for a checkpoint to finish before going ahead
+     * without the lock. Same budget as busy_timeout, which a TRUNCATE
+     * checkpoint already made writers wait on.
+     */
+    private const WRITE_LOCK_WAIT_MS = 5000;
+
+    /**
+     * How long a checkpoint waits for its turn before it is skipped until the
+     * next pass. It holds the gate while it waits (checkpointGatePath()), so
+     * this only has to outlast the writes already running.
+     */
+    private const CHECKPOINT_LOCK_WAIT_MS = 250;
+
     public function __construct(string $path)
     {
         $this->path = $path;
@@ -65,6 +106,35 @@ final class SqliteBuffer
         $this->pdo->exec('PRAGMA temp_store=MEMORY');
         $this->pdo->exec('PRAGMA mmap_size=268435456');
 
+        // No checkpoint SQLite runs by itself. It would run one on whichever
+        // connection's commit pushes the WAL past 1000 pages, without the
+        // checkpoint lock, and that is half of the WAL-reset bug (sqlite.org/
+        // wal.html section 11, every version 3.7.0 to 3.51.2): a checkpoint
+        // starting while another process's commit resets the WAL can mark that
+        // commit's frames as already copied, and the next checkpoint skips them.
+        // The database file loses part of a committed transaction. The agent's
+        // design has two processes writing one WAL, and Yomoney's buffer went
+        // corrupt twice in a week on Ubuntu 24.04's 3.45.1 (2026-10-15 and
+        // 2026-10-21; the second time a buffer index had the wrong number of
+        // entries). Every checkpoint now goes through checkpoint(), which holds
+        // the lock exclusively, and the agent's parent process keeps the WAL
+        // small instead (AsyncServer::checkpointIfWalLarge()).
+        $this->pdo->exec('PRAGMA wal_autocheckpoint=0');
+
+        $this->holdShared();
+        try {
+            $this->createSchema();
+        } finally {
+            $this->releaseShared();
+        }
+
+        $this->appendStmt = $this->pdo->prepare(
+            'INSERT INTO buffer (payload, record_count, created_at) VALUES (:payload, :count, :created_at)'
+        );
+    }
+
+    private function createSchema(): void
+    {
         $this->pdo->exec('
             CREATE TABLE IF NOT EXISTS buffer (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,10 +148,6 @@ final class SqliteBuffer
         $this->pdo->exec('
             CREATE INDEX IF NOT EXISTS idx_buffer_synced_id ON buffer (synced, id)
         ');
-
-        $this->appendStmt = $this->pdo->prepare(
-            'INSERT INTO buffer (payload, record_count, created_at) VALUES (:payload, :count, :created_at)'
-        );
     }
 
     /**
@@ -104,6 +170,7 @@ final class SqliteBuffer
      */
     public function assertWritable(): void
     {
+        $this->holdShared();
         try {
             $this->pdo->beginTransaction();
             $this->pdo->exec(
@@ -125,6 +192,8 @@ final class SqliteBuffer
                 0,
                 $e
             );
+        } finally {
+            $this->releaseShared();
         }
     }
 
@@ -135,11 +204,11 @@ final class SqliteBuffer
      */
     public function appendRaw(string $json): void
     {
-        $this->appendStmt->execute([
+        $this->writing(fn () => $this->appendStmt->execute([
             'payload' => $json,
             'count' => 0,
             'created_at' => microtime(true),
-        ]);
+        ]));
     }
 
     /**
@@ -156,11 +225,11 @@ final class SqliteBuffer
             throw new RuntimeException('Failed to JSON-encode payload: '.json_last_error_msg());
         }
 
-        $this->appendStmt->execute([
+        $this->writing(fn () => $this->appendStmt->execute([
             'payload' => $json,
             'count' => count($records),
             'created_at' => microtime(true),
-        ]);
+        ]));
     }
 
     /**
@@ -220,7 +289,7 @@ final class SqliteBuffer
         );
         $claimStmt->bindValue('claim', $claimValue, PDO::PARAM_INT);
         $claimStmt->bindValue('lim', $limit, PDO::PARAM_INT);
-        $claimStmt->execute();
+        $this->writing(fn () => $claimStmt->execute());
 
         return $this->claimedBy($claimValue, $limit);
     }
@@ -277,6 +346,15 @@ final class SqliteBuffer
      */
     private function chunkedIdUpdate(string $sqlTemplate, array $ids, array $leadingParams = []): void
     {
+        $this->writing(fn () => $this->chunkedIdUpdateLocked($sqlTemplate, $ids, $leadingParams));
+    }
+
+    /**
+     * @param  int[]  $ids
+     * @param  array<int, scalar>  $leadingParams
+     */
+    private function chunkedIdUpdateLocked(string $sqlTemplate, array $ids, array $leadingParams): void
+    {
         $chunks = array_chunk($ids, self::ID_IN_CHUNK);
         $ownsTransaction = count($chunks) > 1 && ! $this->pdo->inTransaction();
 
@@ -312,7 +390,7 @@ final class SqliteBuffer
         $claimValue = 100 + $workerId;
         $stmt = $this->pdo->prepare('UPDATE buffer SET synced = 0 WHERE synced = :claim');
         $stmt->bindValue('claim', $claimValue, PDO::PARAM_INT);
-        $stmt->execute();
+        $this->writing(fn () => $stmt->execute());
     }
 
     /**
@@ -330,7 +408,7 @@ final class SqliteBuffer
      */
     public function releaseAllClaimed(): int
     {
-        return $this->pdo->exec('UPDATE buffer SET synced = 0 WHERE synced >= 100');
+        return $this->writing(fn () => $this->pdo->exec('UPDATE buffer SET synced = 0 WHERE synced >= 100'));
     }
 
     /**
@@ -412,7 +490,7 @@ final class SqliteBuffer
     {
         $cutoff = microtime(true) - $maxAge;
         $stmt = $this->pdo->prepare('DELETE FROM buffer WHERE synced = 1 AND created_at < :cutoff');
-        $stmt->execute(['cutoff' => $cutoff]);
+        $this->writing(fn () => $stmt->execute(['cutoff' => $cutoff]));
 
         return $stmt->rowCount();
     }
@@ -463,7 +541,7 @@ final class SqliteBuffer
     {
         $cutoff = microtime(true) - $maxAge;
         $stmt = $this->pdo->prepare('DELETE FROM buffer WHERE synced = -1 AND created_at < :cutoff');
-        $stmt->execute(['cutoff' => $cutoff]);
+        $this->writing(fn () => $stmt->execute(['cutoff' => $cutoff]));
 
         return $stmt->rowCount();
     }
@@ -509,10 +587,16 @@ final class SqliteBuffer
     /**
      * Run a passive WAL checkpoint. Moves committed pages from the WAL back
      * to the main database without blocking concurrent writers.
+     *
+     * Holds the checkpoint lock exclusively, so no write by any process runs
+     * while it does (see the wal_autocheckpoint note in the constructor).
+     * Returns false when no gap between writes came within $lockWaitMs
+     * (CHECKPOINT_LOCK_WAIT_MS by default; 0 tries once): the checkpoint is
+     * skipped, and the next pass catches up.
      */
-    public function checkpoint(): void
+    public function checkpoint(int $lockWaitMs = self::CHECKPOINT_LOCK_WAIT_MS): bool
     {
-        $this->pdo->exec('PRAGMA wal_checkpoint(PASSIVE)');
+        return $this->checkpointing('PRAGMA wal_checkpoint(PASSIVE)', $lockWaitMs);
     }
 
     /**
@@ -525,9 +609,9 @@ final class SqliteBuffer
      *
      * A 200MB WAL (~50k pages) takes ~100-500ms to checkpoint.
      */
-    public function checkpointTruncate(): void
+    public function checkpointTruncate(): bool
     {
-        $this->pdo->exec('PRAGMA wal_checkpoint(TRUNCATE)');
+        return $this->checkpointing('PRAGMA wal_checkpoint(TRUNCATE)', self::CHECKPOINT_LOCK_WAIT_MS);
     }
 
     /**
@@ -579,8 +663,10 @@ final class SqliteBuffer
         }
 
         $before = $this->fileSize();
-        $this->pdo->exec('PRAGMA incremental_vacuum('.$maxPages.')');
-        $this->pdo->exec('PRAGMA wal_checkpoint(PASSIVE)');
+        $this->writing(fn () => $this->pdo->exec('PRAGMA incremental_vacuum('.$maxPages.')'));
+        // The file only shrinks once the vacuum's pages are checkpointed. Back to
+        // back checkpoints are safe here: each one holds the lock exclusively.
+        $this->checkpoint();
 
         return max(0, $before - $this->fileSize());
     }
@@ -595,9 +681,246 @@ final class SqliteBuffer
     public function compact(): int
     {
         $before = $this->fileSize();
-        $this->pdo->exec('VACUUM');
-        $this->pdo->exec('PRAGMA wal_checkpoint(TRUNCATE)');
+        $this->writing(fn () => $this->pdo->exec('VACUUM'));
+        $this->checkpointTruncate();
 
         return max(0, $before - $this->fileSize());
+    }
+
+    /**
+     * The sidecar file whose flock keeps checkpoints and writes apart: writes
+     * hold it shared (they still run side by side, SQLite orders them), a
+     * checkpoint holds it exclusively. Not the owner lock (lockPath()), which
+     * one agent holds exclusively for its whole life.
+     */
+    public static function checkpointLockPath(string $path): string
+    {
+        return $path.'.ckpt';
+    }
+
+    /**
+     * The gate in front of the checkpoint lock. A write passes through it
+     * (shared, and let go as soon as the write has the lock); a checkpoint
+     * waiting for its turn holds it exclusively, so new writes queue behind
+     * the checkpoint. Without it a checkpoint only ever got in on a gap with
+     * no write running, and two processes writing flat out leave none: 0 of 10
+     * checkpoints got the lock in a test, and a benchmark at ~9k payloads/s
+     * took the WAL to 708 MB (2026-10-22). No deadlock: a write holding the
+     * lock never waits on the gate.
+     */
+    public static function checkpointGatePath(string $path): string
+    {
+        return $path.'.ckpt-gate';
+    }
+
+    /**
+     * Run a write with the checkpoint lock held shared.
+     *
+     * @template T
+     *
+     * @param  \Closure(): T  $write
+     * @return T
+     */
+    private function writing(\Closure $write): mixed
+    {
+        $this->holdShared();
+        try {
+            return $write();
+        } finally {
+            $this->writesSinceCheckpoint++;
+            $this->releaseShared();
+        }
+    }
+
+    /**
+     * Whether anything was written to the buffer, by this connection or any
+     * other, since this connection's last checkpoint. The -wal file keeps its
+     * size after a checkpoint, so its size alone cannot say.
+     */
+    public function changedSinceCheckpoint(): bool
+    {
+        return $this->writesSinceCheckpoint > 0
+            || $this->dataVersionAtCheckpoint === null
+            || $this->dataVersion() !== $this->dataVersionAtCheckpoint;
+    }
+
+    /**
+     * Bytes of WAL that no checkpoint has copied back yet, by every connection
+     * on the file, or null when that cannot be read.
+     *
+     * Read from the wal-index header in the -shm file (sqlite.org/walformat.html):
+     * mxFrame, the last valid frame, at offset 16, and nBackfill, the frames
+     * already checkpointed, at offset 96, both native-endian u32, in a header
+     * whose iVersion at offset 0 is 3007000. The -wal file's size cannot say
+     * this: it keeps its high-water size after a checkpoint. Read without
+     * SQLite's locks, so a value can be one commit stale; good enough to decide
+     * when to checkpoint, and never used for anything else.
+     */
+    public function uncheckpointedWalBytes(): ?int
+    {
+        $header = @file_get_contents($this->path.'-shm', false, null, 0, 100);
+        if ($header === false || strlen($header) < 100 || unpack('L', $header, 0)[1] !== 3007000) {
+            return null;
+        }
+
+        $frames = max(0, unpack('L', $header, 16)[1] - unpack('L', $header, 96)[1]);
+
+        return $frames * ($this->walFrameBytes ??= $this->pageSize() + 24);
+    }
+
+    /** Writes this connection made since its last checkpoint. */
+    public function writesSinceCheckpoint(): int
+    {
+        return $this->writesSinceCheckpoint;
+    }
+
+    /** When this connection last checkpointed (microtime), 0.0 if it never has. */
+    public function lastCheckpointAt(): float
+    {
+        return $this->lastCheckpointAt;
+    }
+
+    private function dataVersion(): int
+    {
+        return (int) $this->pdo->query('PRAGMA data_version')->fetchColumn();
+    }
+
+    /** Run a checkpoint statement and note where the buffer stood, for changedSinceCheckpoint(). */
+    private function runCheckpoint(string $statement): void
+    {
+        $this->pdo->exec($statement);
+        $this->writesSinceCheckpoint = 0;
+        $this->dataVersionAtCheckpoint = $this->dataVersion();
+        $this->lastCheckpointAt = microtime(true);
+    }
+
+    private function holdShared(): void
+    {
+        if ($this->sharedDepth++ > 0) {
+            return;
+        }
+
+        $lock = $this->checkpointLock();
+        if ($lock === null) {
+            return;
+        }
+
+        // Wait out a running or waiting checkpoint, but never longer than
+        // busy_timeout: a checkpoint that hangs must not stop ingest. Past that
+        // the write goes ahead unguarded, as every write did before this lock
+        // existed.
+        $deadline = microtime(true) + self::WRITE_LOCK_WAIT_MS / 1000;
+        $held = self::lockBy($this->checkpointGate, LOCK_SH, $deadline, 500);
+        if ($held) {
+            $held = self::lockBy($lock, LOCK_SH, $deadline, 500);
+            flock($this->checkpointGate, LOCK_UN);
+        }
+
+        if (! $held && microtime(true) - $this->lastUnguardedWriteLogAt >= 60) {
+            $this->lastUnguardedWriteLogAt = microtime(true);
+            error_log('[NightOwl Agent] A buffer checkpoint held its lock for over 5s; writes are going ahead without it.');
+        }
+    }
+
+    private function releaseShared(): void
+    {
+        if (--$this->sharedDepth > 0) {
+            return;
+        }
+
+        $this->sharedDepth = 0;
+        if ($this->checkpointLock !== null) {
+            flock($this->checkpointLock, LOCK_UN);
+        }
+    }
+
+    /** Run one checkpoint statement holding the lock exclusively. */
+    private function checkpointing(string $statement, int $lockWaitMs): bool
+    {
+        $lock = $this->checkpointLock();
+        if ($lock === null) {
+            $this->runCheckpoint($statement);
+
+            return true;
+        }
+
+        // The gate first, so no new write starts; then the lock, once the
+        // writes already running are done.
+        $deadline = microtime(true) + $lockWaitMs / 1000;
+        if (! self::lockBy($this->checkpointGate, LOCK_EX, $deadline, 1000)) {
+            return false;
+        }
+
+        try {
+            if (! self::lockBy($lock, LOCK_EX, $deadline, 1000)) {
+                return false;
+            }
+
+            try {
+                // data_version is read before the lock goes: no write can land
+                // between the checkpoint and it.
+                $this->runCheckpoint($statement);
+
+                return true;
+            } finally {
+                flock($lock, LOCK_UN);
+            }
+        } finally {
+            flock($this->checkpointGate, LOCK_UN);
+        }
+    }
+
+    /**
+     * Take an flock, trying again every $pollMicros until $deadline. Always
+     * tries once, even with the deadline already past.
+     *
+     * @param  resource  $handle
+     */
+    private static function lockBy($handle, int $operation, float $deadline, int $pollMicros): bool
+    {
+        while (! flock($handle, $operation | LOCK_NB)) {
+            if (microtime(true) >= $deadline) {
+                return false;
+            }
+            usleep($pollMicros);
+        }
+
+        return true;
+    }
+
+    /**
+     * The lock handle, opened on first use with the gate's. Every SqliteBuffer
+     * opens its own, and the agent only builds one after a fork, so no two
+     * processes share an open file description (an flock belongs to that, not
+     * to the process). A file that cannot be opened (a directory owned by
+     * someone else) leaves writes and checkpoints running unguarded rather
+     * than failing them.
+     *
+     * @return resource|null
+     */
+    private function checkpointLock()
+    {
+        if ($this->checkpointLock !== null || $this->checkpointLockUnavailable) {
+            return $this->checkpointLock;
+        }
+
+        $handles = [];
+        foreach ([self::checkpointLockPath($this->path), self::checkpointGatePath($this->path)] as $lockPath) {
+            $handle = @fopen($lockPath, 'c+e');
+            if ($handle === false) {
+                $this->checkpointLockUnavailable = true;
+                error_log("[NightOwl Agent] Cannot open {$lockPath}; buffer checkpoints run without their lock: ".(error_get_last()['message'] ?? 'unknown error'));
+                foreach ($handles as $opened) {
+                    fclose($opened);
+                }
+
+                return null;
+            }
+            $handles[] = $handle;
+        }
+
+        [$this->checkpointLock, $this->checkpointGate] = $handles;
+
+        return $this->checkpointLock;
     }
 }

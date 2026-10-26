@@ -88,7 +88,7 @@ class DrainWorkerBufferStallTest extends TestCase
             return;
         }
         unset($this->buffer);
-        foreach ([$this->bufferPath, $this->bufferPath.'-wal', $this->bufferPath.'-shm'] as $f) {
+        foreach ([$this->bufferPath, $this->bufferPath.'-wal', $this->bufferPath.'-shm', $this->bufferPath.'.ckpt', $this->bufferPath.'.ckpt-gate'] as $f) {
             if (file_exists($f)) {
                 @unlink($f);
             }
@@ -176,9 +176,16 @@ class DrainWorkerBufferStallTest extends TestCase
         $this->assertSame(3, $this->rollupCallCount(), 'additive rollups not inflated by re-COPY');
         $this->assertSame(3, $this->buffer->pendingCount(), 'rows stay pending until the buffer can mark them');
 
+        // The stall is visible: BUFFER_UNWRITABLE reads buffer_error_at > buffer_ok_at.
+        $errAt = new ReflectionProperty($worker, 'bufferErrorAt');
+        $okAt = new ReflectionProperty($worker, 'bufferOkAt');
+        $this->assertGreaterThan($okAt->getValue($worker), $errAt->getValue($worker), 'the failed mark is recorded as a buffer error');
+        $this->assertSame(8, (new ReflectionProperty($worker, 'bufferErrorCode'))->getValue($worker), 'SQLITE_READONLY');
+
         // Disk is freed: the held ids get marked, and still nothing re-writes.
         $this->setBufferWritable(true);
         $this->assertTrue($this->drainOnce($worker, $writer), 'recovery tick flushes the held marks');
+        $this->assertGreaterThan($errAt->getValue($worker), $okAt->getValue($worker), 'the accepted mark clears it');
 
         $this->assertSame(3, $this->requestCount(), 'still exactly once after recovery');
         $this->assertSame(3, $this->rollupCallCount());
@@ -187,5 +194,53 @@ class DrainWorkerBufferStallTest extends TestCase
         // Steady state: no work left, no further writes.
         $this->assertFalse($this->drainOnce($worker, $writer));
         $this->assertSame(3, $this->requestCount());
+    }
+
+    /**
+     * Found by review: during poison isolation, a payload's force-insert COMMITTED
+     * and then its mark failed — and because the mark sat inside the same try, the
+     * failure fell into the quarantine branch. The row already in Postgres was
+     * dead-lettered and counted into the never-decaying DRAIN_QUARANTINE total
+     * ("telemetry dropped"), and the batch's buffer-failure flag stayed set for
+     * whatever failed next. A committed row is held for a mark-only retry instead.
+     *
+     * The trigger refuses the mark (synced = 1) but would allow the quarantine
+     * (synced = -1) — a SQLITE_BUSY on the mark followed by a quarantine that gets
+     * the lock, which is what made the old path reachable.
+     */
+    public function test_isolation_holds_a_committed_row_whose_mark_fails_instead_of_quarantining_it(): void
+    {
+        $this->appendRequest('iso-1');
+        $row = $this->buffer->fetchPending(1)[0];
+        $id = (int) $row['id'];
+
+        /** @var PDO $sqlite */
+        $sqlite = (new ReflectionProperty(SqliteBuffer::class, 'pdo'))->getValue($this->buffer);
+        $sqlite->exec("CREATE TRIGGER refuse_mark BEFORE UPDATE OF synced ON buffer WHEN NEW.synced = 1 BEGIN SELECT RAISE(ABORT, 'mark refused'); END");
+
+        $worker = new DrainWorker(
+            sqlitePath: $this->bufferPath,
+            pgHost: self::$host,
+            pgPort: self::$port,
+            pgDatabase: self::$database,
+            pgUsername: self::$username,
+            pgPassword: self::$password,
+            quarantineEnabled: true,
+        );
+        $writer = new RecordWriter(self::$host, self::$port, self::$database, self::$username, self::$password, storageV2Config: false);
+
+        try {
+            (new ReflectionMethod($worker, 'isolateSinglePayload'))
+                ->invoke($worker, $this->buffer, $writer, ['id' => $id, 'records' => json_decode($row['payload'], true)]);
+            $this->fail('a failed mark must propagate to drainBatch, not be swallowed');
+        } catch (\PDOException) {
+            // Expected.
+        }
+
+        $prop = fn (string $name) => (new ReflectionProperty($worker, $name))->getValue($worker);
+        $this->assertSame(1, $this->requestCount(), 'committed exactly once');
+        $this->assertSame(0, $prop('quarantinedTotal'), 'a committed row is not poison');
+        $this->assertSame([$id], $prop('committedUnmarkedIds'), 'held for a mark-only retry');
+        $this->assertSame(0, (int) $sqlite->query("SELECT synced FROM buffer WHERE id = {$id}")->fetchColumn(), 'not dead-lettered');
     }
 }

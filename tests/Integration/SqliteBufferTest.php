@@ -20,7 +20,7 @@ class SqliteBufferTest extends TestCase
     {
         unset($this->buffer);
 
-        foreach ([$this->dbPath, $this->dbPath . '-wal', $this->dbPath . '-shm'] as $file) {
+        foreach ([$this->dbPath, $this->dbPath . '-wal', $this->dbPath . '-shm', $this->dbPath.'.ckpt', $this->dbPath.'.ckpt-gate'] as $file) {
             if (file_exists($file)) {
                 @unlink($file);
             }

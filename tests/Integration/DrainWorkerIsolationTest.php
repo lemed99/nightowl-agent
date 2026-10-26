@@ -81,7 +81,7 @@ class DrainWorkerIsolationTest extends TestCase
             return; // setUp skipped before initializing the buffer
         }
         unset($this->buffer);
-        foreach ([$this->bufferPath, $this->bufferPath.'-wal', $this->bufferPath.'-shm'] as $f) {
+        foreach ([$this->bufferPath, $this->bufferPath.'-wal', $this->bufferPath.'-shm', $this->bufferPath.'.ckpt', $this->bufferPath.'.ckpt-gate'] as $f) {
             if (file_exists($f)) {
                 @unlink($f);
             }

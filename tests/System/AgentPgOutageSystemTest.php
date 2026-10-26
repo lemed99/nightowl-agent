@@ -627,7 +627,7 @@ class AgentPgOutageSystemTest extends TestCase
         self::$sqlitePath = sys_get_temp_dir().'/nightowl-chaos-'.getmypid().'.sqlite';
 
         // Wipe any leftover from a prior failed run before launching.
-        foreach ([self::$sqlitePath, self::$sqlitePath.'-wal', self::$sqlitePath.'-shm', self::$sqlitePath.'.drain-metrics.json'] as $f) {
+        foreach ([self::$sqlitePath, self::$sqlitePath.'-wal', self::$sqlitePath.'-shm', self::$sqlitePath.'.ckpt', self::$sqlitePath.'.ckpt-gate', self::$sqlitePath.'.drain-metrics.json'] as $f) {
             if (file_exists($f)) {
                 @unlink($f);
             }
@@ -711,7 +711,7 @@ class AgentPgOutageSystemTest extends TestCase
         self::$agentProcess = null;
         self::$agentPipes = [];
 
-        foreach ([self::$sqlitePath, self::$sqlitePath.'-wal', self::$sqlitePath.'-shm', self::$sqlitePath.'.drain-metrics.json', self::$sqlitePath.'.drain-metrics.json.tmp'] as $f) {
+        foreach ([self::$sqlitePath, self::$sqlitePath.'-wal', self::$sqlitePath.'-shm', self::$sqlitePath.'.ckpt', self::$sqlitePath.'.ckpt-gate', self::$sqlitePath.'.drain-metrics.json', self::$sqlitePath.'.drain-metrics.json.tmp'] as $f) {
             if (file_exists($f)) {
                 @unlink($f);
             }

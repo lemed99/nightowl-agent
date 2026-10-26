@@ -3,6 +3,7 @@
 namespace NightOwl\Tests\Unit;
 
 use NightOwl\Agent\MetricsCollector;
+use NightOwl\Support\SqliteFailure;
 use PHPUnit\Framework\TestCase;
 
 class MetricsCollectorTest extends TestCase
@@ -1614,5 +1615,484 @@ class MetricsCollectorTest extends TestCase
         $status = $this->collector->getFullStatus(microtime(true) - 60, false, 0, 0, 0);
 
         $this->assertSame(86_400_000.0, $status['drain']['pg_latency_ms']);
+    }
+
+    // --- BUFFER_UNWRITABLE: the agent's own SQLite buffer refuses writes ---
+
+    /**
+     * One second of ingest: $refused appends the buffer refused (with $code),
+     * $accepted it took, $otherRejects refused for another reason (bad token).
+     */
+    private function second(int $refused = 0, int $accepted = 0, int $otherRejects = 0, int $code = SqliteFailure::FULL): void
+    {
+        for ($i = 0; $i < $refused; $i++) {
+            $this->collector->recordBufferWriteFailure($code);
+        }
+        for ($i = 0; $i < $accepted; $i++) {
+            $this->collector->recordIngest();
+        }
+        for ($i = 0; $i < $otherRejects; $i++) {
+            $this->collector->recordReject();
+        }
+        $this->collector->tick();
+    }
+
+    /**
+     * @return array<string, array<string, mixed>> active diagnoses keyed by code
+     */
+    private function diagnose(int $pendingRows = 0): array
+    {
+        $this->collector->runDiagnosis(false, $pendingRows, 0, 0);
+        $status = $this->collector->getFullStatus(microtime(true) - 60, false, $pendingRows, 0, 0);
+
+        return array_column($status['diagnoses'], null, 'code');
+    }
+
+    /** Two diagnosis ticks — the debounce a card needs before it shows. */
+    private function diagnoseTwice(int $pendingRows = 0): array
+    {
+        $this->collector->runDiagnosis(false, $pendingRows, 0, 0);
+
+        return $this->diagnose($pendingRows);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $workers  one drain-metrics file per worker
+     */
+    private function loadWorkerMetrics(array $workers): void
+    {
+        $base = sys_get_temp_dir().'/nightowl-workers-'.uniqid();
+        foreach ($workers as $w => $fields) {
+            file_put_contents("{$base}.drain-metrics-{$w}.json", json_encode(array_merge(
+                ['rows_drained' => 0, 'batches_failed' => 0, 'updated_at' => microtime(true)],
+                $fields,
+            )));
+        }
+        $this->collector->readDrainMetrics($base, count($workers));
+        foreach (array_keys($workers) as $w) {
+            @unlink("{$base}.drain-metrics-{$w}.json");
+        }
+    }
+
+    /**
+     * Yomoney, 2026-10-15: every append failed, the health report read ingest 0 and
+     * rejects 0, and the only card was DRAIN_STOPPED telling them to check a
+     * Postgres that was fine. Refused appends are rejects, and they name the buffer.
+     */
+    public function testRefusedAppendsRaiseBufferUnwritableAndCountAsRejects(): void
+    {
+        for ($s = 0; $s < 10; $s++) {
+            $this->second(refused: 5);
+        }
+
+        $d = $this->diagnoseTwice(500);
+
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $d);
+        $this->assertSame('critical', $d['BUFFER_UNWRITABLE']['level']);
+        $this->assertStringContainsString('refused and lost', $d['BUFFER_UNWRITABLE']['message']);
+        $this->assertStringContainsString('database or disk is full', $d['BUFFER_UNWRITABLE']['message']);
+        $this->assertStringContainsString('df -h', $d['BUFFER_UNWRITABLE']['recommendation']);
+        $this->assertSame(50, $d['BUFFER_UNWRITABLE']['value'], 'payloads refused in the last minute');
+        // Wrong-machine advice and the generic reject card stay quiet.
+        $this->assertArrayNotHasKey('DRAIN_STOPPED', $d);
+        $this->assertArrayNotHasKey('REJECT_RATE_CRITICAL', $d);
+        $this->assertArrayNotHasKey('REJECT_RATE_HIGH', $d);
+
+        // The REPORTED reject numbers stay honest: these payloads were lost.
+        $status = $this->collector->getFullStatus(microtime(true) - 60, false, 500, 0, 0);
+        $this->assertSame(50, $status['ingest']['rejected']);
+        $this->assertSame(100.0, $status['ingest']['reject_pct']);
+    }
+
+    public function testTwoRefusedAppendsAreABlipNotAnOutage(): void
+    {
+        $this->second(refused: 2, code: SqliteFailure::BUSY);
+
+        $this->assertArrayNotHasKey('BUFFER_UNWRITABLE', $this->diagnoseTwice());
+    }
+
+    public function testRareRefusalsOnABusyAppStayQuiet(): void
+    {
+        $this->second(refused: 3, accepted: 100, code: SqliteFailure::BUSY);
+        for ($s = 0; $s < 59; $s++) {
+            $this->second(accepted: 100);
+        }
+
+        $d = $this->diagnoseTwice();
+
+        $this->assertArrayNotHasKey('BUFFER_UNWRITABLE', $d, '3 of 6,003 payloads is not an outage');
+        $this->assertArrayNotHasKey('REJECT_RATE_HIGH', $d);
+    }
+
+    public function testAFewPercentRefusedIsAWarning(): void
+    {
+        for ($s = 0; $s < 30; $s++) {
+            $this->second(refused: 5, accepted: 95);
+        }
+
+        $d = $this->diagnoseTwice();
+
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $d);
+        $this->assertSame('warning', $d['BUFFER_UNWRITABLE']['level']);
+    }
+
+    /**
+     * Found by review: a buffer refusing MOST appends made a latest-events streak
+     * flip every tick, so neither this card nor REJECT_RATE ever survived the
+     * debounce — 80% data loss with no card at all. The window holds it steady.
+     */
+    public function testAPartlyRefusingBufferHoldsTheCardSteadily(): void
+    {
+        $shown = [];
+        for ($tick = 0; $tick < 12; $tick++) {
+            for ($s = 0; $s < 10; $s++) {
+                // The last outcome of each second alternates, the pattern that flapped.
+                ($s + $tick) % 2 === 0
+                    ? $this->second(refused: 4, accepted: 1)
+                    : $this->second(accepted: 1, refused: 4);
+            }
+            $d = $this->diagnose();
+            $shown[] = isset($d['BUFFER_UNWRITABLE']);
+            $this->assertArrayNotHasKey('REJECT_RATE_CRITICAL', $d);
+        }
+
+        array_shift($shown); // the first tick is the debounce
+        $this->assertNotContains(false, $shown, 'shown on every tick after the debounce');
+    }
+
+    /**
+     * Found by review: the streak latched forever on a quiet app — three refusals,
+     * then no traffic overnight, kept a critical lit until the next payload.
+     */
+    public function testTheCardClearsOnAQuietAppOnceTheMinutePasses(): void
+    {
+        $this->second(refused: 3);
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $this->diagnoseTwice());
+
+        for ($s = 0; $s < 60; $s++) {
+            $this->second();
+        }
+        for ($i = 0; $i < 3; $i++) {
+            $d = $this->diagnose();
+        }
+
+        $this->assertArrayNotHasKey('BUFFER_UNWRITABLE', $d);
+    }
+
+    /**
+     * Found by review: right after the buffer was fixed, the reject ring still held
+     * the outage's refusals and raised REJECT_RATE_CRITICAL — "dropping significant
+     * traffic, consider scaling" — for most of a minute.
+     */
+    public function testNoRejectRateCardAfterTheBufferRecovers(): void
+    {
+        for ($tick = 0; $tick < 12; $tick++) {
+            for ($s = 0; $s < 10; $s++) {
+                $tick < 6 ? $this->second(refused: 5) : $this->second(accepted: 5);
+            }
+            $d = $this->diagnose();
+
+            $this->assertArrayNotHasKey('REJECT_RATE_CRITICAL', $d, "tick {$tick}");
+            $this->assertArrayNotHasKey('REJECT_RATE_HIGH', $d, "tick {$tick}");
+        }
+    }
+
+    /**
+     * Found by review: the window moved the lingering onto this card. A minute after
+     * the fix it was still critical, saying incoming telemetry is being lost.
+     */
+    public function testTheCardClearsSoonAfterTheBufferRecovers(): void
+    {
+        for ($s = 0; $s < 60; $s++) {
+            $this->second(refused: 5);
+        }
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $this->diagnoseTwice());
+
+        for ($s = 0; $s < 14; $s++) {
+            $this->second(accepted: 5);
+        }
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $this->diagnose(), '14s without a refusal is not yet recovered');
+
+        $this->second(accepted: 5);
+        $this->assertArrayNotHasKey('BUFFER_UNWRITABLE', $this->diagnose(), '15s is');
+    }
+
+    /**
+     * The recovery rule must not read the gaps between rare refusals as a fix: one
+     * refusal every 20 seconds on a slow app stays shown, not on and off.
+     */
+    public function testSparseRefusalsOnASlowAppAreNotMistakenForRecovery(): void
+    {
+        $shown = [];
+        for ($s = 0; $s < 120; $s++) {
+            $this->second(refused: $s % 20 === 0 ? 1 : 0, accepted: 1);
+            if ($s % 10 === 9) {
+                $shown[$s] = isset($this->diagnose()['BUFFER_UNWRITABLE']);
+            }
+        }
+
+        // Three refusals in the window from s=40; shown after the debounce tick.
+        $this->assertNotContains(false, array_filter($shown, fn ($s) => $s >= 59, ARRAY_FILTER_USE_KEY));
+    }
+
+    /**
+     * Found by review: refusals taken off the top of the reject fraction but left in
+     * its bottom diluted the rest. 30% bad-token rejects read as 3%.
+     */
+    public function testBufferRefusalsDoNotDiluteOtherRejects(): void
+    {
+        for ($s = 0; $s < 10; $s++) {
+            $this->second(refused: 900, accepted: 70, otherRejects: 30);
+        }
+
+        $d = $this->diagnoseTwice();
+
+        $this->assertArrayHasKey('REJECT_RATE_CRITICAL', $d);
+        $this->assertEqualsWithDelta(30.0, $d['REJECT_RATE_CRITICAL']['value'], 0.1);
+    }
+
+    /** Found by review: hiding REJECT_RATE outright also hid unrelated rejects. */
+    public function testOtherRejectsStillShowWhileTheBufferFails(): void
+    {
+        for ($s = 0; $s < 10; $s++) {
+            $this->second(refused: 5, otherRejects: 5);
+        }
+
+        $d = $this->diagnoseTwice();
+
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $d);
+        $this->assertArrayHasKey('REJECT_RATE_CRITICAL', $d, 'the bad-token rejects are a separate problem');
+    }
+
+    /**
+     * One log line per refused payload is thousands a second on a busy app, and the
+     * usual cause is a full disk. The first failure logs; after that, one line per
+     * minute carrying the count — including when failures alternate with successes.
+     */
+    public function testRefusedAppendLoggingIsThrottled(): void
+    {
+        $this->assertSame(1, $this->collector->recordBufferWriteFailure(13));
+        for ($i = 0; $i < 5; $i++) {
+            $this->collector->recordIngest();
+            $this->assertSame(0, $this->collector->recordBufferWriteFailure(13));
+        }
+
+        $lastLog = new \ReflectionProperty($this->collector, 'lastBufferFailLogAt');
+        $lastLog->setValue($this->collector, microtime(true) - 61);
+
+        $this->assertSame(6, $this->collector->recordBufferWriteFailure(13));
+        $this->assertSame(0, $this->collector->recordBufferWriteFailure(13));
+    }
+
+    /**
+     * The drain side: the claim/fetch/mark around the Postgres write keeps failing.
+     * Buffered rows are safe; the card must say so and point at the file, not at
+     * PostgreSQL.
+     */
+    public function testDrainBufferErrorRaisesBufferUnwritableInsteadOfDrainStopped(): void
+    {
+        $now = microtime(true);
+        $this->loadDrainMetrics([
+            'buffer_error_at' => $now,
+            'buffer_error_code' => SqliteFailure::CORRUPT,
+            'buffer_ok_at' => $now - 5,
+        ]);
+
+        $d = $this->diagnoseTwice(7667);
+
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $d);
+        $this->assertSame('critical', $d['BUFFER_UNWRITABLE']['level']);
+        $this->assertSame(7667, $d['BUFFER_UNWRITABLE']['value'], 'rows waiting in the buffer');
+        $this->assertStringContainsString('not reaching PostgreSQL', $d['BUFFER_UNWRITABLE']['message']);
+        $this->assertStringContainsString('database disk image is malformed', $d['BUFFER_UNWRITABLE']['message']);
+        $this->assertStringContainsString('move the three files aside', $d['BUFFER_UNWRITABLE']['recommendation']);
+        $this->assertStringContainsString('already buffered is safe', $d['BUFFER_UNWRITABLE']['recommendation']);
+        $this->assertArrayNotHasKey('DRAIN_STOPPED', $d);
+    }
+
+    public function testDrainBufferErrorClearsOnceTheBufferAcceptsAnOperation(): void
+    {
+        $now = microtime(true);
+        $this->loadDrainMetrics([
+            'buffer_error_at' => $now - 5,
+            'buffer_error_code' => SqliteFailure::FULL,
+            'buffer_ok_at' => $now,
+        ]);
+
+        $this->assertArrayNotHasKey('BUFFER_UNWRITABLE', $this->diagnoseTwice());
+    }
+
+    /** A worker that stopped failing long ago must not keep the card lit forever. */
+    public function testDrainBufferErrorDecaysOnceItIsOld(): void
+    {
+        $this->loadDrainMetrics([
+            'buffer_error_at' => microtime(true) - 120,
+            'buffer_error_code' => SqliteFailure::FULL,
+            'buffer_ok_at' => 0.0,
+        ]);
+
+        $this->assertArrayNotHasKey('BUFFER_UNWRITABLE', $this->diagnoseTwice());
+    }
+
+    /**
+     * Found by review on a real full disk image: an idle worker's empty claim writes
+     * nothing, so it succeeds every loop and its buffer_ok_at masked a peer whose
+     * mark kept failing. Each worker is judged on its own outcome.
+     */
+    public function testAnIdleWorkersSuccessDoesNotMaskAFailingPeer(): void
+    {
+        $now = microtime(true);
+        $this->loadWorkerMetrics([
+            ['buffer_error_at' => $now - 1, 'buffer_error_code' => SqliteFailure::FULL, 'buffer_ok_at' => $now - 5],
+            ['buffer_error_at' => 0.0, 'buffer_error_code' => 0, 'buffer_ok_at' => $now],
+        ]);
+
+        $d = $this->diagnoseTwice(500);
+
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $d);
+        $this->assertStringContainsString('database or disk is full', $d['BUFFER_UNWRITABLE']['message'], "the failing worker's own code");
+    }
+
+    /** A previous run's failure must not greet the restart that fixed it. */
+    public function testAPreviousRunsBufferFailureIsIgnored(): void
+    {
+        $then = microtime(true) - 3600;
+        $this->loadDrainMetrics([
+            'buffer_error_at' => microtime(true),
+            'buffer_error_code' => SqliteFailure::CORRUPT,
+            'buffer_ok_at' => 0.0,
+            'updated_at' => $then,
+        ]);
+
+        $this->assertArrayNotHasKey('BUFFER_UNWRITABLE', $this->diagnoseTwice());
+    }
+
+    /**
+     * The worker writes its metrics file next to the buffer. When the disk fills
+     * further, that file stops updating and the failure it last reported would
+     * otherwise age out of the freshness window and hand the card back to
+     * DRAIN_STOPPED. A stale file keeps the last reported failure standing.
+     */
+    public function testTheCardHoldsWhileTheDrainCannotUpdateItsMetrics(): void
+    {
+        $started = new \ReflectionProperty($this->collector, 'startedAt');
+        $started->setValue($this->collector, microtime(true) - 3600);
+
+        $now = microtime(true);
+        $this->loadDrainMetrics([
+            'buffer_error_at' => $now - 120,
+            'buffer_error_code' => SqliteFailure::FULL,
+            'buffer_ok_at' => 0.0,
+            'updated_at' => $now - 60,
+        ]);
+
+        $d = $this->diagnoseTwice(500);
+
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $d);
+        $this->assertArrayNotHasKey('DRAIN_STOPPED', $d);
+    }
+
+    /**
+     * The exact Yomoney pair: on the corrupt file the drain read 11 "malformed" and
+     * ingest read only 21 "misuse". The card follows the ingest side (it is the
+     * one losing data) but takes its advice from the code that names the file.
+     */
+    public function testIngestMisuseDefersToTheDrainsCorruptCode(): void
+    {
+        $now = microtime(true);
+        $this->loadDrainMetrics([
+            'buffer_error_at' => $now,
+            'buffer_error_code' => SqliteFailure::CORRUPT,
+            'buffer_ok_at' => 0.0,
+        ]);
+        $this->second(refused: 3, code: SqliteFailure::MISUSE);
+
+        $d = $this->diagnoseTwice(7667);
+
+        $this->assertStringContainsString('refused and lost', $d['BUFFER_UNWRITABLE']['message']);
+        $this->assertStringContainsString('database disk image is malformed', $d['BUFFER_UNWRITABLE']['message']);
+        $this->assertStringContainsString('corrupt', $d['BUFFER_UNWRITABLE']['recommendation']);
+    }
+
+    /** When both codes name the file, the ingest side's wins: it is losing data. */
+    public function testIngestCodeWinsWhenBothCodesAreInformative(): void
+    {
+        $this->loadDrainMetrics([
+            'buffer_error_at' => microtime(true),
+            'buffer_error_code' => SqliteFailure::CORRUPT,
+            'buffer_ok_at' => 0.0,
+        ]);
+        $this->second(refused: 3, code: SqliteFailure::FULL);
+
+        $d = $this->diagnoseTwice();
+
+        $this->assertStringContainsString('database or disk is full', $d['BUFFER_UNWRITABLE']['message']);
+    }
+
+    public function testCorruptAdviceDoesNotPromiseToResumeByItself(): void
+    {
+        $advice = new \ReflectionMethod(MetricsCollector::class, 'bufferUnwritableAdvice');
+
+        [, $corrupt] = $advice->invoke($this->collector, SqliteFailure::CORRUPT, false);
+        [, $full] = $advice->invoke($this->collector, SqliteFailure::FULL, false);
+
+        $this->assertStringNotContainsString('resumes by itself', $corrupt, 'a corrupt file needs the move-aside restart');
+        $this->assertStringContainsString('resumes by itself', $full);
+    }
+
+    public function testBufferUnwritableAdviceFitsThePlatformFieldCap(): void
+    {
+        $advice = new \ReflectionMethod(MetricsCollector::class, 'bufferUnwritableAdvice');
+
+        foreach ([0, 5, 6, 7, 8, 10, 11, 13, 14, 21, 26, 99] as $code) {
+            foreach ([true, false] as $ingestFailing) {
+                [$message, $recommendation] = $advice->invoke($this->collector, $code, $ingestFailing);
+
+                $this->assertLessThanOrEqual(1024, strlen($message), "message for SQLite code {$code}");
+                $this->assertLessThanOrEqual(1024, strlen($recommendation), "recommendation for SQLite code {$code}");
+            }
+        }
+    }
+
+    /**
+     * Found by review: the refusals that started a recovery stay in the ingest
+     * window for a minute after it, so the card said telemetry is being lost
+     * next to BUFFER_REPAIRED saying ingest had resumed.
+     */
+    public function testARecoverySetsAsideTheRefusalsThatStartedIt(): void
+    {
+        for ($s = 0; $s < 60; $s++) {
+            $this->second(refused: 5, code: SqliteFailure::CORRUPT);
+        }
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $this->diagnoseTwice());
+
+        usleep(1000);
+        $this->collector->recordBufferRecovery(\NightOwl\Agent\BufferRecovery::REINDEXED, 100);
+        $d = $this->diagnoseTwice();
+        $this->assertArrayNotHasKey('BUFFER_UNWRITABLE', $d);
+        $this->assertArrayHasKey('BUFFER_REPAIRED', $d);
+
+        // Still refusing after it: the card is back.
+        $this->second(refused: 5, code: SqliteFailure::CORRUPT);
+        $this->assertArrayHasKey('BUFFER_UNWRITABLE', $this->diagnoseTwice());
+    }
+
+    /**
+     * Found by review: BUFFER_REPAIRED was timed from the last check of any
+     * outcome, so a clean check 59 minutes after a repair kept the card up for
+     * another hour, and an UNCHECKED one every 5 minutes kept it up for good.
+     */
+    public function testACleanCheckDoesNotExtendTheRepairedCard(): void
+    {
+        $this->collector->recordBufferRecovery(\NightOwl\Agent\BufferRecovery::REINDEXED, 100);
+        $this->assertArrayHasKey('BUFFER_REPAIRED', $this->diagnoseTwice());
+
+        foreach (['bufferRepairedAt', 'bufferRecoveredAt'] as $prop) {
+            (new \ReflectionProperty($this->collector, $prop))->setValue($this->collector, microtime(true) - 3601);
+        }
+        $this->collector->recordBufferRecovery(\NightOwl\Agent\BufferRecovery::CLEAN);
+        $this->collector->recordBufferRecovery(\NightOwl\Agent\BufferRecovery::UNCHECKED);
+
+        $this->assertArrayNotHasKey('BUFFER_REPAIRED', $this->diagnoseTwice());
     }
 }

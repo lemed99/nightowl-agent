@@ -207,6 +207,8 @@ class AgentScalingSystemTest extends TestCase
             self::$sqlitePath,
             self::$sqlitePath.'-wal',
             self::$sqlitePath.'-shm',
+            self::$sqlitePath.'.ckpt',
+            self::$sqlitePath.'.ckpt-gate',
             self::$sqlitePath.'.drain-metrics-0.json',
             self::$sqlitePath.'.drain-metrics-0.json.tmp',
             self::$sqlitePath.'.drain-metrics-1.json',
